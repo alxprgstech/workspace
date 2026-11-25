@@ -1,0 +1,16 @@
+[package]
+name = "workspace-cli"
+description = "ALXPRGS Workspace command-line interface"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "workspace"
+path = "src/main.rs"
+
+[dependencies]
+workspace-core.workspace = true

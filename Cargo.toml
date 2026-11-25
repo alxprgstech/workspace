@@ -1,0 +1,25 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/workspace-core",
+    "crates/workspace-runtime",
+    "crates/workspace-server",
+    "crates/workspace-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.100"
+license = "Apache-2.0"
+repository = "https://github.com/alxprgstech/workspace"
+authors = ["ALXPRGS"]
+
+[workspace.dependencies]
+workspace-core = { path = "crates/workspace-core" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
