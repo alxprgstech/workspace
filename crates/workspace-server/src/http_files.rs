@@ -19,6 +19,7 @@ use crate::auth_store::SessionInfo;
 use crate::files::FilesError;
 use crate::workspaces::valid_id;
 
+#[allow(clippy::result_large_err)]
 fn session(extension: Option<Extension<Arc<SessionInfo>>>) -> Result<Arc<SessionInfo>, Response> {
     extension
         .map(|Extension(info)| info)

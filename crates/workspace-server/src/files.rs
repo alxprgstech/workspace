@@ -319,6 +319,7 @@ impl Files {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn write(
         &self,
         owner: &str,

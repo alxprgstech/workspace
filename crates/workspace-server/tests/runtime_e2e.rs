@@ -215,8 +215,137 @@ async fn workspace_lifecycle_and_job_execution() {
 
     assert_eq!(duplicate.id, job.id);
 
+    // ---- Files: write, read, patch, list ---------------------------------
+    let files =
+        workspace_server::files::Files::new(&runtime, Arc::clone(&manager), 8 * 1024 * 1024)
+            .expect("file service");
+
+    let written = files
+        .write(
+            &owner,
+            &workspace.id,
+            "src/lib.rs",
+            b"pub fn answer() -> u32 {\n    41\n}\n",
+            None,
+            true,
+            true,
+        )
+        .await
+        .expect("file write");
+
+    println!("write sha={} size={}", written.sha256, written.size);
+
+    let chunk = files
+        .read(&owner, &workspace.id, "src/lib.rs", 0, 64 * 1024)
+        .await
+        .expect("file read");
+
+    assert_eq!(chunk.encoding, "utf-8");
+    assert!(chunk.content.contains("answer"));
+
+    let patched = files
+        .patch(
+            &owner,
+            &workspace.id,
+            "src/lib.rs",
+            "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,3 +1,3 @@\n pub fn answer() -> u32 {\n-    41\n+    42\n }\n",
+            Some(&chunk.sha256),
+        )
+        .await
+        .expect("file patch");
+
+    assert_ne!(patched.sha256, written.sha256);
+
+    let listing = files
+        .list(&owner, &workspace.id, "", 4, 100)
+        .await
+        .expect("file list");
+
+    assert!(
+        listing
+            .entries
+            .iter()
+            .any(|entry| entry.path == "src/lib.rs"),
+        "{:?}",
+        listing.entries
+    );
+
+    // ---- Artifacts: publish, link, download, survive workspace delete ----
+    let artifacts = workspace_server::artifacts::Artifacts::new(
+        workspace_server::artifacts::ArtifactStore::new(directory.path()),
+        Arc::new(files),
+        workspace_server::artifacts::ArtifactSettings {
+            ttl_seconds: 3600,
+            link_ttl_seconds: 600,
+            public_base: "https://workspace.example.test".to_owned(),
+        },
+    );
+
+    let artifact = artifacts
+        .publish(&owner, &workspace.id, "src/lib.rs", Some("lib.rs"))
+        .await
+        .expect("publish");
+
+    println!(
+        "artifact {} sha={} size={}",
+        artifact.id, artifact.sha256, artifact.size_bytes
+    );
+
+    let link = artifacts
+        .download_link(&owner, &artifact.id, Some(600))
+        .expect("link");
+
+    assert!(
+        link.url
+            .starts_with("https://workspace.example.test/artifacts/")
+    );
+
+    let token = link.url.rsplit('/').next().unwrap();
+
+    let (resolved, stored_name) = artifacts.resolve(token).expect("resolve");
+
+    assert_eq!(resolved.sha256, artifact.sha256);
+
+    let mut downloaded = Vec::new();
+    let mut offset = 0u64;
+
+    loop {
+        let bytes = artifacts
+            .read(&resolved.id, &stored_name, offset, 1024 * 1024)
+            .await
+            .expect("download chunk");
+
+        if bytes.is_empty() {
+            break;
+        }
+
+        offset += bytes.len() as u64;
+        downloaded.extend_from_slice(&bytes);
+    }
+
+    use sha2::Digest;
+
+    let digest = format!("{:x}", sha2::Sha256::digest(&downloaded));
+
+    assert_eq!(digest, artifact.sha256);
+    assert_eq!(downloaded.len() as u64, artifact.size_bytes);
+
+    println!("downloaded {} bytes with verified sha256", downloaded.len());
+
     // Cleanup must remove the workspace files and free the project quota.
     manager.delete(&owner, &workspace.id).await.expect("delete");
+
+    // The artifact is independent of the workspace lifetime.
+    let (still_there, _) = artifacts.resolve(token).expect("artifact survives");
+
+    assert_eq!(still_there.id, artifact.id);
+
+    artifacts
+        .store()
+        .revoke(&owner, &artifact.id)
+        .expect("revoke");
+
+    assert!(artifacts.resolve(token).is_err());
 
     let remaining = manager.list(&owner).unwrap();
 

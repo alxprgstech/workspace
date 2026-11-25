@@ -35,6 +35,7 @@ workspace-runtime.workspace = true
 rmcp = { version = "3.11.0", features = ["server", "transport-streamable-http-server"] }
 
 [dev-dependencies]
+sha2 = "0.10"
 rsa = { version = "0.9", features = ["sha2"] }
 rand = "0.8"
 tempfile.workspace = true

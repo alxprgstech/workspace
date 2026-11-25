@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 
 /// Bumped whenever the request/response shape changes incompatibly.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Largest JSON header the helper accepts or emits.
 pub const MAX_HEADER_BYTES: u32 = 64 * 1024;
