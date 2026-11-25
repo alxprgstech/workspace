@@ -27,3 +27,9 @@ rustc-ice-*.txt
 /config.toml
 /data/
 /logs/
+
+# React frontend
+/web/node_modules/
+/web/dist/
+/web/.vite/
+/web/*.tsbuildinfo

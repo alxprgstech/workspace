@@ -16,6 +16,8 @@ repository = "https://github.com/alxprgstech/workspace"
 authors = ["ALXPRGS"]
 
 [workspace.dependencies]
+rust-embed = { version = "8", features = ["debug-embed"] }
+mime_guess = "2"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
 tower = { version = "0.5", features = ["util"] }

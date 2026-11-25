@@ -8,7 +8,13 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[features]
+default = []
+web-ui = ["dep:rust-embed", "dep:mime_guess"]
+
 [dependencies]
+rust-embed = { workspace = true, optional = true }
+mime_guess = { workspace = true, optional = true }
 axum.workspace = true
 tokio.workspace = true
 serde.workspace = true

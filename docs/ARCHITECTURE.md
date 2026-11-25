@@ -541,7 +541,7 @@ SQLite — основное хранилище состояния. WAL испо�
 
 ## 20. Веб-панель
 
-Минимальная панель использует серверный HTML, CSS и ограниченный JavaScript. Отдельный Node.js-сервис и сложный SPA не требуются.
+Минимальная панель реализуется на React, TypeScript и Vite. Production-файлы встраиваются в Rust-бинарник посредством rust-embed и обслуживаются Axum. Отдельный Node.js-процесс не требуется. Для разработки используется Vite Dev Server с проксированием API.
 
 Разделы: Dashboard, Workspaces, Jobs, Files, Artifacts, Integrations, Settings, Audit.
 

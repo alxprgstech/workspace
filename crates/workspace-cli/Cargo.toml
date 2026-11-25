@@ -12,6 +12,10 @@ authors.workspace = true
 name = "workspace"
 path = "src/main.rs"
 
+[features]
+default = []
+web-ui = ["workspace-server/web-ui"]
+
 [dependencies]
 workspace-core.workspace = true
 clap.workspace = true

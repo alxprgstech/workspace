@@ -3,6 +3,9 @@
 //! HTTP API, MCP gateway, authentication and administration.
 
 use axum::{Json, Router, extract::State, http::StatusCode, routing::get};
+#[cfg(feature = "web-ui")]
+mod web;
+
 use serde::Serialize;
 use std::io;
 use tokio::net::TcpListener;
@@ -76,11 +79,16 @@ fn router(config: &Config) -> Router {
         },
     };
 
-    Router::new()
+    let router: Router = Router::new()
         .route("/health", get(health))
         .route("/ready", get(ready))
         .route("/api/v1/server/info", get(server_info))
-        .with_state(info)
+        .with_state(info);
+
+    #[cfg(feature = "web-ui")]
+    let router = router.merge(web::router());
+
+    router
 }
 
 pub async fn serve(config: Config) -> io::Result<()> {
