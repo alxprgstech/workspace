@@ -11,6 +11,7 @@ pub mod crypto;
 pub mod secrets;
 pub mod sso;
 pub mod storage;
+pub mod users;
 
 use serde::Serialize;
 use std::io;

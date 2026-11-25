@@ -9,10 +9,18 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 use workspace_core::config::SsoConfig;
 
+#[path = "sessions.rs"]
+mod sessions;
+
+pub use sessions::{SessionCredentials, SessionInfo};
+
 const FLOW_TTL_SECONDS: i64 = 600;
 
 #[derive(Debug, Error)]
 pub enum AuthStoreError {
+    #[error("user operation failed: {0}")]
+    User(#[from] crate::users::UserError),
+
     #[error("authentication storage error: {0}")]
     Storage(#[from] StorageError),
 

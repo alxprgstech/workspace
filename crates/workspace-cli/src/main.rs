@@ -41,6 +41,12 @@ enum Command {
     /// Validate authentication secrets without displaying them
     SsoSecretsCheck,
 
+    /// Manage local Workspace user permissions
+    Users {
+        #[command(subcommand)]
+        command: UsersCommand,
+    },
+
     /// Diagnose the local installation
     Doctor,
 
@@ -52,6 +58,28 @@ enum Command {
 enum ConfigCommand {
     /// Validate the configuration file
     Check,
+}
+
+#[derive(Debug, Subcommand)]
+enum UsersCommand {
+    /// List local users
+    List,
+
+    /// Grant access to an explicitly selected SSO identity
+    Grant {
+        #[arg(long)]
+        subject: String,
+
+        #[arg(long, default_value = "user",
+              value_parser = ["user", "admin"])]
+        role: String,
+    },
+
+    /// Disable a user and revoke their local sessions
+    Disable {
+        #[arg(long)]
+        subject: String,
+    },
 }
 
 fn init_logging(level: LogLevel) -> AppResult<()> {
@@ -111,6 +139,55 @@ fn run(cli: Cli) -> AppResult<ExitCode> {
                 .build()?;
 
             runtime.block_on(workspace_server::serve(config))?;
+
+            Ok(ExitCode::SUCCESS)
+        }
+
+        Command::Users { command } => {
+            let sso = config.sso.as_ref().ok_or(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "SSO is not configured",
+            ))?;
+
+            let data_dir = &config.storage.data_dir;
+
+            match command {
+                UsersCommand::List => {
+                    let users = workspace_server::users::list_users(data_dir, sso)?;
+
+                    println!("Local users: {}", users.len());
+
+                    for user in users {
+                        println!(
+                            "{}  role={}  enabled={}  username={:?}",
+                            user.subject, user.role, user.is_enabled, user.username,
+                        );
+                    }
+                }
+
+                UsersCommand::Grant { subject, role } => {
+                    workspace_server::users::grant_access(data_dir, sso, &subject, &role)?;
+
+                    println!("[OK] Access granted");
+                    println!("[INFO] Subject: {subject}");
+                    println!("[INFO] Role: {role}");
+                }
+
+                UsersCommand::Disable { subject } => {
+                    let changed = workspace_server::users::disable_access(data_dir, sso, &subject)?;
+
+                    if !changed {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            "Local user not found",
+                        )
+                        .into());
+                    }
+
+                    println!("[OK] Access disabled");
+                    println!("[OK] Local sessions revoked");
+                }
+            }
 
             Ok(ExitCode::SUCCESS)
         }
@@ -238,5 +315,31 @@ mod tests {
     #[test]
     fn rejects_unknown_command() {
         assert!(Cli::try_parse_from(["workspace", "unknown"]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod users_cli_tests {
+    use super::*;
+
+    #[test]
+    fn parses_admin_grant_command() {
+        let cli = Cli::try_parse_from([
+            "workspace",
+            "users",
+            "grant",
+            "--subject",
+            "550e8400-e29b-41d4-a716-446655440000",
+            "--role",
+            "admin",
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Command::Users {
+                command: UsersCommand::Grant { .. }
+            }
+        ));
     }
 }
