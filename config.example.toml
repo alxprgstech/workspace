@@ -38,3 +38,12 @@ level = "info"
 # believed when rate limiting sign-in attempts per client. Leave it empty (the
 # default) unless a proxy in front of Workspace is under your control.
 # trusted_proxies = ["127.0.0.1", "::1"]
+
+# Optional MCP gateway (stage 007). The gateway is disabled unless this
+# section exists; without a declared audience no MCP endpoint is served.
+#
+# [mcp]
+# issuer = "https://auth.alxprgs.tech"
+# audience = "https://workspace.example.com/chatgpt/mcp"
+# resource = "https://workspace.example.com/chatgpt/mcp"
+# required_scopes = ["workspace.read"]

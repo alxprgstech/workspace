@@ -1,0 +1,137 @@
+//! MCP gateway foundation (stage 007).
+//!
+//! This module currently publishes only the discovery surface that clients
+//! need before they can obtain a token, plus a fail-closed placeholder for the
+//! protocol endpoint itself. The Streamable HTTP transport is not wired yet,
+//! so no MCP request can be served — an unauthenticated protocol endpoint must
+//! never be exposed in the meantime.
+
+use axum::{Json, Router, extract::State, http::StatusCode, response::IntoResponse, routing::get};
+use serde::Serialize;
+use std::sync::Arc;
+use workspace_core::config::McpConfig;
+
+/// Path the MCP client connects to once the transport exists.
+pub const MCP_ENDPOINT: &str = "/chatgpt/mcp";
+
+#[derive(Serialize)]
+struct ProtectedResourceMetadata {
+    resource: String,
+    authorization_servers: [String; 1],
+    scopes_supported: Vec<String>,
+    bearer_methods_supported: [&'static str; 1],
+    resource_name: &'static str,
+}
+
+impl ProtectedResourceMetadata {
+    fn from_config(config: &McpConfig) -> Self {
+        Self {
+            resource: config.resource.clone(),
+            authorization_servers: [config.issuer.clone()],
+            scopes_supported: config.required_scopes.clone(),
+            bearer_methods_supported: ["header"],
+            resource_name: "ALXPRGS Workspace",
+        }
+    }
+}
+
+async fn protected_resource(State(config): State<Arc<McpConfig>>) -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        Json(ProtectedResourceMetadata::from_config(&config)),
+    )
+}
+
+/// The protocol endpoint exists but is not served yet.
+///
+/// Returning a documented 501 keeps the advertisement honest and avoids
+/// exposing an unauthenticated transport while stage 007 is incomplete.
+async fn transport_pending() -> impl IntoResponse {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(serde_json::json!({
+            "error": "mcp_transport_pending",
+            "message": "The MCP Streamable HTTP transport is not enabled in this build.",
+        })),
+    )
+}
+
+pub fn router(config: McpConfig) -> Router {
+    Router::new()
+        // RFC 9728 protected-resource metadata, including the path-specific
+        // form a client derives from the MCP endpoint URL.
+        .route(
+            "/.well-known/oauth-protected-resource",
+            get(protected_resource),
+        )
+        .route(
+            "/.well-known/oauth-protected-resource/chatgpt/mcp",
+            get(protected_resource),
+        )
+        .route(MCP_ENDPOINT, get(transport_pending).post(transport_pending))
+        .with_state(Arc::new(config))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{body::Body, http::Request};
+    use tower::ServiceExt;
+
+    fn config() -> McpConfig {
+        McpConfig {
+            issuer: "https://auth.alxprgs.tech".to_owned(),
+            audience: "https://workspace.example.com/chatgpt/mcp".to_owned(),
+            resource: "https://workspace.example.com/chatgpt/mcp".to_owned(),
+            required_scopes: vec!["workspace.read".to_owned()],
+        }
+    }
+
+    async fn get_json(uri: &str) -> (StatusCode, serde_json::Value) {
+        let response = router(config())
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        let status = response.status();
+
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    #[tokio::test]
+    async fn advertises_the_resource_and_its_authorization_server() {
+        for uri in [
+            "/.well-known/oauth-protected-resource",
+            "/.well-known/oauth-protected-resource/chatgpt/mcp",
+        ] {
+            let (status, body) = get_json(uri).await;
+
+            assert_eq!(status, StatusCode::OK, "{uri}");
+            assert_eq!(body["resource"], config().resource);
+            assert_eq!(
+                body["authorization_servers"],
+                serde_json::json!([config().issuer])
+            );
+            assert_eq!(
+                body["scopes_supported"],
+                serde_json::json!(config().required_scopes)
+            );
+            assert_eq!(
+                body["bearer_methods_supported"],
+                serde_json::json!(["header"])
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn protocol_endpoint_is_not_served_unauthenticated() {
+        let (status, body) = get_json(MCP_ENDPOINT).await;
+
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(body["error"], "mcp_transport_pending");
+    }
+}

@@ -11,6 +11,8 @@ mod web;
 mod auth_http;
 pub mod auth_store;
 pub mod crypto;
+mod mcp;
+pub mod mcp_auth;
 pub mod secrets;
 pub mod sso;
 pub mod storage;
@@ -112,6 +114,14 @@ fn router(
 
     let router = match auth {
         Some(state) => router.merge(auth_http::router(state)),
+        None => router,
+    };
+
+    // No MCP surface at all unless the deployment declares its audience:
+    // an unconfigured gateway must fail closed rather than answer with an
+    // unverified resource.
+    let router = match config.mcp.clone() {
+        Some(mcp) => router.merge(mcp::router(mcp)),
         None => router,
     };
 
@@ -629,6 +639,55 @@ mod auth_http_tests {
         assert_eq!(
             self::request(&router, request).await.status(),
             StatusCode::TOO_MANY_REQUESTS,
+        );
+    }
+
+    /// Without `[mcp]` the gateway exposes nothing, not even metadata.
+    #[tokio::test]
+    async fn mcp_surface_is_absent_without_configuration() {
+        let (_dir, router, _sso) = setup();
+
+        for uri in [
+            "/.well-known/oauth-protected-resource",
+            "/.well-known/oauth-protected-resource/chatgpt/mcp",
+            "/chatgpt/mcp",
+        ] {
+            assert_eq!(
+                get(&router, uri).await.status(),
+                StatusCode::NOT_FOUND,
+                "{uri}"
+            );
+        }
+    }
+
+    /// With an audience declared, discovery is served but the protocol
+    /// endpoint stays closed until the transport is wired.
+    #[tokio::test]
+    async fn configured_mcp_publishes_discovery_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::parse(include_str!("../../../config.example.toml")).unwrap();
+
+        config.storage.data_dir = dir.path().to_path_buf();
+        config.mcp = Some(workspace_core::config::McpConfig {
+            issuer: "https://auth.alxprgs.tech".to_owned(),
+            audience: "https://workspace.example.com/chatgpt/mcp".to_owned(),
+            resource: "https://workspace.example.com/chatgpt/mcp".to_owned(),
+            required_scopes: vec!["workspace.read".to_owned()],
+        });
+
+        let storage = storage::initialize(dir.path()).unwrap();
+        let router = router(&config, storage, None);
+
+        assert_eq!(
+            get(&router, "/.well-known/oauth-protected-resource")
+                .await
+                .status(),
+            StatusCode::OK
+        );
+
+        assert_eq!(
+            get(&router, "/chatgpt/mcp").await.status(),
+            StatusCode::NOT_IMPLEMENTED
         );
     }
 

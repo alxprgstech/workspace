@@ -17,6 +17,26 @@ pub struct Config {
     pub logging: LoggingConfig,
     #[serde(default)]
     pub sso: Option<SsoConfig>,
+    #[serde(default)]
+    pub mcp: Option<McpConfig>,
+}
+
+/// MCP gateway settings.
+///
+/// The gateway stays disabled unless this section exists: an unconfigured
+/// deployment must never expose an MCP endpoint with no verified audience.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpConfig {
+    /// Identity provider that issues MCP access tokens.
+    pub issuer: String,
+    /// Token audience that identifies this deployment's MCP resource.
+    pub audience: String,
+    /// Canonical resource identifier advertised in protected-resource metadata.
+    pub resource: String,
+    /// Scopes every MCP request must carry.
+    #[serde(default)]
+    pub required_scopes: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
