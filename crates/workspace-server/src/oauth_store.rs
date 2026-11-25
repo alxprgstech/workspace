@@ -963,4 +963,96 @@ mod tests {
                 .is_err()
         );
     }
+
+    fn race_two<F>(operation: F) -> [Result<TokenPair, OAuthError>; 2]
+    where
+        F: Fn() -> Result<TokenPair, OAuthError> + Sync,
+    {
+        let barrier = std::sync::Barrier::new(2);
+
+        std::thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                barrier.wait();
+                operation()
+            });
+
+            let second = scope.spawn(|| {
+                barrier.wait();
+                operation()
+            });
+
+            [first.join().unwrap(), second.join().unwrap()]
+        })
+    }
+
+    fn assert_replay_revoked(store: &OAuthStore, results: [Result<TokenPair, OAuthError>; 2]) {
+        let mut winner = None;
+
+        for result in results {
+            match result {
+                Ok(pair) => {
+                    assert!(winner.replace(pair).is_none());
+                }
+                Err(OAuthError::InvalidGrant) => {}
+                Err(error) => panic!("Unexpected OAuth error: {error}"),
+            }
+        }
+
+        let pair = winner.expect("One exchange must succeed");
+
+        assert!(store.verify_access(&pair.access_token).unwrap().is_none());
+    }
+
+    #[test]
+    fn concurrent_code_exchange_detects_replay() {
+        let (_dir, store, _) = setup();
+        let client = client(&store);
+        let authorization_code = code(&store, &client);
+
+        let results = race_two(|| {
+            store.exchange_code(
+                &client.client_id,
+                &client.client_secret,
+                &authorization_code,
+                REDIRECT,
+                VERIFIER,
+            )
+        });
+
+        assert_replay_revoked(&store, results);
+    }
+
+    #[test]
+    fn concurrent_refresh_rotation_detects_replay() {
+        let (_dir, store, _) = setup();
+        let client = client(&store);
+        let first = tokens(&store, &client);
+
+        let results = race_two(|| {
+            store.rotate_refresh(
+                &client.client_id,
+                &client.client_secret,
+                &first.refresh_token,
+            )
+        });
+
+        assert_replay_revoked(&store, results);
+
+        assert!(store.verify_access(&first.access_token).unwrap().is_none());
+    }
+
+    #[test]
+    fn invalid_client_is_rejected_before_invalid_grant() {
+        let (_dir, store, _) = setup();
+
+        assert!(matches!(
+            store.exchange_code("invalid", "invalid", "invalid", REDIRECT, "invalid",),
+            Err(OAuthError::InvalidClient)
+        ));
+
+        assert!(matches!(
+            store.rotate_refresh("invalid", "invalid", "invalid",),
+            Err(OAuthError::InvalidClient)
+        ));
+    }
 }
