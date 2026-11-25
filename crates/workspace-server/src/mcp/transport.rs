@@ -1,6 +1,7 @@
 //! Streamable HTTP transport for the MCP gateway (stage 007).
 
-use super::tools::{capabilities_catalog, server_information};
+use super::dispatch::Caller;
+use super::{GatewayServices, catalog, dispatch};
 use crate::mcp_auth::{
     Jwk, McpCaller, McpExpectations, TokenError, parse_jwks, verify_access_token,
 };
@@ -211,8 +212,7 @@ pub struct GatewayAuth {
 pub struct GatewayServer {
     info: ServerConfig,
     tools: Vec<Tool>,
-    schema_version: u32,
-    runtime: Arc<crate::mcp::SharedRuntime>,
+    services: Arc<GatewayServices>,
 }
 
 impl ServerHandler for GatewayServer {
@@ -231,77 +231,74 @@ impl ServerHandler for GatewayServer {
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
-        let runtime = self.runtime.status().await;
+        let arguments = request.arguments.unwrap_or_default();
 
-        let payload = match request.name.as_ref() {
-            "server_info" => server_information(self.schema_version, &runtime),
-            "capabilities_list" => capabilities_catalog(self.schema_version, &runtime),
-            other => {
-                return Err(McpError::invalid_params(
-                    format!("unknown tool: {other}"),
-                    None,
-                ));
-            }
+        // The identity was verified by the HTTP gate and attached to the
+        // request parts; it is the only source of the caller identity.
+        let (user_id, scopes) = caller_identity(&context);
+
+        let Some(scopes) = scopes else {
+            return Ok(CallToolResponse::Complete(CallToolResult::error(vec![
+                ContentBlock::text(
+                    json!({"error": "unauthenticated", "message": "no verified caller identity"})
+                        .to_string(),
+                ),
+            ])));
         };
 
-        let text = serde_json::to_string(&payload)
-            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        let user_id = user_id.unwrap_or_default();
 
-        Ok(CallToolResponse::Complete(CallToolResult::success(vec![
-            ContentBlock::text(text),
-        ])))
+        let caller = Caller {
+            user_id: &user_id,
+            scopes: &scopes,
+        };
+
+        let result =
+            dispatch::call(&self.services, &caller, request.name.as_ref(), &arguments).await;
+
+        let (text, is_error) = match result {
+            Ok(value) => (value.to_string(), false),
+            Err(error) => (error.to_json().to_string(), true),
+        };
+
+        let content = vec![ContentBlock::text(text)];
+
+        Ok(CallToolResponse::Complete(if is_error {
+            CallToolResult::error(content)
+        } else {
+            CallToolResult::success(content)
+        }))
     }
 }
 
-/// Both tools take no arguments, so their schema is a closed empty object.
-fn no_arguments() -> Arc<serde_json::Map<String, serde_json::Value>> {
-    let mut schema = serde_json::Map::new();
+/// Extract the verified caller identity from the HTTP request parts.
+fn caller_identity(context: &RequestContext<RoleServer>) -> (Option<String>, Option<Vec<String>>) {
+    let Some(parts) = context.extensions.get::<axum::http::request::Parts>() else {
+        return (None, None);
+    };
 
-    schema.insert("type".to_owned(), json!("object"));
-    schema.insert("properties".to_owned(), json!({}));
-    schema.insert("additionalProperties".to_owned(), json!(false));
+    let user = parts
+        .extensions
+        .get::<Arc<crate::oauth_store::AccessIdentity>>()
+        .map(|identity| identity.user_id.clone());
 
-    Arc::new(schema)
+    let scopes = parts
+        .extensions
+        .get::<Arc<McpCaller>>()
+        .map(|caller| caller.scopes.clone());
+
+    (user, scopes)
 }
 
-fn tool_definitions() -> Vec<Tool> {
-    let mut tools = vec![
-        Tool::new(
-            "server_info",
-            "Read-only build and runtime information for this Workspace instance.",
-            no_arguments(),
-        ),
-        Tool::new(
-            "capabilities_list",
-            "Read-only catalog of capabilities with their real implementation status.",
-            no_arguments(),
-        ),
-    ];
-
-    for tool in &mut tools {
-        tool.annotations = Some(
-            rmcp::model::ToolAnnotations::new()
-                .read_only(true)
-                .destructive(false)
-                .open_world(false),
-        );
-
-        tool.meta = Some(
-            serde_json::from_value(json!({
-                "securitySchemes": [{
-                    "type": "oauth2",
-                    "scopes": ["workspace.read"]
-                }]
-            }))
-            .expect("valid static tool metadata"),
-        );
-    }
-
-    tools
+/// Tools advertised to clients, taken from the catalog.
+fn catalog_tools() -> Vec<Tool> {
+    catalog::definitions()
+        .into_iter()
+        .map(|definition| definition.tool)
+        .collect()
 }
-
 fn host_of(resource: &str) -> Option<String> {
     let url = openidconnect::reqwest::Url::parse(resource).ok()?;
 
@@ -317,16 +314,14 @@ const MCP_PATH: &str = "/chatgpt/mcp";
 
 pub fn service(
     config: &McpConfig,
-    schema_version: u32,
-    runtime: Arc<crate::mcp::SharedRuntime>,
+    services: Arc<GatewayServices>,
 ) -> Result<GatewayService, TokenError> {
-    service_with_mode(config, schema_version, runtime, true)
+    service_with_mode(config, services, true)
 }
 
 fn service_with_mode(
     config: &McpConfig,
-    schema_version: u32,
-    runtime: Arc<crate::mcp::SharedRuntime>,
+    services: Arc<GatewayServices>,
     stateful: bool,
 ) -> Result<GatewayService, TokenError> {
     let mut allowed_hosts = vec!["localhost".to_owned(), "127.0.0.1".to_owned()];
@@ -343,9 +338,8 @@ fn service_with_mode(
                 workspace_core::PRODUCT_NAME,
                 workspace_core::VERSION,
             )),
-        tools: tool_definitions(),
-        schema_version,
-        runtime,
+        tools: catalog_tools(),
+        services,
     };
 
     let mut http = StreamableHttpServerConfig::default();
@@ -361,29 +355,23 @@ fn service_with_mode(
 }
 
 /// Router fragment for the MCP endpoint, mounted behind a bearer-token gate.
-pub fn router(
-    config: &McpConfig,
-    schema_version: u32,
-    runtime: Arc<crate::mcp::SharedRuntime>,
-) -> Result<Router, TokenError> {
-    build_router(config, schema_version, runtime, None)
+pub fn router(config: &McpConfig, services: Arc<GatewayServices>) -> Result<Router, TokenError> {
+    build_router(config, services, None)
 }
 
 /// Same router with pre-seeded signing keys, for hermetic end-to-end tests.
 #[cfg(test)]
 pub fn router_with_keys(
     config: &McpConfig,
-    schema_version: u32,
-    runtime: Arc<crate::mcp::SharedRuntime>,
+    services: Arc<GatewayServices>,
     keys: Vec<Jwk>,
 ) -> Result<Router, TokenError> {
-    build_router(config, schema_version, runtime, Some(keys))
+    build_router(config, services, Some(keys))
 }
 
 fn build_router(
     config: &McpConfig,
-    schema_version: u32,
-    runtime: Arc<crate::mcp::SharedRuntime>,
+    services: Arc<GatewayServices>,
     keys: Option<Vec<Jwk>>,
 ) -> Result<Router, TokenError> {
     let expectations = McpExpectations {
@@ -406,7 +394,7 @@ fn build_router(
 
     let auth = Arc::new(GatewayAuth { keys, expectations });
 
-    let service = service(config, schema_version, Arc::clone(&runtime))?;
+    let service = service(config, Arc::clone(&services))?;
 
     let auth = Arc::clone(&auth);
 
@@ -439,11 +427,10 @@ async fn handle(service: GatewayService, request: Request) -> Response {
 
 pub fn local_router(
     config: &McpConfig,
-    schema_version: u32,
-    runtime: Arc<crate::mcp::SharedRuntime>,
+    services: Arc<GatewayServices>,
     store: Arc<crate::oauth_store::OAuthStore>,
 ) -> Result<Router, TokenError> {
-    let service = service_with_mode(config, schema_version, runtime, false)?;
+    let service = service_with_mode(config, services, false)?;
 
     let metadata_url = format!(
         "{}/.well-known/oauth-protected-resource/chatgpt/mcp",
@@ -637,10 +624,13 @@ mod tests {
         )
     }
 
-    fn test_runtime() -> Arc<crate::mcp::SharedRuntime> {
-        Arc::new(crate::mcp::SharedRuntime::new(
-            None,
-            "550e8400-e29b-41d4-a716-446655440000",
+    fn test_services() -> Arc<GatewayServices> {
+        Arc::new(GatewayServices::runtime_only(
+            3,
+            Arc::new(workspace_runtime::status::RuntimeMonitor::new(
+                None,
+                "550e8400-e29b-41d4-a716-446655440000",
+            )),
         ))
     }
 
@@ -659,7 +649,7 @@ mod tests {
         let config = mcp_config();
         let token = signer.token(&config);
 
-        let router = super::router_with_keys(&config, 3, test_runtime(), keys).unwrap();
+        let router = super::router_with_keys(&config, test_services(), keys).unwrap();
 
         let initialize = serde_json::json!({
             "jsonrpc": "2.0",
@@ -778,8 +768,7 @@ mod tests {
                 resource: "https://workspace.example.com/chatgpt/mcp".to_owned(),
                 required_scopes: vec!["workspace.read".to_owned()],
             },
-            3,
-            test_runtime(),
+            test_services(),
         )
         .unwrap();
 

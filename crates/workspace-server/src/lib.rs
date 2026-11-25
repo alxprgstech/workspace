@@ -17,7 +17,7 @@ pub mod jobs;
 mod mcp;
 pub mod mcp_auth;
 pub mod oauth_store;
-mod runtime_bridge;
+pub mod runtime_bridge;
 pub mod secrets;
 pub mod sso;
 pub mod storage;
@@ -61,6 +61,16 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// MCP view of the same services the HTTP API uses.
+    fn mcp_services(&self) -> Arc<mcp::GatewayServices> {
+        Arc::new(mcp::GatewayServices {
+            schema_version: self.storage.schema_version,
+            runtime: Arc::clone(&self.runtime),
+            workspaces: Some(Arc::clone(&self.workspaces)),
+            jobs: Some(Arc::clone(&self.jobs)),
+        })
+    }
+
     fn new(config: &Config, storage: storage::StorageInfo, runtime: Arc<RuntimeMonitor>) -> Self {
         let resources = json!({
             "cpu_millis": config.resources.cpu_millis,
@@ -214,7 +224,7 @@ fn router(
 
     let state = AppState::new(config, storage, Arc::clone(&monitor));
 
-    router_with_runtime(config, state, auth, monitor)
+    router_with_runtime(config, state, auth)
 }
 
 /// Router bound to a monitor shared with the background supervisor.
@@ -222,9 +232,8 @@ fn router_with_runtime(
     config: &Config,
     state: AppState,
     auth: Option<Arc<auth_http::AuthState>>,
-    runtime: Arc<RuntimeMonitor>,
 ) -> Router {
-    let schema_version = state.storage.schema_version;
+    let mcp_services = state.mcp_services();
     let protected: Router = Router::new()
         .route("/ready", get(ready))
         .route("/api/v1/server/info", get(server_info))
@@ -290,12 +299,7 @@ fn router_with_runtime(
                                 Arc::clone(auth_state),
                                 Arc::clone(&store),
                             ))
-                            .merge(mcp::local_router(
-                                mcp,
-                                schema_version,
-                                Arc::clone(&runtime),
-                                store,
-                            ))
+                            .merge(mcp::local_router(mcp, Arc::clone(&mcp_services), store))
                     }
                     _ => {
                         tracing::error!("Invalid local MCP configuration");
@@ -304,7 +308,7 @@ fn router_with_runtime(
                 }
             }
             // Preserve the existing isolated external-token tests.
-            _ => router.merge(mcp::router(mcp, schema_version, runtime)),
+            _ => router.merge(mcp::router(mcp, mcp_services)),
         },
         None => router,
     };
@@ -630,7 +634,7 @@ pub async fn serve(config: Config) -> io::Result<()> {
 
     axum::serve(
         listener,
-        router_with_runtime(&config, state, auth, Arc::clone(&runtime))
+        router_with_runtime(&config, state, auth)
             .into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
     .with_graceful_shutdown(shutdown)

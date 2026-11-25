@@ -281,8 +281,20 @@ pub fn verify_access_token(
         }
     }
 
-    for required in &expectations.required_scopes {
-        if !scopes.contains(required) {
+    // Normalise names so a legacy read-only token keeps exactly read access
+    // and can never be mistaken for a wider grant.
+    let mut canonical = crate::oauth_store::parse_scopes(&scopes.join(" "));
+    canonical.sort();
+    canonical.dedup();
+
+    let required: Vec<String> = expectations
+        .required_scopes
+        .iter()
+        .flat_map(|scope| crate::oauth_store::parse_scopes(scope))
+        .collect();
+
+    for scope in &required {
+        if !canonical.contains(scope) {
             return Err(TokenError::MissingScope);
         }
     }
@@ -293,7 +305,10 @@ pub fn verify_access_token(
         return Err(TokenError::Malformed);
     }
 
-    Ok(McpCaller { subject, scopes })
+    Ok(McpCaller {
+        subject,
+        scopes: canonical,
+    })
 }
 
 #[cfg(test)]
@@ -380,10 +395,9 @@ mod tests {
         let caller = verify_access_token(&token, &fixture.keys, &expectations(), NOW).unwrap();
 
         assert_eq!(caller.subject, SUBJECT);
-        assert_eq!(
-            caller.scopes,
-            vec!["workspace.read".to_owned(), "workspace.write".to_owned()]
-        );
+        // Legacy names are normalised: `workspace.read` grants read access and
+        // an unknown `workspace.write` is not silently treated as write access.
+        assert_eq!(caller.scopes, vec!["workspace:read".to_owned()]);
     }
 
     #[test]

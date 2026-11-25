@@ -6,6 +6,8 @@
 //! unconfigured gateway must fail closed rather than serve an unverified
 //! resource.
 
+mod catalog;
+mod dispatch;
 mod tools;
 mod transport;
 
@@ -14,8 +16,29 @@ use serde::Serialize;
 use std::sync::Arc;
 use workspace_core::config::McpConfig;
 
-/// Runtime state shared with the MCP gateway.
-pub type SharedRuntime = workspace_runtime::status::RuntimeMonitor;
+/// Services the MCP gateway exposes to tools.
+pub struct GatewayServices {
+    pub schema_version: u32,
+    pub runtime: Arc<workspace_runtime::status::RuntimeMonitor>,
+    pub workspaces: Option<Arc<crate::workspaces::Manager>>,
+    pub jobs: Option<Arc<crate::jobs::Executor>>,
+}
+
+impl GatewayServices {
+    /// Services for a build without workspace or job management.
+    #[cfg(test)]
+    pub fn runtime_only(
+        schema_version: u32,
+        runtime: Arc<workspace_runtime::status::RuntimeMonitor>,
+    ) -> Self {
+        Self {
+            schema_version,
+            runtime,
+            workspaces: None,
+            jobs: None,
+        }
+    }
+}
 
 /// Path an MCP client connects to.
 pub const MCP_ENDPOINT: &str = "/chatgpt/mcp";
@@ -75,10 +98,10 @@ fn discovery_router(config: McpConfig) -> Router {
         .with_state(Arc::new(config))
 }
 
-pub fn router(config: McpConfig, schema_version: u32, runtime: Arc<SharedRuntime>) -> Router {
+pub fn router(config: McpConfig, services: Arc<GatewayServices>) -> Router {
     let discovery = discovery_router(config.clone());
 
-    match transport::router(&config, schema_version, runtime) {
+    match transport::router(&config, services) {
         Ok(transport) => discovery.merge(transport),
         Err(error) => {
             tracing::warn!(%error, "MCP transport unavailable; endpoint stays closed");
@@ -90,11 +113,10 @@ pub fn router(config: McpConfig, schema_version: u32, runtime: Arc<SharedRuntime
 
 pub fn local_router(
     config: McpConfig,
-    schema_version: u32,
-    runtime: Arc<SharedRuntime>,
+    services: Arc<GatewayServices>,
     store: Arc<crate::oauth_store::OAuthStore>,
 ) -> Router {
-    match transport::local_router(&config, schema_version, runtime, store) {
+    match transport::local_router(&config, services, store) {
         Ok(transport) => discovery_router(config).merge(transport),
         Err(error) => {
             tracing::error!(%error, "Local MCP transport unavailable");
@@ -117,15 +139,18 @@ mod tests {
         }
     }
 
-    fn test_runtime() -> Arc<SharedRuntime> {
-        Arc::new(SharedRuntime::new(
-            None,
-            "550e8400-e29b-41d4-a716-446655440000",
+    fn test_services() -> Arc<GatewayServices> {
+        Arc::new(GatewayServices::runtime_only(
+            3,
+            Arc::new(workspace_runtime::status::RuntimeMonitor::new(
+                None,
+                "550e8400-e29b-41d4-a716-446655440000",
+            )),
         ))
     }
 
     async fn get_json(uri: &str) -> (StatusCode, serde_json::Value) {
-        let response = router(config(), 3, test_runtime())
+        let response = router(config(), test_services())
             .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
             .await
             .unwrap();
@@ -166,7 +191,7 @@ mod tests {
 
     #[tokio::test]
     async fn protocol_endpoint_requires_a_token() {
-        let response = router(config(), 3, test_runtime())
+        let response = router(config(), test_services())
             .oneshot(
                 Request::builder()
                     .method("POST")
