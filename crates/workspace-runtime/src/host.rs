@@ -115,7 +115,9 @@ impl Host {
 
         let mut command = self.build(program, args);
 
-        command.stdin(Stdio::piped());
+        // Streaming programs must not echo the payload back: an unread stdout
+        // pipe would fill and block the upload.
+        command.stdin(Stdio::piped()).stdout(Stdio::null());
 
         Ok(command)
     }

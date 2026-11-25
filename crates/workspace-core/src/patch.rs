@@ -31,6 +31,18 @@ pub fn apply(original: &str, patch: &str) -> Result<String, PatchError> {
         return Err(PatchError::Empty);
     }
 
+    // Patches are always written with LF, but files edited on Windows may use
+    // CRLF. Normalise for matching and restore the file's convention at the end.
+    let crlf = original.contains("\r\n");
+    let normalised;
+
+    let original = if crlf {
+        normalised = original.replace("\r\n", "\n");
+        normalised.as_str()
+    } else {
+        original
+    };
+
     let original_lines: Vec<&str> = split_lines(original);
     let mut output: Vec<String> = Vec::with_capacity(original_lines.len());
     let mut cursor = 0usize;
@@ -121,6 +133,10 @@ pub fn apply(original: &str, patch: &str) -> Result<String, PatchError> {
         while result.ends_with('\n') {
             result.pop();
         }
+    }
+
+    if crlf {
+        result = result.replace('\n', "\r\n");
     }
 
     Ok(result)
@@ -223,6 +239,22 @@ mod tests {
             apply(ORIGINAL, "@@ nope @@\n"),
             Err(PatchError::Header(_))
         ));
+    }
+
+    #[test]
+    fn applies_to_crlf_files_and_keeps_crlf() {
+        let patch = "@@ -1,3 +1,3 @@\n [package]\n name = \"demo\"\n-version = \"0.3.0\"\n+version = \"0.4.0\"\n";
+
+        let result = apply(
+            "[package]\r\nname = \"demo\"\r\nversion = \"0.3.0\"\r\n",
+            patch,
+        )
+        .unwrap();
+
+        assert_eq!(
+            result,
+            "[package]\r\nname = \"demo\"\r\nversion = \"0.4.0\"\r\n"
+        );
     }
 
     #[test]

@@ -1033,6 +1033,13 @@ fn default_environment(extra: &[(String, String)]) -> Vec<(String, String)> {
         ("CARGO_TARGET_DIR".to_owned(), "/cache/target".to_owned()),
         ("PIP_CACHE_DIR".to_owned(), "/cache/pip".to_owned()),
         ("RUSTUP_HOME".to_owned(), "/usr/local/rustup".to_owned()),
+        // Pin the toolchain explicitly: the container root filesystem is
+        // read-only, so rustup must never try to sync a channel from a
+        // project toolchain file.
+        (
+            "RUSTUP_TOOLCHAIN".to_owned(),
+            "1.100.0-x86_64-unknown-linux-gnu".to_owned(),
+        ),
     ];
 
     environment.extend(extra.iter().cloned());

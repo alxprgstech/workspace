@@ -183,7 +183,7 @@ fn extract_zip(
         extracted.bytes += content.len() as u64;
         extracted.entries += 1;
 
-        root.write(&target, &content, true, true, None)?;
+        root.write_unsynced(&target, &content, true, true)?;
     }
 
     Ok(extracted)
@@ -268,7 +268,7 @@ fn extract_tar(
         extracted.bytes += content.len() as u64;
         extracted.entries += 1;
 
-        root.write(&target, &content, true, true, None)?;
+        root.write_unsynced(&target, &content, true, true)?;
     }
 
     Ok(extracted)

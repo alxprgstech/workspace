@@ -1,136 +1,141 @@
-# MCP Gateway — контракты и состояние (этап 007)
+# MCP Gateway — контракты и состояние
 
-Документ фиксирует состояние MCP-шлюза ALXPRGS Workspace, уже реализованные
-контракты и точный перечень незавершённых работ. Он дополняет §15–16
-`ARCHITECTURE.md`; всё, что не описано здесь как реализованное, считается
+Документ описывает фактическое состояние MCP-шлюза ALXPRGS Workspace: endpoint,
+авторизацию, полный каталог инструментов, механизм передачи файлов и известные
+ограничения. Он дополняет §15–16 `ARCHITECTURE.md` и `SPECIFICATION`-разделы
+`MVP.md`. Всё, что здесь не отмечено как реализованное, считается
 нереализованным.
 
-## 1. Состояние
+## 1. Endpoint и discovery
 
-| Элемент | Состояние |
+| Элемент | Значение |
 | --- | --- |
-| Конфигурация `[mcp]` | реализовано |
-| Protected Resource Metadata (RFC 9728) | реализовано |
-| Проверка MCP access token (RS256, issuer, audience, resource, срок, scopes) | реализовано |
-| Отключение шлюза без конфигурации (fail-closed) | реализовано |
-| Streamable HTTP транспорт (`rmcp`) | реализовано |
-| Инструменты `server_info`, `capabilities_list` | реализовано |
-| JWKS-кеш с обновлением при ротации ключей для MCP | реализовано |
-| OAuth-сервер: authorization code + PKCE, DCR, refresh, revoke | не реализовано |
+| MCP endpoint | `POST/GET/DELETE https://workspace.alxprgs.tech/chatgpt/mcp` |
+| Protected Resource Metadata | `GET /.well-known/oauth-protected-resource[/chatgpt/mcp]` |
+| Authorization Server Metadata | `GET /.well-known/oauth-authorization-server` |
+| Транспорт | Streamable HTTP (`rmcp`) |
+| Ресурс | `https://workspace.alxprgs.tech/chatgpt/mcp` |
 
-`POST /chatgpt/mcp` смонтирован через `rmcp` Streamable HTTP и защищён
-Bearer-токеном (§4). Запрос без токена, с истёкшим токеном или с токеном
-чужой аудитории получает `401` с `WWW-Authenticate` и ссылкой на
-protected-resource metadata. Если транспорт не удалось собрать (например,
-некорректный `resource`), endpoint отвечает `501 mcp_transport_pending`.
-
-## 2. Конфигурация
-
-```toml
-[mcp]
-issuer = "https://auth.alxprgs.tech"                 # IdP, выпускающий токены
-audience = "https://workspace.example.com/chatgpt/mcp"  # aud access token
-resource = "https://workspace.example.com/chatgpt/mcp"  # RFC 8707 resource
-required_scopes = ["workspace.read"]                  # обязательные scopes
-```
-
-Без секции `[mcp]` шлюз отсутствует полностью: `/.well-known/*` и
-`/chatgpt/mcp` возвращают `404`. Это осознанное решение: конфигурация
+Без секции `[mcp]` шлюз отсутствует полностью (404 на все маршруты): конфигурация
 объявляет аудиторию, без которой проверка токена невозможна.
 
-## 3. Discovery
+## 2. Авторизация
 
-- `GET /.well-known/oauth-protected-resource`
-- `GET /.well-known/oauth-protected-resource/chatgpt/mcp`
+Поддерживается локальный OAuth Authorization Server:
 
-Ответ:
+- Authorization Code Flow;
+- PKCE S256 (обязателен);
+- точные redirect URI, зарегистрированные для клиента;
+- статические `client_id`/`client_secret` (CLI `workspace mcp-clients register`);
+- короткоживущие access-токены и refresh-token rotation с обнаружением replay;
+- отзыв доступа;
+- consent-страница с перечнем запрашиваемых scopes.
+
+Внешние JWT (RS256, issuer/audience/resource/scopes) также принимаются, если
+настроен внешний IdP; локальные opaque-токены проверяются в SQLite.
+
+### Scopes
+
+| Scope | Что разрешает |
+| --- | --- |
+| `workspace:read` | чтение информации о пространствах, заданиях, файлах |
+| `workspace:write` | создание и изменение пространств, запуск/остановка |
+| `workspace:delete` | удаление пространств |
+| `execution:run` | `exec`, отмена заданий |
+| `files:read` | просмотр и чтение файлов |
+| `files:write` | создание, перезапись, патчи |
+| `files:import` | импорт вложений и URL |
+| `artifacts:read` | список и ссылки на артефакты |
+| `artifacts:publish` | публикация артефактов |
+
+Токены, выданные до появления per-operation scopes (scope `workspace.read`),
+нормализуются в `workspace:read` и **не получают** дополнительных прав. Для
+write-инструментов требуется повторное согласие пользователя; миграция схемы
+обновляет только `allowed_scope` клиента и не трогает выданные гранты.
+
+## 3. Каталог инструментов
+
+Изменяющие состояние инструменты не помечаются `readOnlyHint`; у каждого
+инструмента в `_meta.securitySchemes` указан требуемый scope.
+
+| Инструмент | Назначение | Scope | Read-only |
+| --- | --- | --- | --- |
+| `server_info` | сборка, runtime, ресурсы, блокеры | `workspace:read` | да |
+| `capabilities_list` | каталог модулей и сервисов | `workspace:read` | да |
+| `workspace_create` | создание пространства (подготовка образа — асинхронно) | `workspace:write` | нет |
+| `workspace_list` | список пространств владельца | `workspace:read` | да |
+| `workspace_info` | состояние, лимиты, квота, TTL | `workspace:read` | да |
+| `workspace_update` | имя, TTL, закрепление, режим | `workspace:write` | нет |
+| `workspace_stop` | остановка контейнера, файлы сохраняются | `workspace:write` | нет |
+| `workspace_delete` | удаление пространства и файлов | `workspace:delete` | нет |
+| `exec` | запуск argv внутри контейнера, возвращает Job ID | `execution:run` | нет |
+| `job_status` | состояние, код возврата, длительность | `workspace:read` | да |
+| `job_logs` | постраничные stdout/stderr | `workspace:read` | да |
+| `job_cancel` | отмена задания | `execution:run` | нет |
+| `files_list` | каталоги и файлы пространства | `files:read` | да |
+| `file_read` | чтение файла (UTF-8 или base64) | `files:read` | да |
+| `file_write` | атомарная запись/создание | `files:write` | нет |
+| `file_patch` | строгий unified diff | `files:write` | нет |
+| `file_import` | вложение ChatGPT через `openai/fileParams` | `files:import` | нет |
+| `url_import` | импорт по URL из allowlist | `files:import` | нет |
+| `artifact_publish` | неизменяемая копия файла | `artifacts:publish` | нет |
+| `artifact_list` | список артефактов владельца | `artifacts:read` | да |
+| `artifact_download` | временная ссылка на скачивание | `artifacts:read` | да |
+
+## 4. Передача файлов
+
+### Вложения ChatGPT (`file_import`)
+
+Инструмент объявляет `_meta["openai/fileParams"] = ["file"]`. Хост заполняет
+аргумент `file` объектом `FileRef`:
 
 ```json
 {
-  "resource": "https://workspace.example.com/chatgpt/mcp",
-  "authorization_servers": ["https://auth.alxprgs.tech"],
-  "scopes_supported": ["workspace.read"],
-  "bearer_methods_supported": ["header"],
-  "resource_name": "ALXPRGS Workspace"
+  "download_url": "https://…",
+  "file_id": "…",
+  "file_name": "project.zip",
+  "mime_type": "application/zip"
 }
 ```
 
-## 4. Проверка access token
+Сервер скачивает содержимое по HTTPS сам, не пропуская байты через контекст
+модели. Проверки: только HTTPS, без credentials, публичные адреса (loopback,
+private, link-local, metadata, CGNAT запрещены), DNS-адрес пинится для защиты
+от rebinding, редиректы валидируются и ограничены, размер ограничен
+`storage.max_import_mib`, время передачи ограничено. ZIP/TAR распаковываются в
+пространство с защитой от traversal, ссылок и бомб.
 
-Реализовано в `crates/workspace-server/src/mcp_auth.rs`.
+### Артефакты (`artifact_download`)
 
-Обязательные условия приёма запроса:
+`artifact_publish` создаёт неизменяемую копию файла с SHA-256 и TTL.
+`artifact_download` возвращает временную ссылку вида
+`https://workspace.alxprgs.tech/artifacts/<token>`; токен одноразовый по смыслу
+(несколько скачиваний в пределах TTL), отзывается вместе с артефактом и не
+раскрывает структуру хранилища. Ссылка живёт не дольше TTL артефакта.
 
-1. JWT из трёх частей, `alg = RS256`; `alg: none` и любые другие алгоритмы
-   отклоняются (`UnsupportedAlgorithm`).
-2. Подпись проверяется ключом из JWKS по `kid`; при отсутствии `kid` JWKS
-   должен содержать ровно один пригодный RSA-ключ.
-3. `iss` строго равен настроенному `issuer`.
-4. `aud` содержит настроенный `audience` (строка или массив).
-5. Если токен содержит `resource`, он обязан совпасть с настроенным
-   `resource` (RFC 8707).
-6. `exp > now - 60`, `nbf <= now + 60`.
-7. `scp`/`scope` содержит все `required_scopes`.
-8. `sub` непустой — это идентификатор вызывающего.
+`file_import` также принимает архивы: распаковка идёт в `path` (каталог) и
+возвращает число записей.
 
-Криптографические примитивы не реализуются самостоятельно: подпись
-проверяется `ring` (`RSA_PKCS1_2048_8192_SHA256`), JWKS разбирается штатным
-`serde_json`, base64url — крейтом `base64`.
+## 5. Ограничения и ошибки
 
-Токены MCP не связаны с браузерными сессиями: отдельный путь проверки,
-отдельная аудитория, отзыв браузерной сессии не продлевает и не отзывает
-MCP-токен (отзыв появится вместе с OAuth-сервером).
+- Размер аргументов одного вызова ограничен настройками транспорта;
+- `exec` принимает только argv (не shell-строку); вывод ограничен 1 МиБ на
+  поток, лишнее помечается `*_truncated`;
+- длительные операции всегда выполняются как Job: завершение MCP-вызова не
+  означает успешное выполнение команды;
+- ошибки возвращаются структурированно: `{ "error": "<code>", "message": "…" }`
+  с кодами `invalid_arguments`, `insufficient_scope`, `runtime_not_ready`,
+  `workspace_not_found`, `workspace_busy`, `capability_error`,
+  `image_build_failed`, `file_conflict`, `file_too_large`, `artifact_not_found`,
+  `link_invalid`.
 
-## 5. Инструменты (реализованы как read-only)
+## 6. Известные ограничения
 
-`server_info` — read-only, без аргументов:
-
-```json
-{
-  "product": "ALXPRGS Workspace",
-  "version": "0.1.0",
-  "api_version": "v1",
-  "platform": "windows",
-  "architecture": "x86_64",
-  "schema_version": 3,
-  "runtime_ready": false
-}
-```
-
-`capabilities_list` — read-only, без аргументов; каталог модулей с честным
-состоянием (реализовано/не реализовано), версиями и зависимостями:
-
-```json
-{
-  "capabilities": [
-    {"id": "web_session", "status": "ready", "version": "1"},
-    {"id": "mcp_gateway", "status": "partial", "version": "1"},
-    {"id": "docker_runtime", "status": "absent", "version": null}
-  ]
-}
-```
-
-Аннотации инструментов должны соответствовать поведению: изменяющие
-состояние операции не помечаются `readOnlyHint`.
-
-## 6. Что нужно сделать для завершения этапа 007
-
-1. Реализовать OAuth-сервер: authorization code + PKCE S256, AS metadata,
-   refresh token rotation, отзыв, точные redirect URI, статические clients.
-   Сейчас токены принимаются, но выпускаются внешним IdP.
-2. Проверить подключение из обычного веб-чата ChatGPT на целевом аккаунте
-   (initialize → tools/list → tools/call на реальном аккаунте); до этого
-   NGINX Basic Auth остаётся включённой.
-3. Добавить интеграционный тест полного пути с подписанным токеном и
-   подставленным JWKS (сейчас транспорт проверен на `initialize`).
-4. Ограничить число одновременных MCP-сессий и размеры ответов на уровне
-   gateway, если это потребуется по результатам нагрузки.
-
-## 7. Безопасность
-
-- Шлюз не публикует endpoint без объявленной аудитории.
-- Токены принимаются только в заголовке `Authorization: Bearer`.
-- Секреты SSO (`client_secret`, ключи шифрования) не используются для
-  проверки MCP-токенов и не логируются.
-- Запрещено включать MCP-endpoint в интернете до появления полноценной
-  проверки токена, отзыва и ограничения размеров.
+- `whisper-vad` отсутствует в текущей сборке: нет доверенного источника с
+  закреплённой контрольной суммой. Модуль отдаётся как `not_installed`, и
+  создание пространства с ним отклоняется.
+- Сетевой режим `allowlist` (egress proxy) не реализован; пространства
+  создаются только с `network = none`, а `url_import` работает из управляющего
+  процесса по административному allowlist.
+- Подготовка образа асинхронна: после `workspace_create` пространство находится
+  в состоянии `preparing`, команды отклоняются до готовности.

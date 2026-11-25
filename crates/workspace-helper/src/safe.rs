@@ -268,6 +268,40 @@ impl SafeRoot {
         replace: bool,
         expected_sha256: Option<&str>,
     ) -> Result<serde_json::Value, HelperError> {
+        self.write_inner(
+            path,
+            content,
+            create_parents,
+            replace,
+            expected_sha256,
+            true,
+        )
+    }
+
+    /// Write without an fsync per file.
+    ///
+    /// Used by archive extraction, where thousands of small files would make a
+    /// per-file fsync dominate the whole import. The rename still makes each
+    /// file atomic; a crash may lose the newest files of an import.
+    pub fn write_unsynced(
+        &self,
+        path: &str,
+        content: &[u8],
+        create_parents: bool,
+        replace: bool,
+    ) -> Result<serde_json::Value, HelperError> {
+        self.write_inner(path, content, create_parents, replace, None, false)
+    }
+
+    fn write_inner(
+        &self,
+        path: &str,
+        content: &[u8],
+        create_parents: bool,
+        replace: bool,
+        expected_sha256: Option<&str>,
+        sync: bool,
+    ) -> Result<serde_json::Value, HelperError> {
         helper::validate_relative_path(path)?;
 
         if path.is_empty() {
@@ -303,7 +337,11 @@ impl SafeRoot {
 
         let (temporary, mut file) = self.create_temp(path)?;
 
-        let result = file.write_all(content).and_then(|()| file.sync_all());
+        let result = if sync {
+            file.write_all(content).and_then(|()| file.sync_all())
+        } else {
+            file.write_all(content)
+        };
 
         drop(file);
 
