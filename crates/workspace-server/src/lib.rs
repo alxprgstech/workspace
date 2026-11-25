@@ -6,6 +6,7 @@ use axum::{Json, Router, extract::State, http::StatusCode, routing::get};
 #[cfg(feature = "web-ui")]
 mod web;
 
+mod auth_http;
 pub mod auth_store;
 pub mod crypto;
 pub mod secrets;
@@ -14,7 +15,7 @@ pub mod storage;
 pub mod users;
 
 use serde::Serialize;
-use std::io;
+use std::{io, sync::Arc};
 use tokio::net::TcpListener;
 use workspace_core::{PRODUCT_NAME, VERSION, config::Config};
 
@@ -70,7 +71,11 @@ async fn server_info(State(info): State<ServerInfo>) -> Json<ServerInfo> {
     Json(info)
 }
 
-fn router(config: &Config, storage: storage::StorageInfo) -> Router {
+fn router(
+    config: &Config,
+    storage: storage::StorageInfo,
+    auth: Option<Arc<auth_http::AuthState>>,
+) -> Router {
     let info = ServerInfo {
         product: PRODUCT_NAME,
         version: VERSION,
@@ -88,16 +93,30 @@ fn router(config: &Config, storage: storage::StorageInfo) -> Router {
         },
     };
 
-    let router: Router = Router::new()
-        .route("/health", get(health))
+    let protected: Router = Router::new()
         .route("/ready", get(ready))
         .route("/api/v1/server/info", get(server_info))
         .with_state(info);
 
+    let protected = match auth.as_ref() {
+        Some(state) => protected.route_layer(axum::middleware::from_fn_with_state(
+            Arc::clone(state),
+            auth_http::require_session,
+        )),
+        None => protected,
+    };
+
+    let router = Router::new().route("/health", get(health)).merge(protected);
+
+    let router = match auth {
+        Some(state) => router.merge(auth_http::router(state)),
+        None => router,
+    };
+
     #[cfg(feature = "web-ui")]
     let router = router.merge(web::router());
 
-    router
+    router.layer(axum::middleware::from_fn(auth_http::security_headers))
 }
 
 pub async fn serve(config: Config) -> io::Result<()> {
@@ -106,6 +125,22 @@ pub async fn serve(config: Config) -> io::Result<()> {
             io::ErrorKind::PermissionDenied,
             "Non-loopback listeners are disabled until authentication is implemented",
         ));
+    }
+
+    let auth = config
+        .sso
+        .as_ref()
+        .map(|sso| {
+            let secrets = secrets::AuthSecrets::from_env().map_err(io::Error::other)?;
+
+            auth_http::AuthState::new(sso, &config.storage.data_dir, secrets).map(Arc::new)
+        })
+        .transpose()?;
+
+    if auth.is_some() {
+        tracing::info!("ALXPRGS SSO authentication enabled");
+    } else {
+        tracing::warn!("SSO is not configured; local development mode");
     }
 
     let listener = TcpListener::bind(config.server.listen).await?;
@@ -160,7 +195,7 @@ pub async fn serve(config: Config) -> io::Result<()> {
 
     tracing::warn!("Execution runtime is not ready");
 
-    axum::serve(listener, router(&config, storage))
+    axum::serve(listener, router(&config, storage, auth))
         .with_graceful_shutdown(shutdown)
         .await?;
 
@@ -188,7 +223,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let storage = storage::initialize(dir.path()).unwrap();
 
-        router(&config(), storage)
+        router(&config(), storage, None)
             .oneshot(
                 Request::builder()
                     .method(method)
@@ -268,5 +303,278 @@ mod tests {
         let error = serve(config).await.unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+}
+
+#[cfg(test)]
+mod auth_http_tests {
+    use super::*;
+    use axum::{
+        body::Body,
+        http::{Method, Request, header},
+        response::Response,
+    };
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use tower::ServiceExt;
+    use workspace_core::config::SsoConfig;
+
+    const KEY: [u8; 32] = [42; 32];
+
+    const SUBJECT: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    const ORIGIN: &str = "https://workspace.example.com";
+
+    fn setup() -> (tempfile::TempDir, Router, SsoConfig) {
+        let dir = tempfile::tempdir().unwrap();
+
+        let mut config = Config::parse(include_str!("../../../config.example.toml")).unwrap();
+
+        let sso = SsoConfig {
+            issuer: "https://auth.alxprgs.tech".to_owned(),
+            client_id: "test-client".to_owned(),
+            redirect_uri: format!("{ORIGIN}/auth/callback"),
+        };
+
+        config.sso = Some(sso.clone());
+        config.storage.data_dir = dir.path().to_path_buf();
+
+        let storage = storage::initialize(dir.path()).unwrap();
+
+        let secrets =
+            secrets::AuthSecrets::from_values("test-client-secret-123456", &STANDARD.encode(KEY))
+                .unwrap();
+
+        let auth = auth_http::AuthState::new(&sso, dir.path(), secrets).unwrap();
+
+        let router = router(&config, storage, Some(Arc::new(auth)));
+
+        (dir, router, sso)
+    }
+
+    async fn request(router: &Router, request: Request<Body>) -> Response {
+        router.clone().oneshot(request).await.unwrap()
+    }
+
+    async fn get(router: &Router, uri: &str) -> Response {
+        request(
+            router,
+            Request::builder().uri(uri).body(Body::empty()).unwrap(),
+        )
+        .await
+    }
+
+    fn create_session(dir: &std::path::Path, config: &SsoConfig) -> auth_store::SessionCredentials {
+        users::grant_access(dir, config, SUBJECT, "admin").unwrap();
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        let login = sso::LoginResult {
+            identity: sso::VerifiedIdentity {
+                issuer: config.issuer.clone(),
+                subject: SUBJECT.to_owned(),
+                expires_at_unix: now + 300,
+            },
+            username: Some("test-user".to_owned()),
+            email: None,
+            email_verified: false,
+            tokens: sso::SessionTokens {
+                access_token: "test-access".to_owned(),
+                refresh_token: "test-refresh".to_owned(),
+                id_token: "test-id".to_owned(),
+                access_expires_at_unix: now + 300,
+            },
+        };
+
+        auth_store::AuthStore::new(dir, &KEY)
+            .unwrap()
+            .create_session(config, &login)
+            .unwrap()
+            .unwrap()
+    }
+
+    fn session_cookie(credentials: &auth_store::SessionCredentials) -> String {
+        format!(
+            "__Host-workspace-session={}; \
+             __Host-workspace-csrf={}",
+            credentials.handle, credentials.csrf_token,
+        )
+    }
+
+    #[tokio::test]
+    async fn health_is_public_but_private_api_requires_session() {
+        let (_dir, router, _sso) = setup();
+
+        assert_eq!(get(&router, "/health").await.status(), StatusCode::OK,);
+
+        for uri in ["/ready", "/api/v1/server/info", "/auth/me"] {
+            let response = get(&router, uri).await;
+
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED,);
+
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store",);
+        }
+    }
+
+    #[tokio::test]
+    async fn login_redirect_sets_secure_flow_cookie() {
+        let (_dir, router, _sso) = setup();
+
+        let response = get(&router, "/auth/login").await;
+
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+        let location = response.headers()[header::LOCATION].to_str().unwrap();
+
+        assert!(location.starts_with("https://auth.alxprgs.tech/oauth/authorize?"));
+
+        assert!(location.contains("code_challenge_method=S256"));
+
+        let cookie = response.headers()[header::SET_COOKIE].to_str().unwrap();
+
+        assert!(cookie.starts_with("__Host-workspace-flow="));
+        assert!(cookie.contains("Secure"));
+        assert!(cookie.contains("HttpOnly"));
+        assert!(cookie.contains("SameSite=Lax"));
+        assert!(cookie.contains("Path=/"));
+        assert!(cookie.contains("Max-Age=600"));
+        assert!(!cookie.contains("Domain="));
+    }
+
+    #[tokio::test]
+    async fn malformed_callbacks_are_rejected() {
+        let (_dir, router, _sso) = setup();
+
+        for uri in [
+            "/auth/callback",
+            "/auth/callback?code=test&state=test",
+            "/auth/callback?code=a&code=b&state=test",
+            "/auth/callback?error=denied&code=a&state=test",
+            "/auth/callback?code=a&state=x&state=y",
+        ] {
+            assert_eq!(get(&router, uri).await.status(), StatusCode::BAD_REQUEST,);
+        }
+    }
+
+    #[tokio::test]
+    async fn head_does_not_start_or_consume_login() {
+        let (_dir, router, _sso) = setup();
+
+        for uri in ["/auth/login", "/auth/callback"] {
+            let response = request(
+                &router,
+                Request::builder()
+                    .method(Method::HEAD)
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+
+            assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED,);
+        }
+    }
+
+    #[tokio::test]
+    async fn valid_session_can_access_private_api() {
+        let (dir, router, sso) = setup();
+
+        let credentials = create_session(dir.path(), &sso);
+
+        for uri in ["/auth/me", "/api/v1/server/info"] {
+            let response = request(
+                &router,
+                Request::builder()
+                    .uri(uri)
+                    .header(header::COOKIE, session_cookie(&credentials))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_session_cookies_are_rejected() {
+        let (dir, router, sso) = setup();
+
+        let credentials = create_session(dir.path(), &sso);
+
+        let cookie = format!(
+            "{}; __Host-workspace-session={}",
+            session_cookie(&credentials),
+            credentials.handle,
+        );
+
+        let response = request(
+            &router,
+            Request::builder()
+                .uri("/auth/me")
+                .header(header::COOKIE, cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED,);
+    }
+
+    #[tokio::test]
+    async fn logout_requires_origin_and_csrf_and_revokes_session() {
+        let (dir, router, sso) = setup();
+
+        let credentials = create_session(dir.path(), &sso);
+
+        for (origin, csrf) in [
+            ("https://other.example.com", credentials.csrf_token.as_str()),
+            (ORIGIN, "invalid-csrf"),
+        ] {
+            let response = request(
+                &router,
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/auth/logout")
+                    .header(header::ORIGIN, origin)
+                    .header("x-workspace-csrf", csrf)
+                    .header(header::COOKIE, session_cookie(&credentials))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+
+            assert_eq!(response.status(), StatusCode::FORBIDDEN,);
+        }
+
+        let response = request(
+            &router,
+            Request::builder()
+                .method(Method::POST)
+                .uri("/auth/logout")
+                .header(header::ORIGIN, ORIGIN)
+                .header("x-workspace-csrf", &credentials.csrf_token)
+                .header(header::COOKIE, session_cookie(&credentials))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT,);
+
+        let response = request(
+            &router,
+            Request::builder()
+                .uri("/auth/me")
+                .header(header::COOKIE, session_cookie(&credentials))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED,);
     }
 }
