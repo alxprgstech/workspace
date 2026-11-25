@@ -1,3 +1,6 @@
+#[path = "oauth_browser.rs"]
+pub(crate) mod browser;
+
 use crate::{crypto, sso, storage};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
@@ -93,6 +96,7 @@ fn valid_redirect(value: &str) -> bool {
             && url.username().is_empty()
             && url.password().is_none()
             && url.fragment().is_none()
+            && url.query().is_none()
     })
 }
 
@@ -326,52 +330,7 @@ impl OAuthStore {
         let mut connection = storage::open(&self.data_dir)?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
-        let current_time = now(&tx)?;
-        let grant_id = Uuid::new_v4().to_string();
-        let code = random_token("mcp_code_")?;
-
-        let changed = tx.execute(
-            "INSERT INTO mcp_oauth_grants
-             (id, user_id, client_id, resource, scope,
-              created_at_unix, expires_at_unix)
-             SELECT ?1, u.id, c.client_id, ?2, ?3, ?4, ?5
-             FROM users u CROSS JOIN mcp_oauth_clients c
-             WHERE u.id = ?6 AND u.issuer = ?7
-               AND u.is_enabled = 1
-               AND c.client_id = ?8 AND c.is_enabled = 1
-               AND c.redirect_uri = ?9
-               AND c.allowed_scope = ?3",
-            params![
-                grant_id,
-                self.resource,
-                SCOPE,
-                current_time,
-                current_time + GRANT_TTL,
-                user_id,
-                self.user_issuer,
-                client_id,
-                redirect_uri,
-            ],
-        )?;
-
-        if changed != 1 {
-            return Err(OAuthError::AccessDenied);
-        }
-
-        tx.execute(
-            "INSERT INTO mcp_oauth_codes
-             (code_hash, grant_id, redirect_uri, code_challenge,
-              created_at_unix, expires_at_unix)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                &crypto::hash_handle(&code)[..],
-                grant_id,
-                redirect_uri,
-                challenge,
-                current_time,
-                current_time + CODE_TTL,
-            ],
-        )?;
+        let code = self.issue_code_on(&tx, client_id, redirect_uri, challenge, user_id)?;
 
         tx.commit()?;
 
@@ -608,6 +567,66 @@ impl OAuthStore {
         tx.commit()?;
 
         Ok(())
+    }
+}
+
+impl OAuthStore {
+    fn issue_code_on(
+        &self,
+        connection: &Connection,
+        client_id: &str,
+        redirect_uri: &str,
+        challenge: &str,
+        user_id: &str,
+    ) -> Result<String, OAuthError> {
+        let current_time = now(connection)?;
+        let grant_id = Uuid::new_v4().to_string();
+        let code = random_token("mcp_code_")?;
+
+        let changed = connection.execute(
+            "INSERT INTO mcp_oauth_grants
+             (id, user_id, client_id, resource, scope,
+              created_at_unix, expires_at_unix)
+             SELECT ?1, u.id, c.client_id, ?2, ?3, ?4, ?5
+             FROM users u CROSS JOIN mcp_oauth_clients c
+             WHERE u.id = ?6 AND u.issuer = ?7
+               AND u.is_enabled = 1
+               AND c.client_id = ?8 AND c.is_enabled = 1
+               AND c.redirect_uri = ?9
+               AND c.allowed_scope = ?3",
+            params![
+                grant_id,
+                self.resource,
+                SCOPE,
+                current_time,
+                current_time + GRANT_TTL,
+                user_id,
+                self.user_issuer,
+                client_id,
+                redirect_uri,
+            ],
+        )?;
+
+        if changed != 1 {
+            return Err(OAuthError::AccessDenied);
+        }
+
+        connection.execute(
+            "INSERT INTO mcp_oauth_codes
+             (code_hash, grant_id, redirect_uri, code_challenge,
+              created_at_unix, expires_at_unix)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                &crypto::hash_handle(&code)[..],
+                grant_id,
+                redirect_uri,
+                challenge,
+                current_time,
+                current_time + CODE_TTL,
+            ],
+        )?;
+
+        Ok(code)
     }
 }
 

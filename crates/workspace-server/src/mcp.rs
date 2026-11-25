@@ -85,6 +85,19 @@ pub fn router(config: McpConfig, schema_version: u32) -> Router {
     }
 }
 
+pub fn local_router(
+    config: McpConfig,
+    schema_version: u32,
+    store: Arc<crate::oauth_store::OAuthStore>,
+) -> Router {
+    match transport::local_router(&config, schema_version, store) {
+        Ok(transport) => discovery_router(config).merge(transport),
+        Err(error) => {
+            tracing::error!(%error, "Local MCP transport unavailable");
+            Router::new()
+        }
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;

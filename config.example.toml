@@ -43,7 +43,7 @@ level = "info"
 # section exists; without a declared audience no MCP endpoint is served.
 #
 # [mcp]
-# issuer = "https://auth.alxprgs.tech"
+# issuer = "https://workspace.example.com"
 # audience = "https://workspace.example.com/chatgpt/mcp"
 # resource = "https://workspace.example.com/chatgpt/mcp"
 # required_scopes = ["workspace.read"]

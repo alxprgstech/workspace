@@ -130,8 +130,8 @@ fn router(
 
     let router = Router::new().route("/health", get(health)).merge(protected);
 
-    let router = match auth {
-        Some(state) => router.merge(auth_http::router(state)),
+    let router = match auth.as_ref() {
+        Some(state) => router.merge(auth_http::router(Arc::clone(state))),
         None => router,
     };
 
@@ -139,7 +139,30 @@ fn router(
     // an unconfigured gateway must fail closed rather than answer with an
     // unverified resource.
     let router = match config.mcp.clone() {
-        Some(mcp) => router.merge(mcp::router(mcp, schema_version)),
+        Some(mcp) => {
+            match (config.sso.as_ref(), auth.as_ref()) {
+                (Some(sso), Some(auth)) => {
+                    match oauth_store::OAuthStore::new(&config.storage.data_dir, sso) {
+                        Ok(store) if valid_local_mcp(config) => {
+                            let store = Arc::new(store);
+
+                            router
+                                .merge(auth_http::oauth_router(
+                                    Arc::clone(auth),
+                                    Arc::clone(&store),
+                                ))
+                                .merge(mcp::local_router(mcp, schema_version, store))
+                        }
+                        _ => {
+                            tracing::error!("Invalid local MCP configuration");
+                            router
+                        }
+                    }
+                }
+                // Preserve the existing isolated external-token tests.
+                _ => router.merge(mcp::router(mcp, schema_version)),
+            }
+        }
         None => router,
     };
 
@@ -179,7 +202,36 @@ async fn headless_index() -> Response {
         .into_response()
 }
 
+fn valid_local_mcp(config: &Config) -> bool {
+    let Some(mcp) = config.mcp.as_ref() else {
+        return true;
+    };
+
+    let Some(sso) = config.sso.as_ref() else {
+        return false;
+    };
+
+    let Ok(url) = openidconnect::reqwest::Url::parse(&sso.redirect_uri) else {
+        return false;
+    };
+
+    let issuer = url.origin().ascii_serialization();
+    let resource = format!("{issuer}/chatgpt/mcp");
+
+    mcp.issuer == issuer
+        && mcp.resource == resource
+        && mcp.audience == resource
+        && mcp.required_scopes == [oauth_store::SCOPE]
+}
+
 pub async fn serve(config: Config) -> io::Result<()> {
+    if !valid_local_mcp(&config) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "MCP requires SSO and the canonical local issuer/resource/scope",
+        ));
+    }
+
     if !config.server.listen.ip().is_loopback() {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -485,6 +537,308 @@ mod auth_http_tests {
             .unwrap()
     }
 
+    #[tokio::test]
+    async fn local_oauth_and_mcp_end_to_end() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use openidconnect::reqwest::Url;
+        use serde_json::{Value, json};
+
+        const REDIRECT: &str = "https://chatgpt.com/connector_platform_oauth_redirect";
+
+        const VERIFIER: &str = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG";
+
+        fn encode(pairs: &[(&str, &str)]) -> String {
+            let mut url = Url::parse("https://example.com/").unwrap();
+
+            url.query_pairs_mut().extend_pairs(pairs.iter().copied());
+
+            url.query().unwrap().to_owned()
+        }
+
+        async fn read_json(response: Response) -> Value {
+            let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+
+            serde_json::from_slice(&body).unwrap()
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+
+        let mut config = Config::parse(include_str!("../../../config.example.toml")).unwrap();
+
+        let sso = SsoConfig {
+            issuer: "https://auth.alxprgs.tech".to_owned(),
+            client_id: "test-client".to_owned(),
+            redirect_uri: format!("{ORIGIN}/auth/callback"),
+            trusted_proxies: Vec::new(),
+        };
+
+        let resource = format!("{ORIGIN}/chatgpt/mcp");
+
+        config.sso = Some(sso.clone());
+        config.storage.data_dir = dir.path().to_path_buf();
+
+        config.mcp = Some(workspace_core::config::McpConfig {
+            issuer: ORIGIN.to_owned(),
+            audience: resource.clone(),
+            resource: resource.clone(),
+            required_scopes: vec!["workspace.read".to_owned()],
+        });
+
+        assert!(valid_local_mcp(&config));
+
+        let storage_info = storage::initialize(dir.path()).unwrap();
+
+        let secrets =
+            secrets::AuthSecrets::from_values("test-client-secret-123456", &STANDARD.encode(KEY))
+                .unwrap();
+
+        let auth = auth_http::AuthState::new_with_sso_revocation(&sso, dir.path(), secrets, false)
+            .unwrap();
+
+        let credentials = create_session(dir.path(), &sso);
+
+        let store = oauth_store::OAuthStore::new(dir.path(), &sso).unwrap();
+
+        let client = store.register_client("ChatGPT Test", REDIRECT).unwrap();
+
+        let router = router(&config, storage_info, Some(Arc::new(auth)));
+
+        let response = get(&router, "/.well-known/oauth-authorization-server").await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let metadata = read_json(response).await;
+        assert_eq!(metadata["issuer"], ORIGIN);
+
+        let challenge = URL_SAFE_NO_PAD.encode(crypto::hash_handle(VERIFIER));
+
+        let query = encode(&[
+            ("response_type", "code"),
+            ("client_id", &client.client_id),
+            ("redirect_uri", REDIRECT),
+            ("code_challenge", &challenge),
+            ("code_challenge_method", "S256"),
+            ("state", "integration-test-state"),
+            ("scope", "workspace.read"),
+            ("resource", &resource),
+        ]);
+
+        let response = get(&router, &format!("/oauth/authorize?{query}")).await;
+
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+        let pending_cookie = response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .find_map(|value| {
+                value
+                    .to_str()
+                    .ok()
+                    .filter(|value| value.starts_with("__Host-workspace-mcp-request="))
+            })
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+
+        let pending_handle = pending_cookie.split_once('=').unwrap().1.to_owned();
+
+        let cookies = format!(
+            "__Host-workspace-session={}; \
+             __Host-workspace-csrf={}; {}",
+            credentials.handle, credentials.csrf_token, pending_cookie,
+        );
+
+        let response = request(
+            &router,
+            Request::builder()
+                .uri("/oauth/consent")
+                .header(header::COOKIE, &cookies)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let tag = URL_SAFE_NO_PAD.encode(crypto::hash_handle(&credentials.handle));
+
+        let consent = encode(&[
+            ("csrf", &credentials.csrf_token),
+            ("request_handle", &pending_handle),
+            ("session_tag", &tag),
+            ("decision", "approve"),
+        ]);
+
+        let consent_request = |origin: &str| {
+            Request::builder()
+                .method(Method::POST)
+                .uri("/oauth/consent")
+                .header(header::ORIGIN, origin)
+                .header(header::COOKIE, &cookies)
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(consent.clone()))
+                .unwrap()
+        };
+
+        let response = request(&router, consent_request("https://untrusted.example")).await;
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let response = request(&router, consent_request(ORIGIN)).await;
+
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+        let location = Url::parse(response.headers()[header::LOCATION].to_str().unwrap()).unwrap();
+
+        let fields: std::collections::HashMap<_, _> = location.query_pairs().into_owned().collect();
+
+        assert_eq!(fields["state"], "integration-test-state");
+        assert_eq!(fields["iss"], ORIGIN);
+
+        let code = fields["code"].clone();
+
+        // Consent must be single-use.
+        let response = request(&router, consent_request(ORIGIN)).await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let basic = format!(
+            "Basic {}",
+            STANDARD.encode(format!("{}:{}", client.client_id, client.client_secret)),
+        );
+
+        let exchange = encode(&[
+            ("grant_type", "authorization_code"),
+            ("code", &code),
+            ("redirect_uri", REDIRECT),
+            ("code_verifier", VERIFIER),
+            ("resource", &resource),
+        ]);
+
+        let post = |path: &str, body: String| {
+            Request::builder()
+                .method(Method::POST)
+                .uri(path)
+                .header(header::AUTHORIZATION, &basic)
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(body))
+                .unwrap()
+        };
+
+        let response = request(&router, post("/oauth/token", exchange)).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let tokens = read_json(response).await;
+
+        let access = tokens["access_token"].as_str().unwrap();
+        let refresh = tokens["refresh_token"].as_str().unwrap();
+
+        let mcp_request = |token: &str, payload: Value| {
+            Request::builder()
+                .method(Method::POST)
+                .uri("/chatgpt/mcp")
+                .header(header::HOST, "workspace.example.com")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::ACCEPT, "application/json, text/event-stream")
+                .header("mcp-protocol-version", "2025-06-18")
+                .body(Body::from(payload.to_string()))
+                .unwrap()
+        };
+
+        let initialize = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "test",
+                    "version": "1.0.0"
+                }
+            }
+        });
+
+        let response = request(&router, mcp_request("invalid", initialize.clone())).await;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = request(&router, mcp_request(access, initialize)).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!response.headers().contains_key("mcp-session-id"));
+
+        let list = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list"
+        });
+
+        let response = request(&router, mcp_request(access, list.clone())).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+
+        assert!(String::from_utf8_lossy(&body).contains("server_info"));
+        assert!(String::from_utf8_lossy(&body).contains("capabilities_list"));
+
+        let call = json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "server_info",
+                "arguments": {}
+            }
+        });
+
+        let response = request(&router, mcp_request(access, call)).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+
+        assert!(String::from_utf8_lossy(&body).contains("ALXPRGS Workspace"));
+
+        let rotation = encode(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh),
+            ("resource", &resource),
+        ]);
+
+        let response = request(&router, post("/oauth/token", rotation)).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let rotated = read_json(response).await;
+
+        let new_access = rotated["access_token"].as_str().unwrap();
+        let new_refresh = rotated["refresh_token"].as_str().unwrap();
+
+        assert_ne!(refresh, new_refresh);
+
+        let revocation = encode(&[("token", new_refresh), ("token_type_hint", "refresh_token")]);
+
+        let response = request(&router, post("/oauth/revoke", revocation)).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = request(&router, mcp_request(new_access, list)).await;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
     fn session_cookie(credentials: &auth_store::SessionCredentials) -> String {
         format!(
             "__Host-workspace-session={}; \

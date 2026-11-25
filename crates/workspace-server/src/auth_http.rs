@@ -25,6 +25,13 @@ use workspace_core::config::SsoConfig;
 #[path = "refresh_http.rs"]
 mod refresh_http;
 
+#[path = "oauth_http.rs"]
+mod oauth_http;
+
+pub(crate) use oauth_http::router as oauth_router;
+
+const MCP_REQUEST_COOKIE: &str = "__Host-workspace-mcp-request";
+
 const FLOW_COOKIE: &str = "__Host-workspace-flow";
 const SESSION_COOKIE: &str = "__Host-workspace-session";
 const CSRF_COOKIE: &str = "__Host-workspace-csrf";
@@ -629,7 +636,13 @@ async fn callback(
         return response;
     };
 
-    let mut response = Redirect::to("/").into_response();
+    let destination = if cookie(&headers, MCP_REQUEST_COOKIE).is_some() {
+        "/oauth/consent"
+    } else {
+        "/"
+    };
+
+    let mut response = Redirect::to(destination).into_response();
 
     clear_flow(&mut response);
 

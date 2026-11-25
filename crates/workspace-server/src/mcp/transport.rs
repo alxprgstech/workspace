@@ -264,7 +264,7 @@ fn no_arguments() -> Arc<serde_json::Map<String, serde_json::Value>> {
 }
 
 fn tool_definitions() -> Vec<Tool> {
-    vec![
+    let mut tools = vec![
         Tool::new(
             "server_info",
             "Read-only build and runtime information for this Workspace instance.",
@@ -275,7 +275,28 @@ fn tool_definitions() -> Vec<Tool> {
             "Read-only catalog of capabilities with their real implementation status.",
             no_arguments(),
         ),
-    ]
+    ];
+
+    for tool in &mut tools {
+        tool.annotations = Some(
+            rmcp::model::ToolAnnotations::new()
+                .read_only(true)
+                .destructive(false)
+                .open_world(false),
+        );
+
+        tool.meta = Some(
+            serde_json::from_value(json!({
+                "securitySchemes": [{
+                    "type": "oauth2",
+                    "scopes": ["workspace.read"]
+                }]
+            }))
+            .expect("valid static tool metadata"),
+        );
+    }
+
+    tools
 }
 
 fn host_of(resource: &str) -> Option<String> {
@@ -292,6 +313,14 @@ pub type GatewayService = StreamableHttpService<GatewayServer, LocalSessionManag
 const MCP_PATH: &str = "/chatgpt/mcp";
 
 pub fn service(config: &McpConfig, schema_version: u32) -> Result<GatewayService, TokenError> {
+    service_with_mode(config, schema_version, true)
+}
+
+fn service_with_mode(
+    config: &McpConfig,
+    schema_version: u32,
+    stateful: bool,
+) -> Result<GatewayService, TokenError> {
     let mut allowed_hosts = vec!["localhost".to_owned(), "127.0.0.1".to_owned()];
 
     if let Some(host) = host_of(&config.resource)
@@ -312,6 +341,8 @@ pub fn service(config: &McpConfig, schema_version: u32) -> Result<GatewayService
 
     let mut http = StreamableHttpServerConfig::default();
     http.allowed_hosts = allowed_hosts;
+    http.legacy_session_mode = stateful;
+    http.max_request_body_bytes = 64 * 1024;
 
     Ok(StreamableHttpService::new(
         move || Ok(server.clone()),
@@ -391,6 +422,100 @@ async fn handle(service: GatewayService, request: Request) -> Response {
     }
 }
 
+pub fn local_router(
+    config: &McpConfig,
+    schema_version: u32,
+    store: Arc<crate::oauth_store::OAuthStore>,
+) -> Result<Router, TokenError> {
+    let service = service_with_mode(config, schema_version, false)?;
+
+    let metadata_url = format!(
+        "{}/.well-known/oauth-protected-resource/chatgpt/mcp",
+        config.issuer,
+    );
+
+    let challenge = HeaderValue::from_str(&format!(
+        "Bearer resource_metadata=\"{metadata_url}\", scope=\"workspace.read\""
+    ))
+    .map_err(|_| TokenError::Malformed)?;
+
+    let origin = config.issuer.clone();
+
+    let gate = move |request: Request, next: Next| {
+        let store = Arc::clone(&store);
+        let challenge = challenge.clone();
+        let origin = origin.clone();
+
+        async move {
+            let reject = || {
+                let mut response = StatusCode::UNAUTHORIZED.into_response();
+
+                response
+                    .headers_mut()
+                    .insert(header::WWW_AUTHENTICATE, challenge.clone());
+
+                response
+            };
+
+            if request.headers().contains_key(header::ORIGIN)
+                && !request
+                    .headers()
+                    .get(header::ORIGIN)
+                    .and_then(|value| value.to_str().ok())
+                    .is_some_and(|value| value == origin || value == "https://chatgpt.com")
+            {
+                return StatusCode::FORBIDDEN.into_response();
+            }
+
+            if request
+                .headers()
+                .get_all(header::AUTHORIZATION)
+                .iter()
+                .count()
+                != 1
+            {
+                return reject();
+            }
+
+            let Some(token) = bearer(request.headers()).map(str::to_owned) else {
+                return reject();
+            };
+
+            if token.len() > 128 {
+                return reject();
+            }
+
+            let identity = tokio::task::spawn_blocking(move || store.verify_access(&token)).await;
+
+            match identity {
+                Ok(Ok(Some(identity))) => {
+                    let caller = McpCaller {
+                        subject: identity.subject.clone(),
+                        scopes: vec![crate::oauth_store::SCOPE.to_owned()],
+                    };
+
+                    let mut request = request;
+
+                    request.extensions_mut().insert(Arc::new(caller));
+                    request.extensions_mut().insert(Arc::new(identity));
+
+                    next.run(request).await
+                }
+
+                Ok(Ok(None)) => reject(),
+
+                _ => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            }
+        }
+    };
+
+    Ok(Router::new()
+        .route(
+            MCP_PATH,
+            any(move |request: Request| handle(service.clone(), request)),
+        )
+        .layer(middleware::from_fn(gate)))
+}
 #[cfg(test)]
 mod tests {
     use super::*;
