@@ -19,6 +19,7 @@ pub const SCOPE: &str = "workspace.read";
 pub const SCOPES: &[&str] = &[
     "workspace:read",
     "workspace:write",
+    "workspace:delete",
     "execution:run",
     "files:read",
     "files:write",
