@@ -28,6 +28,7 @@ serde.workspace = true
 tracing.workspace = true
 tower = "0.5"
 workspace-core.workspace = true
+workspace-runtime.workspace = true
 rmcp = { version = "3.11.0", features = ["server", "transport-streamable-http-server"] }
 
 [dev-dependencies]

@@ -22,6 +22,7 @@ use serde::Serialize;
 use std::{io, sync::Arc};
 use tokio::net::TcpListener;
 use workspace_core::{PRODUCT_NAME, VERSION, config::Config};
+use workspace_runtime::{RuntimeProbe, SystemProbe};
 
 #[derive(Serialize)]
 struct HealthResponse {
@@ -61,14 +62,28 @@ async fn health() -> Json<HealthResponse> {
 }
 
 async fn ready() -> (StatusCode, Json<ReadinessResponse>) {
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        Json(ReadinessResponse {
-            status: "not_ready",
-            runtime_ready: false,
-            reason: "Runtime initialization is not implemented",
-        }),
-    )
+    // Readiness is a policy decision, not a guess: a host whose container
+    // engine has not been queried directly is never reported as ready.
+    let facts = SystemProbe.facts();
+
+    match workspace_runtime::evaluate(&facts) {
+        Ok(_) => (
+            StatusCode::OK,
+            Json(ReadinessResponse {
+                status: "ready",
+                runtime_ready: true,
+                reason: "",
+            }),
+        ),
+        Err(issue) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ReadinessResponse {
+                status: "not_ready",
+                runtime_ready: false,
+                reason: issue.reason(),
+            }),
+        ),
+    }
 }
 
 async fn server_info(State(info): State<ServerInfo>) -> Json<ServerInfo> {
@@ -307,6 +322,12 @@ mod tests {
 
         assert_eq!(body["runtime_ready"], false);
         assert_eq!(body["status"], "not_ready");
+
+        // The reason must name the real blocker instead of a generic string.
+        let reason = body["reason"].as_str().unwrap();
+
+        assert!(reason.len() > 20, "{reason}");
+        assert_ne!(reason, "Runtime initialization is not implemented");
     }
 
     #[tokio::test]
