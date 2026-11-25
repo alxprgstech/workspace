@@ -40,7 +40,8 @@ pub const MODULES: &[Module] = &[
             "ca-certificates",
         ],
         depends_on: &[],
-        available: false,
+        // The pinned base image is the audited base recipe.
+        available: true,
     },
     Module {
         id: "git",

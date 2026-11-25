@@ -121,15 +121,9 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing module {id}"))
         };
 
-        for id in [
-            "base",
-            "rust",
-            "cpp",
-            "git",
-            "python",
-            "ffmpeg",
-            "whisper-vad",
-        ] {
+        assert_eq!(status("base"), "available");
+
+        for id in ["rust", "cpp", "git", "python", "ffmpeg", "whisper-vad"] {
             assert_eq!(status(id), "not_installed", "{id}");
         }
 

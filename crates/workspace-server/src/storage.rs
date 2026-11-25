@@ -8,7 +8,7 @@ use std::{
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 6;
 
 const APPLICATION_ID: i64 = 0x414C5857;
 const MIN_SQLITE_VERSION: i32 = 3_051_003;
@@ -17,6 +17,8 @@ const MIGRATION_001: &str = include_str!("../migrations/0001_initial.sql");
 const MIGRATION_002: &str = include_str!("../migrations/0002_auth.sql");
 const MIGRATION_003: &str = include_str!("../migrations/0003_refresh_lease.sql");
 const MIGRATION_004: &str = include_str!("../migrations/0004_mcp_oauth.sql");
+const MIGRATION_005: &str = include_str!("../migrations/0005_workspaces.sql");
+const MIGRATION_006: &str = include_str!("../migrations/0006_scopes.sql");
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct StorageInfo {
@@ -136,6 +138,14 @@ fn migrate(connection: &mut Connection) -> Result<(), StorageError> {
         tx.execute_batch(MIGRATION_004)?;
     }
 
+    if version < 5 {
+        tx.execute_batch(MIGRATION_005)?;
+    }
+
+    if version < 6 {
+        tx.execute_batch(MIGRATION_006)?;
+    }
+
     tx.commit()?;
 
     Ok(())
@@ -194,6 +204,36 @@ fn read_info_versioned(
     })
 }
 
+/// Copy the database to a consistent backup before a destructive migration.
+///
+/// `VACUUM INTO` produces a byte-consistent snapshot without stopping writers
+/// that are not running yet (the server migrates before serving requests).
+fn backup_before_migration(
+    connection: &Connection,
+    data_dir: &Path,
+    version: u32,
+) -> Result<PathBuf, StorageError> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default();
+
+    let directory = data_dir
+        .join("backups")
+        .join(format!("pre-schema{version}-{stamp}"));
+
+    fs::create_dir_all(&directory)?;
+
+    let target = directory.join("workspace.db");
+
+    connection.execute(
+        "VACUUM INTO ?1",
+        params![target.to_string_lossy().to_string()],
+    )?;
+
+    Ok(target)
+}
+
 pub fn initialize(data_dir: &Path) -> Result<StorageInfo, StorageError> {
     check_sqlite_version()?;
 
@@ -203,6 +243,20 @@ pub fn initialize(data_dir: &Path) -> Result<StorageInfo, StorageError> {
     let mut connection = Connection::open(path)?;
 
     configure(&connection)?;
+
+    let version = schema_version(&connection)?;
+
+    if version > 0 && version < SCHEMA_VERSION {
+        let backup = backup_before_migration(&connection, data_dir, version)?;
+
+        tracing::info!(
+            path = %backup.display(),
+            from_version = version,
+            to_version = SCHEMA_VERSION,
+            "Database backup created before migration"
+        );
+    }
+
     migrate(&mut connection)?;
 
     let journal_mode: String =
@@ -581,7 +635,7 @@ mod mcp_oauth_migration_tests {
 
         let info = initialize(dir.path()).unwrap();
 
-        assert_eq!(info.schema_version, 4);
+        assert_eq!(info.schema_version, 6);
         assert_eq!(info.instance_id, "550e8400-e29b-41d4-a716-446655440000");
 
         let connection = open(dir.path()).unwrap();

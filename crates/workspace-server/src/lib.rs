@@ -11,13 +11,18 @@ mod web;
 mod auth_http;
 pub mod auth_store;
 pub mod crypto;
+mod http_jobs;
+mod http_workspaces;
+pub mod jobs;
 mod mcp;
 pub mod mcp_auth;
 pub mod oauth_store;
+mod runtime_bridge;
 pub mod secrets;
 pub mod sso;
 pub mod storage;
 pub mod users;
+pub mod workspaces;
 
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -48,9 +53,11 @@ struct ReadinessResponse {
 /// State shared by the HTTP API and, indirectly, by the MCP gateway.
 #[derive(Clone)]
 pub struct AppState {
-    storage: storage::StorageInfo,
-    resources: Value,
-    runtime: Arc<RuntimeMonitor>,
+    pub(crate) storage: storage::StorageInfo,
+    pub(crate) resources: Value,
+    pub(crate) runtime: Arc<RuntimeMonitor>,
+    pub(crate) workspaces: Arc<workspaces::Manager>,
+    pub(crate) jobs: Arc<jobs::Executor>,
 }
 
 impl AppState {
@@ -65,10 +72,81 @@ impl AppState {
             "max_job_seconds": config.resources.max_job_seconds,
         });
 
+        let budget = workspace_core::workspace::Limits {
+            cpu_millis: config.resources.cpu_millis,
+            memory_mib: config.resources.memory_mib,
+            pids: config.resources.max_processes_per_workspace,
+            disk_mib: config
+                .runtime
+                .as_ref()
+                .map(|runtime| runtime.workspace_storage_mib)
+                .unwrap_or(1024),
+            files: config
+                .runtime
+                .as_ref()
+                .map(|runtime| runtime.workspace_files)
+                .unwrap_or(100_000),
+            max_job_seconds: config.resources.max_job_seconds,
+        };
+
+        let settings = workspaces::ManagerSettings {
+            budget,
+            default_ttl_seconds: config.workspace.ttl_seconds,
+            idle_timeout_seconds: config.workspace.idle_timeout_seconds,
+            network_mode: match config.network.default_mode {
+                workspace_core::config::NetworkMode::None => "none".to_owned(),
+                workspace_core::config::NetworkMode::Allowlist => "allowlist".to_owned(),
+            },
+            base_image: config
+                .runtime
+                .as_ref()
+                .map(|runtime| runtime.base_image.clone())
+                .unwrap_or_default(),
+        };
+
+        let runtime_impl: Arc<dyn workspaces::WorkspaceRuntime> =
+            match runtime_bridge::DockerWorkspaceRuntime::new(
+                Arc::clone(&runtime),
+                storage.instance_id.clone(),
+            ) {
+                Ok(bridge) => Arc::new(bridge),
+                Err(error) => Arc::new(runtime_bridge::UnavailableRuntime::new(error.to_string())),
+            };
+
+        let manager = Arc::new(workspaces::Manager::new(
+            workspaces::Store::new(config.storage.data_dir.clone()),
+            runtime_impl,
+            settings,
+        ));
+
+        let job_runtime: Arc<dyn jobs::JobRuntime> =
+            match jobs::DockerJobRuntime::new(&runtime, storage.instance_id.clone()) {
+                Ok(job_runtime) => Arc::new(job_runtime),
+                Err(error) => Arc::new(jobs::UnavailableJobRuntime::new(error.to_string())),
+            };
+
+        let executor = jobs::Executor::new(
+            jobs::JobStore::new(config.storage.data_dir.clone()),
+            Arc::clone(&manager),
+            job_runtime,
+            Arc::clone(&runtime),
+            jobs::ExecSettings {
+                max_concurrent_jobs: config.resources.max_concurrent_jobs,
+                default_timeout_seconds: config
+                    .workspace
+                    .ttl_seconds
+                    .min(config.resources.max_job_seconds),
+                max_timeout_seconds: config.resources.max_job_seconds,
+            },
+            storage.instance_id.clone(),
+        );
+
         Self {
             storage,
             resources,
             runtime,
+            workspaces: manager,
+            jobs: Arc::new(executor),
         }
     }
 }
@@ -134,22 +212,52 @@ fn router(
         &storage.instance_id,
     ));
 
-    router_with_runtime(config, storage, auth, monitor)
+    let state = AppState::new(config, storage, Arc::clone(&monitor));
+
+    router_with_runtime(config, state, auth, monitor)
 }
 
 /// Router bound to a monitor shared with the background supervisor.
 fn router_with_runtime(
     config: &Config,
-    storage: storage::StorageInfo,
+    state: AppState,
     auth: Option<Arc<auth_http::AuthState>>,
     runtime: Arc<RuntimeMonitor>,
 ) -> Router {
-    let schema_version = storage.schema_version;
-    let state = AppState::new(config, storage, Arc::clone(&runtime));
-
+    let schema_version = state.storage.schema_version;
     let protected: Router = Router::new()
         .route("/ready", get(ready))
         .route("/api/v1/server/info", get(server_info))
+        .route("/api/v1/runtime", get(http_workspaces::runtime_status))
+        .route(
+            "/api/v1/workspaces",
+            get(http_workspaces::list).post(http_workspaces::create),
+        )
+        .route(
+            "/api/v1/workspaces/{id}",
+            get(http_workspaces::info)
+                .patch(http_workspaces::update)
+                .delete(http_workspaces::delete),
+        )
+        .route(
+            "/api/v1/workspaces/{id}/stop",
+            axum::routing::post(http_workspaces::stop),
+        )
+        .route(
+            "/api/v1/workspaces/{id}/start",
+            axum::routing::post(http_workspaces::start),
+        )
+        .route(
+            "/api/v1/workspaces/{id}/exec",
+            axum::routing::post(http_jobs::exec),
+        )
+        .route("/api/v1/jobs", get(http_jobs::list))
+        .route("/api/v1/jobs/{id}", get(http_jobs::info))
+        .route("/api/v1/jobs/{id}/logs", get(http_jobs::logs))
+        .route(
+            "/api/v1/jobs/{id}/cancel",
+            axum::routing::post(http_jobs::cancel),
+        )
         .with_state(state);
 
     let protected = match auth.as_ref() {
@@ -264,7 +372,7 @@ fn valid_local_mcp(config: &Config) -> bool {
 /// A stopped WSL2 distribution is woken by the same probe: the first pass
 /// tolerates the cold start through the bounded engine retry, and later passes
 /// only re-verify. Nothing here starts user workloads.
-fn spawn_runtime_supervisor(runtime: Arc<RuntimeMonitor>) {
+fn spawn_runtime_supervisor(runtime: Arc<RuntimeMonitor>, workspaces: Arc<workspaces::Manager>) {
     tokio::spawn(async move {
         if !runtime.configured() {
             tracing::warn!(
@@ -274,6 +382,10 @@ fn spawn_runtime_supervisor(runtime: Arc<RuntimeMonitor>) {
 
             return;
         }
+
+        // Wake the dedicated environment before the first probe; a stopped
+        // WSL2 distribution is a normal state, not an outage.
+        runtime.warm_up().await;
 
         let mut first = true;
 
@@ -310,11 +422,95 @@ fn spawn_runtime_supervisor(runtime: Arc<RuntimeMonitor>) {
 
             first = false;
 
-            tokio::time::sleep(ACCEPTANCE_REFRESH).await;
+            // Retry quickly while the runtime is unavailable, so a cold start
+            // or a restarted engine is picked up without waiting a full cycle.
+            let delay = if status.execution_ready {
+                ACCEPTANCE_REFRESH
+            } else {
+                Duration::from_secs(15)
+            };
+
+            tokio::time::sleep(delay).await;
+        }
+    });
+
+    // TTL and idle-timeout enforcement run on a short, fixed cadence.
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(60));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        loop {
+            ticker.tick().await;
+
+            match workspaces.reap(now_unix()).await {
+                Ok((deleted, stopped)) if deleted + stopped > 0 => {
+                    tracing::info!(deleted, stopped, "Workspace reaper completed a pass");
+                }
+                Ok(_) => {}
+                Err(error) => tracing::warn!(%error, "Workspace reaper failed"),
+            }
         }
     });
 }
 
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or_default()
+}
+
+/// Remove resources this instance owns that no live workspace needs.
+async fn runtime_reconcile(
+    docker: &workspace_runtime::docker::Docker,
+    manager: &workspaces::Manager,
+    instance: &str,
+) -> Result<(), workspace_runtime::RuntimeError> {
+    let containers = docker.list_managed(instance).await?;
+
+    for container in containers {
+        match container.kind.as_deref() {
+            Some("job") => {
+                tracing::warn!(name = %container.name, "Removing orphan job container");
+                docker.remove(&container.name).await?;
+            }
+            Some("workspace") => {
+                let workspace = container
+                    .workspace
+                    .as_deref()
+                    .and_then(|id| manager.store().get(id).ok().flatten());
+
+                let keep = workspace.as_ref().is_some_and(|workspace| {
+                    workspace.execution_mode == workspace_core::workspace::ExecutionMode::Persistent
+                        && workspace.state.holds_compute()
+                });
+
+                if !keep {
+                    tracing::warn!(name = %container.name, "Removing untracked workspace container");
+                    docker.remove(&container.name).await?;
+
+                    if let Some(workspace) = workspace {
+                        let _ = manager.store().set_container(&workspace.id, None);
+
+                        if workspace.state.holds_compute() {
+                            let _ = manager.store().set_state(
+                                &workspace.id,
+                                workspace_core::workspace::WorkspaceState::Stopped,
+                                Some("container was not running after restart"),
+                            );
+                        }
+                    }
+                }
+            }
+            _ => {
+                tracing::warn!(name = %container.name, "Removing unlabelled instance container");
+                docker.remove(&container.name).await?;
+            }
+        }
+    }
+
+    Ok(())
+}
 pub async fn serve(config: Config) -> io::Result<()> {
     if !valid_local_mcp(&config) {
         return Err(io::Error::new(
@@ -401,7 +597,28 @@ pub async fn serve(config: Config) -> io::Result<()> {
         &storage.instance_id,
     ));
 
-    spawn_runtime_supervisor(Arc::clone(&runtime));
+    let state = AppState::new(&config, storage, Arc::clone(&runtime));
+
+    // Nothing from a previous process may keep running: unfinished jobs are
+    // marked interrupted and this instance's orphan containers are removed.
+    match state.jobs.recover() {
+        Ok(0) => {}
+        Ok(count) => tracing::warn!(count, "Unfinished jobs marked as interrupted"),
+        Err(error) => tracing::error!(%error, "Job recovery failed"),
+    }
+
+    if let Some(docker) = runtime.docker().cloned() {
+        let manager = Arc::clone(&state.workspaces);
+        let instance = state.storage.instance_id.clone();
+
+        tokio::spawn(async move {
+            if let Err(error) = runtime_reconcile(&docker, &manager, &instance).await {
+                tracing::warn!(%error, "Runtime reconciliation failed");
+            }
+        });
+    }
+
+    spawn_runtime_supervisor(Arc::clone(&runtime), Arc::clone(&state.workspaces));
 
     tracing::info!(
         backend = runtime
@@ -413,7 +630,7 @@ pub async fn serve(config: Config) -> io::Result<()> {
 
     axum::serve(
         listener,
-        router_with_runtime(&config, storage, auth, Arc::clone(&runtime))
+        router_with_runtime(&config, state, auth, Arc::clone(&runtime))
             .into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
     .with_graceful_shutdown(shutdown)

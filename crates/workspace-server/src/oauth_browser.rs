@@ -20,6 +20,14 @@ pub(crate) struct PendingAuthorization {
     pub client_name: String,
 }
 
+/// Effective scopes of one authorization request.
+pub(crate) fn requested_scopes(request: &AuthorizationRequest) -> Vec<String> {
+    match request.scope.as_deref() {
+        Some(scope) => parse_scopes(scope),
+        None => parse_scopes(&default_scope()),
+    }
+}
+
 fn request_aad(handle: &str, client_id: &str) -> Vec<u8> {
     format!("workspace:mcp-request:v1:{handle}:{client_id}").into_bytes()
 }
@@ -31,7 +39,10 @@ fn validate(request: &AuthorizationRequest, resource: &str) -> Result<(), OAuthE
         || request.code_challenge_method != "S256"
         || !valid_challenge(&request.code_challenge)
         || request.resource != resource
-        || request.scope.as_deref().unwrap_or(SCOPE) != SCOPE
+        || request
+            .scope
+            .as_deref()
+            .is_some_and(|scope| parse_scopes(scope).is_empty())
         || request.state.is_empty()
         || request.state.len() > 512
         || request.state.chars().any(char::is_control)
@@ -53,20 +64,21 @@ impl OAuthStore {
         let mut connection = storage::open(&self.data_dir)?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
-        let client_exists: bool = tx.query_row(
-            "SELECT EXISTS (
-                SELECT 1 FROM mcp_oauth_clients
-                WHERE client_id = ?1
-                  AND redirect_uri = ?2
-                  AND allowed_scope = ?3
-                  AND is_enabled = 1
-            )",
-            params![request.client_id, request.redirect_uri, SCOPE],
-            |row| row.get(0),
-        )?;
+        let allowed_scope: Option<String> = tx
+            .query_row(
+                "SELECT allowed_scope FROM mcp_oauth_clients
+                 WHERE client_id = ?1 AND redirect_uri = ?2 AND is_enabled = 1",
+                params![request.client_id, request.redirect_uri],
+                |row| row.get(0),
+            )
+            .optional()?;
 
-        if !client_exists {
+        let Some(allowed_scope) = allowed_scope else {
             return Err(OAuthError::InvalidClient);
+        };
+
+        if !scope_subset(&requested_scopes(request), &parse_scopes(&allowed_scope)) {
+            return Err(OAuthError::InvalidRequest);
         }
 
         tx.execute(
@@ -147,9 +159,8 @@ impl OAuthStore {
              JOIN mcp_oauth_clients c ON c.client_id = r.client_id
              WHERE r.handle_hash = ?1
                AND r.expires_at_unix > unixepoch()
-               AND c.is_enabled = 1
-               AND c.allowed_scope = ?2",
-                params![&crypto::hash_handle(handle)[..], SCOPE],
+               AND c.is_enabled = 1",
+                params![&crypto::hash_handle(handle)[..]],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
@@ -174,6 +185,16 @@ impl OAuthStore {
         validate(&request, &self.resource)?;
 
         if request.client_id != client_id || request.redirect_uri != redirect_uri {
+            return Err(OAuthError::InvalidRequest);
+        }
+
+        let allowed_scope: String = connection.query_row(
+            "SELECT allowed_scope FROM mcp_oauth_clients WHERE client_id = ?1",
+            params![client_id],
+            |row| row.get(0),
+        )?;
+
+        if !scope_subset(&requested_scopes(&request), &parse_scopes(&allowed_scope)) {
             return Err(OAuthError::InvalidRequest);
         }
 
@@ -258,6 +279,7 @@ impl OAuthStore {
                 &request.redirect_uri,
                 &request.code_challenge,
                 user_id,
+                &requested_scopes(&request).join(" "),
             )?)
         } else {
             None

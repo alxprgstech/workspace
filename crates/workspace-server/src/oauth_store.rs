@@ -9,7 +9,51 @@ use thiserror::Error;
 use uuid::Uuid;
 use workspace_core::config::SsoConfig;
 
+/// Scope required by tokens issued before per-operation scopes existed.
+///
+/// Such tokens stay read-only: they are normalised to `workspace:read` and can
+/// never be silently upgraded.
 pub const SCOPE: &str = "workspace.read";
+
+/// Scopes this deployment can grant.
+pub const SCOPES: &[&str] = &[
+    "workspace:read",
+    "workspace:write",
+    "execution:run",
+    "files:read",
+    "files:write",
+    "artifacts:read",
+    "artifacts:publish",
+];
+
+/// Scope set a newly registered client asks for.
+pub fn default_scope() -> String {
+    SCOPES.join(" ")
+}
+
+/// Normalise a stored scope string into canonical, sorted scopes.
+///
+/// Unknown values are dropped, and the legacy `workspace.read` scope maps to
+/// the read-only subset.
+pub fn parse_scopes(raw: &str) -> Vec<String> {
+    let mut scopes: Vec<String> = raw
+        .split_whitespace()
+        .filter_map(|scope| match scope {
+            "workspace.read" => Some("workspace:read".to_owned()),
+            other if SCOPES.contains(&other) => Some(other.to_owned()),
+            _ => None,
+        })
+        .collect();
+
+    scopes.sort();
+    scopes.dedup();
+    scopes
+}
+
+/// Whether every scope in `granted` is permitted by `allowed`.
+pub fn scope_subset(granted: &[String], allowed: &[String]) -> bool {
+    !granted.is_empty() && granted.iter().all(|scope| allowed.contains(scope))
+}
 pub const CODE_TTL: i64 = 60;
 pub const ACCESS_TTL: i64 = 600;
 pub const GRANT_TTL: i64 = 30 * 24 * 60 * 60;
@@ -62,6 +106,7 @@ pub struct TokenPair {
     pub access_token: String,
     pub refresh_token: String,
     pub expires_in: i64,
+    pub scope: String,
 }
 
 #[derive(Debug)]
@@ -70,6 +115,7 @@ pub struct AccessIdentity {
     pub subject: String,
     pub role: String,
     pub grant_id: String,
+    pub scopes: Vec<String>,
 }
 
 fn random_token(prefix: &str) -> Result<String, OAuthError> {
@@ -138,9 +184,8 @@ fn authenticate_client(
             WHERE client_id = ?1
               AND secret_hash = ?2
               AND is_enabled = 1
-              AND allowed_scope = ?3
         )",
-        params![client_id, &crypto::hash_handle(secret)[..], SCOPE],
+        params![client_id, &crypto::hash_handle(secret)[..]],
         |row| row.get(0),
     )?;
 
@@ -168,6 +213,7 @@ fn issue_pair(
     generation: i64,
     current_time: i64,
     grant_expiry: i64,
+    scope: &str,
 ) -> Result<TokenPair, OAuthError> {
     let access_expiry = (current_time + ACCESS_TTL).min(grant_expiry);
 
@@ -208,6 +254,7 @@ fn issue_pair(
         access_token,
         refresh_token,
         expires_in: access_expiry - current_time,
+        scope: scope.to_owned(),
     })
 }
 
@@ -260,7 +307,7 @@ impl OAuthStore {
                 name.trim(),
                 &crypto::hash_handle(&client_secret)[..],
                 redirect_uri,
-                SCOPE,
+                default_scope(),
             ],
         )?;
 
@@ -330,7 +377,14 @@ impl OAuthStore {
         let mut connection = storage::open(&self.data_dir)?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
-        let code = self.issue_code_on(&tx, client_id, redirect_uri, challenge, user_id)?;
+        let code = self.issue_code_on(
+            &tx,
+            client_id,
+            redirect_uri,
+            challenge,
+            user_id,
+            &default_scope(),
+        )?;
 
         tx.commit()?;
 
@@ -362,7 +416,7 @@ impl OAuthStore {
         let record = tx
             .query_row(
                 "SELECT g.id, g.expires_at_unix,
-                    c.expires_at_unix, c.consumed_at_unix
+                    c.expires_at_unix, c.consumed_at_unix, g.scope
              FROM mcp_oauth_codes c
              JOIN mcp_oauth_grants g ON g.id = c.grant_id
              JOIN users u ON u.id = g.user_id
@@ -370,17 +424,16 @@ impl OAuthStore {
                AND g.client_id = ?2
                AND c.redirect_uri = ?3
                AND c.code_challenge = ?4
-               AND g.resource = ?5 AND g.scope = ?6
+               AND g.resource = ?5
                AND g.revoked_at_unix IS NULL
-               AND g.expires_at_unix > ?7
-               AND u.issuer = ?8 AND u.is_enabled = 1",
+               AND g.expires_at_unix > ?6
+               AND u.issuer = ?7 AND u.is_enabled = 1",
                 params![
                     &hash[..],
                     client_id,
                     redirect_uri,
                     challenge,
                     self.resource,
-                    SCOPE,
                     current_time,
                     self.user_issuer,
                 ],
@@ -390,14 +443,19 @@ impl OAuthStore {
                         row.get::<_, i64>(1)?,
                         row.get::<_, i64>(2)?,
                         row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, String>(4)?,
                     ))
                 },
             )
             .optional()?;
 
-        let Some((grant_id, grant_expiry, code_expiry, consumed)) = record else {
+        let Some((grant_id, grant_expiry, code_expiry, consumed, scope)) = record else {
             return Err(OAuthError::InvalidGrant);
         };
+
+        if parse_scopes(&scope).is_empty() {
+            return Err(OAuthError::InvalidGrant);
+        }
 
         if consumed.is_some() {
             revoke_grant(&tx, &grant_id)?;
@@ -415,7 +473,7 @@ impl OAuthStore {
             params![current_time, &hash[..]],
         )?;
 
-        let pair = issue_pair(&tx, &grant_id, 0, current_time, grant_expiry)?;
+        let pair = issue_pair(&tx, &grant_id, 0, current_time, grant_expiry, &scope)?;
 
         tx.commit()?;
 
@@ -443,23 +501,22 @@ impl OAuthStore {
         let record = tx
             .query_row(
                 "SELECT g.id, g.expires_at_unix,
-                    r.generation, r.consumed_at_unix
+                    r.generation, r.consumed_at_unix, g.scope
              FROM mcp_refresh_tokens r
              JOIN mcp_oauth_grants g ON g.id = r.grant_id
              JOIN users u ON u.id = g.user_id
              WHERE r.token_hash = ?1
                AND g.client_id = ?2
-               AND g.resource = ?3 AND g.scope = ?4
+               AND g.resource = ?3
                AND g.revoked_at_unix IS NULL
                AND r.revoked_at_unix IS NULL
-               AND g.expires_at_unix > ?5
-               AND r.expires_at_unix > ?5
-               AND u.issuer = ?6 AND u.is_enabled = 1",
+               AND g.expires_at_unix > ?4
+               AND r.expires_at_unix > ?4
+               AND u.issuer = ?5 AND u.is_enabled = 1",
                 params![
                     &hash[..],
                     client_id,
                     self.resource,
-                    SCOPE,
                     current_time,
                     self.user_issuer,
                 ],
@@ -469,12 +526,13 @@ impl OAuthStore {
                         row.get::<_, i64>(1)?,
                         row.get::<_, i64>(2)?,
                         row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, String>(4)?,
                     ))
                 },
             )
             .optional()?;
 
-        let Some((grant_id, expiry, generation, consumed)) = record else {
+        let Some((grant_id, expiry, generation, consumed, scope)) = record else {
             return Err(OAuthError::InvalidGrant);
         };
 
@@ -493,7 +551,14 @@ impl OAuthStore {
             params![current_time, &hash[..]],
         )?;
 
-        let pair = issue_pair(&tx, &grant_id, next_generation, current_time, expiry)?;
+        let pair = issue_pair(
+            &tx,
+            &grant_id,
+            next_generation,
+            current_time,
+            expiry,
+            &scope,
+        )?;
 
         tx.commit()?;
 
@@ -507,39 +572,60 @@ impl OAuthStore {
 
         let connection = storage::open(&self.data_dir)?;
 
-        Ok(connection
+        let record = connection
             .query_row(
-                "SELECT u.id, u.subject, u.role, g.id
-             FROM mcp_access_tokens a
-             JOIN mcp_oauth_grants g ON g.id = a.grant_id
-             JOIN users u ON u.id = g.user_id
-             JOIN mcp_oauth_clients c ON c.client_id = g.client_id
-             WHERE a.token_hash = ?1
-               AND a.expires_at_unix > unixepoch()
-               AND g.expires_at_unix > unixepoch()
-               AND a.revoked_at_unix IS NULL
-               AND g.revoked_at_unix IS NULL
-               AND u.is_enabled = 1 AND c.is_enabled = 1
-               AND g.resource = ?2 AND g.scope = ?3
-               AND c.allowed_scope = ?3 AND u.issuer = ?4",
+                "SELECT u.id, u.subject, u.role, g.id, g.scope, c.allowed_scope
+                 FROM mcp_access_tokens a
+                 JOIN mcp_oauth_grants g ON g.id = a.grant_id
+                 JOIN users u ON u.id = g.user_id
+                 JOIN mcp_oauth_clients c ON c.client_id = g.client_id
+                 WHERE a.token_hash = ?1
+                   AND a.expires_at_unix > unixepoch()
+                   AND g.expires_at_unix > unixepoch()
+                   AND a.revoked_at_unix IS NULL
+                   AND g.revoked_at_unix IS NULL
+                   AND u.is_enabled = 1 AND c.is_enabled = 1
+                   AND g.resource = ?2
+                   AND u.issuer = ?3",
                 params![
                     &crypto::hash_handle(token)[..],
                     self.resource,
-                    SCOPE,
                     self.user_issuer,
                 ],
                 |row| {
-                    Ok(AccessIdentity {
-                        user_id: row.get(0)?,
-                        subject: row.get(1)?,
-                        role: row.get(2)?,
-                        grant_id: row.get(3)?,
-                    })
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
                 },
             )
-            .optional()?)
-    }
+            .optional()?;
 
+        let Some((user_id, subject, role, grant_id, scope, allowed_scope)) = record else {
+            return Ok(None);
+        };
+
+        // A grant is only honoured while it stays inside the client's allowed
+        // scope set. This is what stops a client from widening its own rights.
+        let scopes = parse_scopes(&scope);
+        let allowed = parse_scopes(&allowed_scope);
+
+        if !scope_subset(&scopes, &allowed) {
+            return Ok(None);
+        }
+
+        Ok(Some(AccessIdentity {
+            user_id,
+            subject,
+            role,
+            grant_id,
+            scopes,
+        }))
+    }
     pub fn revoke(&self, client_id: &str, secret: &str, token: &str) -> Result<(), OAuthError> {
         let mut connection = storage::open(&self.data_dir)?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -571,6 +657,7 @@ impl OAuthStore {
 }
 
 impl OAuthStore {
+    #[allow(clippy::too_many_arguments)]
     fn issue_code_on(
         &self,
         connection: &Connection,
@@ -578,6 +665,7 @@ impl OAuthStore {
         redirect_uri: &str,
         challenge: &str,
         user_id: &str,
+        scopes: &str,
     ) -> Result<String, OAuthError> {
         let current_time = now(connection)?;
         let grant_id = Uuid::new_v4().to_string();
@@ -592,12 +680,11 @@ impl OAuthStore {
              WHERE u.id = ?6 AND u.issuer = ?7
                AND u.is_enabled = 1
                AND c.client_id = ?8 AND c.is_enabled = 1
-               AND c.redirect_uri = ?9
-               AND c.allowed_scope = ?3",
+               AND c.redirect_uri = ?9",
             params![
                 grant_id,
                 self.resource,
-                SCOPE,
+                scopes,
                 current_time,
                 current_time + GRANT_TTL,
                 user_id,

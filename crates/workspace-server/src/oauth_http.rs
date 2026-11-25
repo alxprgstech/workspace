@@ -1,5 +1,7 @@
 use super::*;
-use crate::oauth_store::{OAuthError, OAuthStore, SCOPE, TokenPair, browser::AuthorizationRequest};
+use crate::oauth_store::{
+    OAuthError, OAuthStore, SCOPES, TokenPair, browser::AuthorizationRequest, parse_scopes,
+};
 use axum::{
     Form,
     extract::{DefaultBodyLimit, Query},
@@ -67,7 +69,7 @@ async fn metadata(State(state): State<Arc<OAuthHttp>>) -> Json<serde_json::Value
             "client_secret_basic", "client_secret_post"
         ],
         "authorization_response_iss_parameter_supported": true,
-        "scopes_supported": [SCOPE]
+        "scopes_supported": SCOPES
     }))
 }
 
@@ -216,7 +218,8 @@ small {{opacity:.7;overflow-wrap:anywhere}}
 <h1>Authorize application</h1>
 <p><strong>{client}</strong> requests access to Workspace.</p>
 <p>Signed in as <strong>{username}</strong>.</p>
-<p>Permission: read server information and available capabilities.</p>
+<p>Permissions requested:</p>
+<ul>{scopes}</ul>
 <p><small>Resource: {resource}</small></p>
 <form method="post" action="/oauth/consent">
 <input type="hidden" name="csrf" value="{csrf}">
@@ -230,6 +233,10 @@ small {{opacity:.7;overflow-wrap:anywhere}}
 </html>"#,
         client = escape(&pending.client_name),
         username = escape(username),
+        scopes = crate::oauth_store::browser::requested_scopes(&pending.request)
+            .iter()
+            .map(|scope| format!("<li><code>{}</code></li>", escape(scope)))
+            .collect::<String>(),
         resource = escape(state.store.resource()),
         csrf = escape(&csrf),
         handle = escape(&handle),
@@ -416,7 +423,7 @@ fn token_response(pair: TokenPair) -> Response {
         "refresh_token": pair.refresh_token,
         "token_type": "Bearer",
         "expires_in": pair.expires_in,
-        "scope": SCOPE,
+        "scope": pair.scope,
     }))
     .into_response()
 }
@@ -435,7 +442,10 @@ async fn token(
         .resource
         .as_deref()
         .is_some_and(|value| value != state.store.resource())
-        || form.scope.as_deref().is_some_and(|value| value != SCOPE)
+        || form
+            .scope
+            .as_deref()
+            .is_some_and(|value| parse_scopes(value).is_empty())
     {
         return error_response(OAuthError::InvalidRequest);
     }

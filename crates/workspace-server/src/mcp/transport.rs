@@ -507,7 +507,7 @@ pub fn local_router(
                 Ok(Ok(Some(identity))) => {
                     let caller = McpCaller {
                         subject: identity.subject.clone(),
-                        scopes: vec![crate::oauth_store::SCOPE.to_owned()],
+                        scopes: identity.scopes.clone(),
                     };
 
                     let mut request = request;

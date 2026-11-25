@@ -387,6 +387,51 @@ impl Docker {
         })
     }
 
+    /// Build an attached `docker run` command for a job.
+    pub fn command_run(
+        &self,
+        spec: &ContainerSpec,
+    ) -> Result<tokio::process::Command, RuntimeError> {
+        let arguments = self.arguments(spec.arguments("run")?);
+
+        self.host.command(&self.docker_path, &arguments)
+    }
+
+    /// Build an attached `docker exec` command inside a workspace container.
+    pub fn command_exec(
+        &self,
+        name: &str,
+        argv: &[String],
+        workdir: &str,
+        env: &[(String, String)],
+    ) -> Result<tokio::process::Command, RuntimeError> {
+        validate_container_name(name)?;
+
+        if argv.is_empty() {
+            return Err(RuntimeError::Protocol(
+                "an exec command is required".to_owned(),
+            ));
+        }
+
+        let mut arguments = vec![
+            "exec".to_owned(),
+            "--workdir".to_owned(),
+            workdir.to_owned(),
+        ];
+
+        for (key, value) in env {
+            validate_env(key, value)?;
+            arguments.push("--env".to_owned());
+            arguments.push(format!("{key}={value}"));
+        }
+
+        arguments.push(name.to_owned());
+        arguments.extend(argv.iter().cloned());
+
+        self.host
+            .command(&self.docker_path, &self.arguments(arguments))
+    }
+
     /// Inspect one container.
     pub async fn inspect(&self, name: &str) -> Result<ContainerState, RuntimeError> {
         validate_container_name(name)?;

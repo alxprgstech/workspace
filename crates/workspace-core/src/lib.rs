@@ -19,3 +19,5 @@ mod tests {
 pub mod capabilities;
 pub mod config;
 pub mod helper;
+pub mod job;
+pub mod workspace;
