@@ -665,7 +665,25 @@ mod auth_http_tests {
 
         assert_eq!(response.status(), StatusCode::OK);
 
-        let tag = URL_SAFE_NO_PAD.encode(crypto::hash_handle(&credentials.handle));
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+
+        let html = String::from_utf8(body.to_vec()).unwrap();
+
+        let tag = html
+            .split_once("name=\"session_tag\" value=\"")
+            .unwrap()
+            .1
+            .split('"')
+            .next()
+            .unwrap()
+            .to_owned();
+
+        let post_cookies = format!(
+            "__Host-workspace-session={}; __Host-workspace-csrf={}",
+            credentials.handle, credentials.csrf_token,
+        );
 
         let consent = encode(&[
             ("csrf", &credentials.csrf_token),
@@ -679,13 +697,21 @@ mod auth_http_tests {
                 .method(Method::POST)
                 .uri("/oauth/consent")
                 .header(header::ORIGIN, origin)
-                .header(header::COOKIE, &cookies)
+                .header(header::COOKIE, &post_cookies)
                 .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
                 .body(Body::from(consent.clone()))
                 .unwrap()
         };
 
         let response = request(&router, consent_request("https://untrusted.example")).await;
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let mut forged = consent_request(ORIGIN);
+
+        *forged.body_mut() = Body::from(consent.replace(&tag, &"A".repeat(43)));
+
+        let response = request(&router, forged).await;
 
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
 

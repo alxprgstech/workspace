@@ -1,8 +1,5 @@
 use super::*;
-use crate::{
-    crypto,
-    oauth_store::{OAuthError, OAuthStore, SCOPE, TokenPair, browser::AuthorizationRequest},
-};
+use crate::oauth_store::{OAuthError, OAuthStore, SCOPE, TokenPair, browser::AuthorizationRequest};
 use axum::{
     Form,
     extract::{DefaultBodyLimit, Query},
@@ -126,8 +123,31 @@ fn escape(value: &str) -> String {
         .replace(char::from(39), "\x26#39;")
 }
 
-fn session_tag(handle: &str) -> String {
-    URL_SAFE_NO_PAD.encode(crypto::hash_handle(handle))
+fn consent_message(session: &str, request: &str, csrf: &str) -> String {
+    format!("workspace:mcp-consent:v1:{session}:{request}:{csrf}")
+}
+
+fn consent_tag(key: &[u8; 32], session: &str, request: &str, csrf: &str) -> String {
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, key);
+    let message = consent_message(session, request, csrf);
+
+    URL_SAFE_NO_PAD.encode(ring::hmac::sign(&key, message.as_bytes()).as_ref())
+}
+
+fn verify_consent_tag(key: &[u8; 32], session: &str, request: &str, csrf: &str, tag: &str) -> bool {
+    if !valid_handle(session) || !valid_handle(request) || !valid_handle(csrf) || !valid_handle(tag)
+    {
+        return false;
+    }
+
+    let Ok(signature) = URL_SAFE_NO_PAD.decode(tag) else {
+        return false;
+    };
+
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, key);
+    let message = consent_message(session, request, csrf);
+
+    ring::hmac::verify(&key, message.as_bytes(), &signature).is_ok()
 }
 
 async fn consent_page(
@@ -213,7 +233,12 @@ small {{opacity:.7;overflow-wrap:anywhere}}
         resource = escape(state.store.resource()),
         csrf = escape(&csrf),
         handle = escape(&handle),
-        tag = session_tag(&session_handle),
+        tag = consent_tag(
+            state.auth.secrets.encryption_key(),
+            &session_handle,
+            &handle,
+            &csrf,
+        ),
     );
 
     let mut response = Html(page).into_response();
@@ -254,7 +279,7 @@ async fn consent_submit(
 ) -> Response {
     if !valid_origin(&headers, &state.auth)
         || cookie(&headers, CSRF_COOKIE).as_deref() != Some(form.csrf.as_str())
-        || cookie(&headers, MCP_REQUEST_COOKIE).as_deref() != Some(form.request_handle.as_str())
+        || cookie(&headers, MCP_REQUEST_COOKIE).is_some_and(|value| value != form.request_handle)
         || !matches!(form.decision.as_str(), "approve" | "deny")
     {
         return StatusCode::FORBIDDEN.into_response();
@@ -264,7 +289,13 @@ async fn consent_submit(
         return StatusCode::UNAUTHORIZED.into_response();
     };
 
-    if session_tag(&handle) != form.session_tag {
+    if !verify_consent_tag(
+        state.auth.secrets.encryption_key(),
+        &handle,
+        &form.request_handle,
+        &form.csrf,
+        &form.session_tag,
+    ) {
         return StatusCode::FORBIDDEN.into_response();
     }
 
