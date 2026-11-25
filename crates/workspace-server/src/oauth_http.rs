@@ -243,10 +243,19 @@ small {{opacity:.7;overflow-wrap:anywhere}}
 
     let mut response = Html(page).into_response();
 
+    let Ok(callback) = Url::parse(&pending.request.redirect_uri) else {
+        return error_response(OAuthError::InvalidRequest);
+    };
+
+    let form_action = format!(
+        "form-action 'self' {}",
+        callback.origin().ascii_serialization(),
+    );
+
     let csp = [
         "default-src 'none'",
         "style-src 'unsafe-inline'",
-        "form-action 'self'",
+        form_action.as_str(),
         "frame-ancestors 'none'",
         "base-uri 'none'",
     ]
