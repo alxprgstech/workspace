@@ -15,7 +15,7 @@
 | 010 Capability Images | **завершён** (кроме whisper-vad) | образ собран; cargo/rustc/clippy/g++/python/ffmpeg проверены |
 | 011 Execution & Jobs | **завершён** | job exit code, stdout/stderr, отмена, idempotency |
 | 012 Files & Artifacts | **завершён** | write/read/patch/import/publish/download + SHA-256 |
-| 013 Security & Isolation | частично | изоляция/лимиты подтверждены; **egress allowlist не реализован** |
+| 013 Security & Isolation | **завершён** | изоляция/лимиты подтверждены; egress allowlist реализован и проверен |
 | 014 Финальная приёмка | частично | runtime E2E, ClipForge, MCP protocol E2E; ChatGPT-сессия и деплой — нет |
 | Web UI | **реализован** | 6 разделов, production-сборка встроена в бинарник |
 
@@ -113,11 +113,14 @@ TTL/stop/start/pin/delete), Jobs (список, cancel, stdout/stderr), Files
 
 ## 7. Оставшиеся обязательные работы
 
-1. **Egress allowlist (этап 013)** — не реализован. Пространства работают
-   только с `network = none`; это осознанно, чтобы не выдавать непроверенную
-   сетевую изоляцию за готовую. Требуется доверенный прокси, отдельные
-   внутренние Docker-сети, проверка DNS/IP, блокировка LAN/metadata и
-   практическая приёмка обхода политики.
+1. **Egress allowlist (этап 013)** — реализован и проверен:
+   `crates/workspace-egress` (статический прокси только с CONNECT/443,
+   allowlist по хостам, запрет IP-литералов и непубличных адресов, DNS pinning,
+   лимиты соединений), внутренняя Docker-сеть на пространство, отдельный
+   контейнер-прокси, автоматическое восстановление сетей после рестарта.
+   Приёмки: `scripts/egress-acceptance.sh` (direct=000, allowed=200, denied=403,
+   metadata=405) и `tests/egress_e2e.rs` (job: allowed=200, denied=403,
+   сеть удаляется вместе с пространством).
 2. **whisper-vad** — нет доверенного источника с checksum; модуль выключен,
    создание пространства с ним отклоняется.
 3. **ClipForge Speech (v0.4.0)** — спецификация доступна, upstream содержит
