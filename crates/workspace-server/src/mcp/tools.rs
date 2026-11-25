@@ -36,13 +36,13 @@ pub fn capabilities_catalog(schema_version: u32) -> Value {
             },
             {
                 "id": "mcp_gateway",
-                "status": "partial",
-                "description": "Token validation, protected-resource metadata and the MCP transport are present; OAuth issuance is not.",
+                "status": "ready",
+                "description": "Local OAuth authorization, token issuance, refresh rotation, revocation and authenticated MCP transport are implemented.",
             },
             {
                 "id": "docker_runtime",
-                "status": "absent",
-                "description": "Isolated execution runtime (stage 008) is not implemented.",
+                "status": "partial",
+                "description": "Dedicated WSL2 rootless Docker and quota storage preflight are implemented; execution remains disabled.",
             },
             {
                 "id": "workspace_manager",
@@ -88,8 +88,8 @@ mod tests {
         };
 
         assert_eq!(status("http_api"), "ready");
-        assert_eq!(status("mcp_gateway"), "partial");
-        assert_eq!(status("docker_runtime"), "absent");
+        assert_eq!(status("mcp_gateway"), "ready");
+        assert_eq!(status("docker_runtime"), "partial");
         assert_eq!(status("workspace_manager"), "absent");
     }
 }

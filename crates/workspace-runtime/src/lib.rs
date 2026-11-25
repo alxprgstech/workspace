@@ -6,7 +6,10 @@
 //! The evaluation is a pure function over observed facts so the fail-closed
 //! rules can be tested without touching a host runtime.
 
+mod live;
 mod probe;
+
+pub use live::{LiveReport, probe_wsl};
 
 pub use probe::{RuntimeProbe, SystemProbe};
 

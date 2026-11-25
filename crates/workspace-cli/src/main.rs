@@ -344,13 +344,32 @@ fn run(cli: Cli) -> AppResult<ExitCode> {
                 }
             }
 
-            let facts = workspace_runtime::SystemProbe.facts();
+            if !cfg!(windows) {
+                let facts = workspace_runtime::SystemProbe.facts();
 
-            match workspace_runtime::evaluate(&facts) {
-                Ok(kind) => println!("[OK] Container runtime: {kind:?}"),
-                Err(issue) => println!("[PENDING] Container runtime: {}", issue.reason()),
+                match workspace_runtime::evaluate(&facts) {
+                    Ok(kind) => println!("[OK] Container runtime: {kind:?}"),
+                    Err(issue) => println!("[PENDING] Container runtime: {}", issue.reason()),
+                }
             }
-            println!("[PENDING] Resource isolation");
+            if cfg!(windows) {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+
+                match runtime.block_on(workspace_runtime::probe_wsl()) {
+                    Ok(report) => {
+                        println!("[OK] Dedicated WSL2 Docker: {}", report.engine);
+                        println!("[OK] Cgroup version: {}", report.cgroup_version);
+                        println!("[OK] Storage: {}", report.storage);
+                    }
+                    Err(error) => {
+                        println!("[FAIL] Runtime preflight: {error}");
+                    }
+                }
+            }
+
+            println!("[PENDING] Automatic resource isolation acceptance");
             println!("[PENDING] Storage quotas");
             println!("[PENDING] Network isolation");
             println!("[PENDING] ALXPRGS SSO");
