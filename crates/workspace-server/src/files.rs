@@ -188,6 +188,10 @@ impl Files {
         format!("{}/artifacts", self.settings.data_root)
     }
 
+    pub fn max_import_bytes(&self) -> u64 {
+        self.max_import_bytes
+    }
+
     pub fn data_root(&self) -> &str {
         &self.settings.data_root
     }

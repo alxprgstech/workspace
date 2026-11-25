@@ -553,6 +553,12 @@ impl Executor {
 
         let workspace = self.manager.owned(owner, workspace_id)?;
 
+        if workspace.state.is_transitional()
+            || workspace.state == workspace_core::workspace::WorkspaceState::Failed
+        {
+            return Err(JobError::Invalid("workspace is not ready yet"));
+        }
+
         if workspace.network_mode != "none" {
             return Err(JobError::Invalid(
                 "allowlist networking is not available in this build",
@@ -1026,6 +1032,7 @@ fn default_environment(extra: &[(String, String)]) -> Vec<(String, String)> {
         ("CARGO_HOME".to_owned(), "/cache/cargo".to_owned()),
         ("CARGO_TARGET_DIR".to_owned(), "/cache/target".to_owned()),
         ("PIP_CACHE_DIR".to_owned(), "/cache/pip".to_owned()),
+        ("RUSTUP_HOME".to_owned(), "/usr/local/rustup".to_owned()),
     ];
 
     environment.extend(extra.iter().cloned());

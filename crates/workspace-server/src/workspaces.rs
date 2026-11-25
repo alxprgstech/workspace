@@ -323,6 +323,20 @@ impl Store {
         Ok(())
     }
 
+    pub fn set_image(&self, id: &str, image: &str) -> Result<(), WorkspaceError> {
+        let connection = self.connection()?;
+
+        connection
+            .execute(
+                "UPDATE workspaces SET image = ?2, updated_at_unix = unixepoch()
+                 WHERE id = ?1",
+                params![id, image],
+            )
+            .map_err(map_sqlite)?;
+
+        Ok(())
+    }
+
     pub fn set_container(&self, id: &str, container: Option<&str>) -> Result<(), WorkspaceError> {
         let connection = self.connection()?;
 
@@ -479,6 +493,7 @@ pub struct Manager {
     store: Store,
     runtime: Arc<dyn WorkspaceRuntime>,
     settings: ManagerSettings,
+    images: Option<Arc<crate::images::ImageBuilder>>,
 }
 
 impl Manager {
@@ -491,7 +506,18 @@ impl Manager {
             store,
             runtime,
             settings,
+            images: None,
         }
+    }
+
+    /// Attach the trusted image builder.
+    pub fn with_images(mut self, images: Arc<crate::images::ImageBuilder>) -> Self {
+        self.images = Some(images);
+        self
+    }
+
+    pub fn images(&self) -> Option<&Arc<crate::images::ImageBuilder>> {
+        self.images.as_ref()
     }
 
     pub fn store(&self) -> &Store {
@@ -503,7 +529,22 @@ impl Manager {
     }
 
     /// Create a workspace for `owner`.
+    /// Create and fully prepare a workspace.
     pub async fn create(
+        &self,
+        owner: &str,
+        request: &CreateRequest,
+    ) -> Result<Workspace, WorkspaceError> {
+        let workspace = self.reserve(owner, request).await?;
+
+        self.prepare(&workspace.id).await
+    }
+
+    /// Reserve a workspace record in the `preparing` state.
+    ///
+    /// Image preparation can take minutes, so transports reserve first, return
+    /// the identifier and run [`Self::prepare`] in the background.
+    pub async fn reserve(
         &self,
         owner: &str,
         request: &CreateRequest,
@@ -555,7 +596,7 @@ impl Manager {
             owner_id: owner.to_owned(),
             name: request.name.trim().to_owned(),
             execution_mode,
-            state: WorkspaceState::Created,
+            state: WorkspaceState::Preparing,
             capabilities,
             image: self.settings.base_image.clone(),
             network_mode: self.settings.network_mode.clone(),
@@ -574,54 +615,82 @@ impl Manager {
         // Write-ahead: the record exists before any external resource.
         self.store.insert(&workspace)?;
 
-        if let Err(error) = self.runtime.prepare_storage(&workspace).await {
-            let _ = self.store.set_state(
-                &workspace.id,
-                WorkspaceState::Failed,
-                Some(&error.to_string()),
-            );
-            let _ = self.store.audit(
-                owner,
-                "workspace.create",
-                Some(&id),
-                "failed",
-                Some(&error.to_string()),
-            );
+        self.store
+            .audit(owner, "workspace.reserve", Some(&id), "ok", None)?;
+
+        self.get_owned(owner, &id).await
+    }
+
+    /// Prepare the image, storage and (for persistent workspaces) the container.
+    pub async fn prepare(&self, id: &str) -> Result<Workspace, WorkspaceError> {
+        let workspace = self.store.get(id)?.ok_or(WorkspaceError::NotFound)?;
+
+        if workspace.state != WorkspaceState::Preparing {
+            return Ok(workspace);
+        }
+
+        let image = match self.images.as_ref() {
+            Some(builder) => match builder.ensure(&workspace.capabilities).await {
+                Ok(image) => image.reference,
+                Err(error) => {
+                    self.fail_preparation(&workspace, &error.to_string())?;
+
+                    return Err(WorkspaceError::Capability(error.to_string()));
+                }
+            },
+            None => self.settings.base_image.clone(),
+        };
+
+        self.store.set_image(id, &image)?;
+
+        let prepared = self.store.get(id)?.ok_or(WorkspaceError::NotFound)?;
+
+        if let Err(error) = self.runtime.prepare_storage(&prepared).await {
+            self.fail_preparation(&prepared, &error.to_string())?;
 
             return Err(error);
         }
 
-        if workspace.execution_mode == ExecutionMode::Persistent {
-            match self.runtime.start_container(&workspace).await {
-                Ok(_) => {
-                    let _ = self
-                        .store
-                        .set_state(&workspace.id, WorkspaceState::Idle, None);
+        if prepared.execution_mode == ExecutionMode::Persistent {
+            match self.runtime.start_container(&prepared).await {
+                Ok(container) => {
+                    self.store.set_container(id, Some(&container))?;
+                    self.store.set_state(id, WorkspaceState::Idle, None)?;
                 }
                 Err(error) => {
-                    let _ = self.store.set_state(
-                        &workspace.id,
-                        WorkspaceState::Failed,
-                        Some(&error.to_string()),
-                    );
-
-                    let _ = self.store.audit(
-                        owner,
-                        "workspace.start",
-                        Some(&id),
-                        "failed",
-                        Some(&error.to_string()),
-                    );
+                    self.fail_preparation(&prepared, &error.to_string())?;
 
                     return Err(error);
                 }
             }
+        } else {
+            self.store.set_state(id, WorkspaceState::Created, None)?;
         }
 
-        self.store
-            .audit(owner, "workspace.create", Some(&id), "ok", None)?;
+        self.store.audit(
+            &prepared.owner_id,
+            "workspace.prepare",
+            Some(id),
+            "ok",
+            None,
+        )?;
 
-        self.get_owned(owner, &id).await
+        self.get_owned(&prepared.owner_id, id).await
+    }
+
+    fn fail_preparation(&self, workspace: &Workspace, error: &str) -> Result<(), WorkspaceError> {
+        self.store
+            .set_state(&workspace.id, WorkspaceState::Failed, Some(error))?;
+
+        let _ = self.store.audit(
+            &workspace.owner_id,
+            "workspace.prepare",
+            Some(&workspace.id),
+            "failed",
+            Some(error),
+        );
+
+        Ok(())
     }
 
     /// Load a workspace and enforce ownership.

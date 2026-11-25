@@ -1,0 +1,28 @@
+# Trusted capability build recipes (stage 010).
+#
+# This file is compiled into the server binary with `include_str!`: an MCP
+# client can only name module identifiers, never packages, scripts or images.
+# Changing this file is an administrator action that requires a new build.
+
+[base]
+version = "13"
+packages = [
+    "bash", "ca-certificates", "coreutils", "curl", "findutils", "grep",
+    "less", "procps", "tar", "unzip", "xz-utils",
+]
+
+[git]
+version = "2.47"
+packages = ["git"]
+
+[cpp]
+version = "14"
+packages = ["gcc", "g++", "cmake", "make", "ninja-build", "pkg-config"]
+
+[python]
+version = "3.13"
+packages = ["python3", "python3-pip", "python3-venv"]
+
+[ffmpeg]
+version = "7.1"
+packages = ["ffmpeg"]

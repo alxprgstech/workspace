@@ -22,6 +22,7 @@ pub const SCOPES: &[&str] = &[
     "execution:run",
     "files:read",
     "files:write",
+    "files:import",
     "artifacts:read",
     "artifacts:publish",
 ];

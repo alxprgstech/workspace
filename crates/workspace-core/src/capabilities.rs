@@ -50,7 +50,7 @@ pub const MODULES: &[Module] = &[
         version: "1",
         tools: &["git"],
         depends_on: &["base"],
-        available: false,
+        available: true,
     },
     Module {
         id: "rust",
@@ -59,7 +59,7 @@ pub const MODULES: &[Module] = &[
         version: "1.100",
         tools: &["rustc", "cargo", "rustfmt", "cargo-clippy"],
         depends_on: &["base"],
-        available: false,
+        available: true,
     },
     Module {
         id: "cpp",
@@ -68,7 +68,7 @@ pub const MODULES: &[Module] = &[
         version: "14",
         tools: &["gcc", "g++", "cmake", "ninja", "pkg-config"],
         depends_on: &["base"],
-        available: false,
+        available: true,
     },
     Module {
         id: "python",
@@ -77,7 +77,7 @@ pub const MODULES: &[Module] = &[
         version: "3.13",
         tools: &["python3", "pip", "venv"],
         depends_on: &["base"],
-        available: false,
+        available: true,
     },
     Module {
         id: "ffmpeg",
@@ -86,7 +86,7 @@ pub const MODULES: &[Module] = &[
         version: "7",
         tools: &["ffmpeg", "ffprobe"],
         depends_on: &["base"],
-        available: false,
+        available: true,
     },
     Module {
         id: "whisper-vad",
@@ -95,6 +95,7 @@ pub const MODULES: &[Module] = &[
         version: "1",
         tools: &["whisper-vad", "silero-vad"],
         depends_on: &["ffmpeg"],
+        // No trusted, checksum-pinned whisper.cpp/Silero source in this build.
         available: false,
     },
 ];
@@ -244,10 +245,20 @@ mod tests {
 
     #[test]
     fn unavailable_capabilities_are_reported_not_silently_skipped() {
-        let error = resolve(&["rust".to_owned()]).unwrap_err();
+        let error = resolve(&["whisper-vad".to_owned()]).unwrap_err();
 
         assert_eq!(error.code(), "capability_unavailable");
-        assert!(error.message().contains("rust"));
+        assert!(error.message().contains("whisper-vad"));
+    }
+
+    #[test]
+    fn dependency_closure_is_canonical() {
+        let modules = resolve(&["rust".to_owned()]).unwrap();
+
+        assert_eq!(
+            canonical_ids(&modules),
+            vec!["base".to_owned(), "rust".to_owned()]
+        );
     }
 
     #[test]

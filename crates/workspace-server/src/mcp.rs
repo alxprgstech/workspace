@@ -22,6 +22,7 @@ pub struct GatewayServices {
     pub runtime: Arc<workspace_runtime::status::RuntimeMonitor>,
     pub workspaces: Option<Arc<crate::workspaces::Manager>>,
     pub files: Option<Arc<crate::files::Files>>,
+    pub downloader: Option<Arc<crate::import::Downloader>>,
     pub artifacts: Option<Arc<crate::artifacts::Artifacts>>,
     pub jobs: Option<Arc<crate::jobs::Executor>>,
 }
@@ -40,6 +41,7 @@ impl GatewayServices {
             jobs: None,
             files: None,
             artifacts: None,
+            downloader: None,
         }
     }
 }

@@ -317,6 +317,38 @@ impl Docker {
         }
     }
 
+    /// Immutable identifier of an existing image.
+    pub async fn image_id(&self, reference: &str) -> Result<String, RuntimeError> {
+        validate_reference(reference)?;
+
+        self.host
+            .run(
+                &self.docker_path,
+                &self.arguments(vec![
+                    "image".to_owned(),
+                    "inspect".to_owned(),
+                    "--format".to_owned(),
+                    "{{.Id}}".to_owned(),
+                    reference.to_owned(),
+                ]),
+            )
+            .await
+    }
+
+    /// Retag an image, used to pin a build to its immutable identifier.
+    pub async fn tag(&self, source: &str, target: &str) -> Result<(), RuntimeError> {
+        validate_reference(source)?;
+        validate_reference(target)?;
+
+        self.host
+            .run(
+                &self.docker_path,
+                &self.arguments(vec!["tag".to_owned(), source.to_owned(), target.to_owned()]),
+            )
+            .await
+            .map(|_| ())
+    }
+
     /// Pull an immutable image reference. Used only for digest-pinned images.
     pub async fn pull(&self, reference: &str) -> Result<(), RuntimeError> {
         validate_image(reference)?;
@@ -593,16 +625,37 @@ fn validate_container_name(name: &str) -> Result<(), RuntimeError> {
     Ok(())
 }
 
-fn validate_image(reference: &str) -> Result<(), RuntimeError> {
-    let valid = reference.len() <= 255
-        && reference.contains("@sha256:")
+/// Syntax check for references used by internal image operations.
+fn validate_reference(reference: &str) -> Result<(), RuntimeError> {
+    let allowed = reference.len() <= 255
         && reference
             .chars()
-            .all(|character| character.is_ascii_alphanumeric() || "/:._-@".contains(character));
+            .all(|character| character.is_ascii_alphanumeric() || "/:._-@".contains(character))
+        && (reference.contains(':') || reference.contains('@'));
 
-    if !valid {
+    if !allowed {
+        return Err(RuntimeError::Protocol("invalid image reference".to_owned()));
+    }
+
+    Ok(())
+}
+
+fn validate_image(reference: &str) -> Result<(), RuntimeError> {
+    let allowed = reference
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || "/:._-@".contains(character));
+
+    // Either a registry digest reference, or one of this instance's own build
+    // tags whose tag component is the immutable image identifier.
+    let digest_pinned = reference.contains("@sha256:");
+    let local_pinned = reference
+        .strip_prefix("alxprgs-workspace/")
+        .and_then(|rest| rest.rsplit_once(':'))
+        .is_some_and(|(_, tag)| tag.len() == 64 && tag.chars().all(|c| c.is_ascii_hexdigit()));
+
+    if reference.len() > 255 || !allowed || !(digest_pinned || local_pinned) {
         return Err(RuntimeError::Protocol(
-            "images must be digest-pinned references".to_owned(),
+            "images must be pinned references".to_owned(),
         ));
     }
 

@@ -394,7 +394,7 @@ fn run(cli: Cli) -> AppResult<ExitCode> {
                         return Ok(ExitCode::from(2));
                     };
 
-                    for directory in ["workspaces", "artifacts", "staging", "logs"] {
+                    for directory in ["workspaces", "artifacts", "staging", "logs", "builds"] {
                         runtime.block_on(helper.call(
                             workspace_core::helper::Operation::Mkdir {
                                 root: settings.data_root.clone(),

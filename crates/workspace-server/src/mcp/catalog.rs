@@ -51,7 +51,28 @@ fn tool(
             .open_world(false),
     );
 
+    // Declares the OAuth scope the tool needs, as MCP security metadata.
+    tool.meta = serde_json::from_value(serde_json::json!({
+        "securitySchemes": [{ "type": "oauth2", "scopes": [scope] }]
+    }))
+    .ok();
+
     Definition { tool, scope }
+}
+
+/// Declares the documented ChatGPT file parameter for a tool.
+///
+/// The host fills the named input with a `FileRef` object containing
+/// `download_url`, `file_id`, `file_name` and `mime_type`; the server then
+/// fetches the bytes over HTTPS itself.
+fn with_openai_file_parameter(mut definition: Definition) -> Definition {
+    let mut meta = definition.tool.meta.take().unwrap_or_default();
+
+    meta.insert("openai/fileParams".to_owned(), serde_json::json!(["file"]));
+
+    definition.tool.meta = Some(meta);
+
+    definition
 }
 
 /// All tools this build implements.
@@ -268,6 +289,44 @@ pub fn definitions() -> Vec<Definition> {
                 &["workspace_id", "path", "patch"],
             ),
             "files:write",
+            false,
+        ),
+        with_openai_file_parameter(tool(
+            "file_import",
+            "Import a file the user attached in ChatGPT. The host fills `file` with a signed download URL; the server fetches it over HTTPS. ZIP/TAR archives are extracted into `path` after safety checks.",
+            object(
+                json!({
+                    "workspace_id": workspace_id.clone(),
+                    "path": {"type": "string", "description": "Destination file path, or destination directory for archives."},
+                    "file": {
+                        "type": "object",
+                        "description": "File reference filled by ChatGPT.",
+                        "properties": {
+                            "download_url": {"type": "string"},
+                            "file_id": {"type": "string"},
+                            "file_name": {"type": "string"},
+                            "mime_type": {"type": "string"}
+                        },
+                        "required": ["download_url"]
+                    }
+                }),
+                &["workspace_id", "path", "file"],
+            ),
+            "files:import",
+            false,
+        )),
+        tool(
+            "url_import",
+            "Import a file from a URL whose host is on the administrator allowlist.",
+            object(
+                json!({
+                    "workspace_id": workspace_id.clone(),
+                    "url": {"type": "string"},
+                    "path": {"type": "string", "description": "Destination file path, or directory for archives."}
+                }),
+                &["workspace_id", "url", "path"],
+            ),
+            "files:import",
             false,
         ),
         tool(

@@ -16,6 +16,8 @@ pub mod files;
 mod http_files;
 mod http_jobs;
 mod http_workspaces;
+pub mod images;
+pub mod import;
 pub mod jobs;
 mod mcp;
 pub mod mcp_auth;
@@ -63,6 +65,7 @@ pub struct AppState {
     pub(crate) jobs: Arc<jobs::Executor>,
     pub(crate) files: Option<Arc<files::Files>>,
     pub(crate) artifacts: Option<Arc<artifacts::Artifacts>>,
+    pub(crate) downloader: Arc<import::Downloader>,
     pub(crate) max_import_bytes: u64,
 }
 
@@ -76,6 +79,7 @@ impl AppState {
             jobs: Some(Arc::clone(&self.jobs)),
             files: self.files.clone(),
             artifacts: self.artifacts.clone(),
+            downloader: Some(Arc::clone(&self.downloader)),
         })
     }
 
@@ -131,11 +135,17 @@ impl AppState {
                 Err(error) => Arc::new(runtime_bridge::UnavailableRuntime::new(error.to_string())),
             };
 
-        let manager = Arc::new(workspaces::Manager::new(
+        let mut manager = workspaces::Manager::new(
             workspaces::Store::new(config.storage.data_dir.clone()),
             runtime_impl,
             settings,
-        ));
+        );
+
+        if let Ok(builder) = images::ImageBuilder::new(&runtime, config.storage.data_dir.clone()) {
+            manager = manager.with_images(Arc::new(builder));
+        }
+
+        let manager = Arc::new(manager);
 
         let job_runtime: Arc<dyn jobs::JobRuntime> =
             match jobs::DockerJobRuntime::new(&runtime, storage.instance_id.clone()) {
@@ -185,6 +195,7 @@ impl AppState {
             jobs: Arc::new(executor),
             files,
             artifacts,
+            downloader: Arc::new(import::Downloader::new(config.network.allowlist.clone())),
             max_import_bytes,
         }
     }

@@ -121,11 +121,12 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing module {id}"))
         };
 
-        assert_eq!(status("base"), "available");
-
-        for id in ["rust", "cpp", "git", "python", "ffmpeg", "whisper-vad"] {
-            assert_eq!(status(id), "not_installed", "{id}");
+        for id in ["base", "rust", "cpp", "git", "python", "ffmpeg"] {
+            assert_eq!(status(id), "available", "{id}");
         }
+
+        // No trusted, checksum-pinned source exists for this module yet.
+        assert_eq!(status("whisper-vad"), "not_installed");
 
         assert_eq!(catalog["services"][3]["id"], "docker_runtime");
         assert_eq!(catalog["services"][3]["status"], "not_ready");

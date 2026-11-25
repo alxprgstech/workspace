@@ -93,8 +93,21 @@ pub async fn create(
             .into_response();
     }
 
-    match state.workspaces.create(&session.user.id, &request).await {
-        Ok(workspace) => (StatusCode::CREATED, Json(json!(workspace))).into_response(),
+    match state.workspaces.reserve(&session.user.id, &request).await {
+        Ok(workspace) => {
+            // Image preparation may take minutes; the client polls
+            // workspace_info until the workspace leaves `preparing`.
+            let manager = Arc::clone(&state.workspaces);
+            let id = workspace.id.clone();
+
+            tokio::spawn(async move {
+                if let Err(error) = manager.prepare(&id).await {
+                    tracing::warn!(%error, workspace = id, "Workspace preparation failed");
+                }
+            });
+
+            (StatusCode::CREATED, Json(json!(workspace))).into_response()
+        }
         Err(error) => problem(error),
     }
 }

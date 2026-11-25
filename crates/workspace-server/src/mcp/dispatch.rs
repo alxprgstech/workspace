@@ -5,6 +5,7 @@
 //! mistyped fields are rejected instead of being ignored.
 
 use serde_json::{Map, Value, json};
+use std::sync::Arc;
 
 use crate::jobs::{ExecRequest, LogPage};
 use crate::workspaces::{CreateRequest, UpdateRequest};
@@ -107,6 +108,8 @@ pub async fn call(
         "file_read" => file_read(services, caller, arguments).await,
         "file_write" => file_write(services, caller, arguments).await,
         "file_patch" => file_patch(services, caller, arguments).await,
+        "file_import" => file_import(services, caller, arguments).await,
+        "url_import" => url_import(services, caller, arguments).await,
         "artifact_publish" => artifact_publish(services, caller, arguments).await,
         "artifact_list" => artifact_list(services, caller),
         "artifact_download" => artifact_download(services, caller, arguments),
@@ -115,6 +118,13 @@ pub async fn call(
             format!("unknown tool: {other}"),
         )),
     }
+}
+
+fn downloader(services: &GatewayServices) -> Result<&crate::import::Downloader, ToolError> {
+    services
+        .downloader
+        .as_deref()
+        .ok_or_else(|| ToolError::unavailable("the import service is not available"))
 }
 
 fn files(services: &GatewayServices) -> Result<&crate::files::Files, ToolError> {
@@ -251,10 +261,26 @@ async fn workspace_create(
         persistent: optional_bool(arguments, "persistent")?,
     };
 
-    let workspace = manager(services)?
-        .create(caller.user_id, &request)
+    let manager = manager(services)?;
+    let workspace = manager
+        .reserve(caller.user_id, &request)
         .await
         .map_err(workspace_error)?;
+
+    // Image preparation may take minutes; return the identifier immediately
+    // and let the client poll workspace_info.
+    let prepare = services
+        .workspaces
+        .as_ref()
+        .map(Arc::clone)
+        .ok_or_else(|| ToolError::unavailable("workspace management is not available"))?;
+    let id = workspace.id.clone();
+
+    tokio::spawn(async move {
+        if let Err(error) = prepare.prepare(&id).await {
+            tracing::warn!(%error, workspace = id, "Workspace preparation failed");
+        }
+    });
 
     Ok(json!(workspace))
 }
@@ -508,6 +534,131 @@ async fn file_patch(
         .map_err(files_error)?;
 
     Ok(json!(outcome))
+}
+
+async fn file_import(
+    services: &GatewayServices,
+    caller: &Caller<'_>,
+    arguments: &Map<String, Value>,
+) -> Result<Value, ToolError> {
+    let workspace_id = string_argument(arguments, "workspace_id")?;
+    let path = string_argument(arguments, "path")?;
+
+    let file = arguments
+        .get("file")
+        .and_then(Value::as_object)
+        .ok_or_else(|| ToolError::invalid("file must be an object filled by the host"))?;
+
+    let url = file
+        .get("download_url")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ToolError::invalid("file.download_url is required"))?;
+
+    let declared_name = file.get("file_name").and_then(Value::as_str);
+
+    import_url(
+        services,
+        caller,
+        workspace_id,
+        path,
+        url,
+        declared_name,
+        false,
+    )
+    .await
+}
+
+async fn url_import(
+    services: &GatewayServices,
+    caller: &Caller<'_>,
+    arguments: &Map<String, Value>,
+) -> Result<Value, ToolError> {
+    let workspace_id = string_argument(arguments, "workspace_id")?;
+    let url = string_argument(arguments, "url")?;
+    let path = string_argument(arguments, "path")?;
+
+    import_url(services, caller, workspace_id, path, url, None, true).await
+}
+
+async fn import_url(
+    services: &GatewayServices,
+    caller: &Caller<'_>,
+    workspace_id: &str,
+    path: &str,
+    url: &str,
+    declared_name: Option<&str>,
+    require_allowlist: bool,
+) -> Result<Value, ToolError> {
+    let files = files(services)?;
+    let downloader = downloader(services)?;
+    let host = services
+        .runtime
+        .host()
+        .ok_or_else(|| ToolError::unavailable("the runtime host is unavailable"))?;
+
+    // Ownership is checked before any network access happens.
+    let _ = files
+        .list(caller.user_id, workspace_id, "", 0, 1)
+        .await
+        .map_err(files_error)?;
+
+    let downloaded = downloader
+        .fetch(host, files, url, require_allowlist)
+        .await
+        .map_err(files_error)?;
+
+    let name = declared_name
+        .map(str::to_owned)
+        .or(downloaded.file_name.clone())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    let is_archive = [".zip", ".tar", ".tar.gz", ".tgz"]
+        .iter()
+        .any(|extension| name.ends_with(extension));
+
+    let limit = files.max_import_bytes();
+
+    if is_archive {
+        let outcome = files
+            .extract_staged(
+                caller.user_id,
+                workspace_id,
+                &downloaded.staging,
+                path,
+                20_000,
+                limit.saturating_mul(8),
+            )
+            .await
+            .map_err(files_error)?;
+
+        Ok(json!({
+            "kind": "archive",
+            "path": path,
+            "entries": outcome.entries,
+            "bytes": outcome.bytes,
+            "downloaded_bytes": downloaded.bytes,
+        }))
+    } else {
+        let outcome = files
+            .import_staged(
+                caller.user_id,
+                workspace_id,
+                &downloaded.staging,
+                path,
+                true,
+            )
+            .await
+            .map_err(files_error)?;
+
+        Ok(json!({
+            "kind": "file",
+            "path": outcome.path,
+            "size": outcome.size,
+            "sha256": outcome.sha256,
+            "downloaded_bytes": downloaded.bytes,
+        }))
+    }
 }
 
 async fn artifact_publish(
