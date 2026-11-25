@@ -320,6 +320,24 @@ pub fn service(config: &McpConfig, schema_version: u32) -> Result<GatewayService
 
 /// Router fragment for the MCP endpoint, mounted behind a bearer-token gate.
 pub fn router(config: &McpConfig, schema_version: u32) -> Result<Router, TokenError> {
+    build_router(config, schema_version, None)
+}
+
+/// Same router with pre-seeded signing keys, for hermetic end-to-end tests.
+#[cfg(test)]
+pub fn router_with_keys(
+    config: &McpConfig,
+    schema_version: u32,
+    keys: Vec<Jwk>,
+) -> Result<Router, TokenError> {
+    build_router(config, schema_version, Some(keys))
+}
+
+fn build_router(
+    config: &McpConfig,
+    schema_version: u32,
+    keys: Option<Vec<Jwk>>,
+) -> Result<Router, TokenError> {
     let expectations = McpExpectations {
         issuer: config.issuer.clone(),
         audience: config.audience.clone(),
@@ -327,10 +345,18 @@ pub fn router(config: &McpConfig, schema_version: u32) -> Result<Router, TokenEr
         required_scopes: config.required_scopes.clone(),
     };
 
-    let auth = Arc::new(GatewayAuth {
-        keys: KeyCache::new(&config.issuer)?,
-        expectations,
-    });
+    let keys = match keys {
+        Some(keys) => {
+            let mut cache = KeyCache::new(&config.issuer)?;
+
+            cache.cached = tokio::sync::Mutex::new(Some((Instant::now(), Arc::new(keys))));
+
+            cache
+        }
+        None => KeyCache::new(&config.issuer)?,
+    };
+
+    let auth = Arc::new(GatewayAuth { keys, expectations });
 
     let service = service(config, schema_version)?;
 
@@ -399,6 +425,196 @@ mod tests {
         );
 
         assert!(host_of("not a url").is_none());
+    }
+
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    use rsa::{
+        RsaPrivateKey,
+        pkcs1v15::SigningKey,
+        sha2::Sha256,
+        signature::{SignatureEncoding, Signer as RsaSigner},
+        traits::PublicKeyParts,
+    };
+
+    struct Signer {
+        key: SigningKey<Sha256>,
+    }
+
+    impl Signer {
+        fn token(&self, config: &McpConfig) -> String {
+            let header = URL_SAFE_NO_PAD.encode(
+                serde_json::json!({"alg": "RS256", "typ": "JWT", "kid": "e2e-key"}).to_string(),
+            );
+
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+
+            let claims = serde_json::json!({
+                "iss": config.issuer,
+                "aud": config.audience,
+                "resource": config.resource,
+                "sub": "550e8400-e29b-41d4-a716-446655440000",
+                "exp": now + 300,
+                "scope": "workspace.read",
+            });
+
+            let payload = URL_SAFE_NO_PAD.encode(claims.to_string());
+
+            let signed = format!("{header}.{payload}");
+
+            let signature = self.key.sign(signed.as_bytes());
+
+            format!("{signed}.{}", URL_SAFE_NO_PAD.encode(signature.to_bytes()))
+        }
+    }
+
+    fn signing_fixture() -> (Signer, Vec<Jwk>) {
+        let private = RsaPrivateKey::new(&mut rand::rngs::OsRng, 2048).unwrap();
+
+        let document = serde_json::json!({
+            "keys": [{
+                "kty": "RSA",
+                "kid": "e2e-key",
+                "use": "sig",
+                "alg": "RS256",
+                "n": URL_SAFE_NO_PAD.encode(private.n().to_bytes_be()),
+                "e": URL_SAFE_NO_PAD.encode(private.e().to_bytes_be()),
+            }]
+        });
+
+        (
+            Signer {
+                key: SigningKey::<Sha256>::new(private),
+            },
+            parse_jwks(&document.to_string()).unwrap(),
+        )
+    }
+
+    fn mcp_config() -> McpConfig {
+        McpConfig {
+            issuer: "https://auth.alxprgs.tech".to_owned(),
+            audience: "https://workspace.example.com/chatgpt/mcp".to_owned(),
+            resource: "https://workspace.example.com/chatgpt/mcp".to_owned(),
+            required_scopes: vec!["workspace.read".to_owned()],
+        }
+    }
+
+    #[tokio::test]
+    async fn authenticated_client_can_list_and_call_tools() {
+        let (signer, keys) = signing_fixture();
+        let config = mcp_config();
+        let token = signer.token(&config);
+
+        let router = super::router_with_keys(&config, 3, keys).unwrap();
+
+        let initialize = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": { "name": "e2e", "version": "1.0.0" }
+            }
+        });
+
+        let response = router
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/chatgpt/mcp")
+                    .header(header::HOST, "workspace.example.com")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::ACCEPT, "application/json, text/event-stream")
+                    .body(Body::from(initialize.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let session = response
+            .headers()
+            .get("mcp-session-id")
+            .expect("initialize must establish a session")
+            .to_str()
+            .unwrap()
+            .to_owned();
+
+        let body = axum::body::to_bytes(Body::new(response.into_body()), 1024 * 1024)
+            .await
+            .unwrap();
+
+        assert!(String::from_utf8_lossy(&body).contains("serverInfo"));
+
+        let list = serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"});
+
+        let response = router
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/chatgpt/mcp")
+                    .header(header::HOST, "workspace.example.com")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::ACCEPT, "application/json, text/event-stream")
+                    .header("mcp-session-id", &session)
+                    .header("mcp-protocol-version", "2025-06-18")
+                    .body(Body::from(list.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(Body::new(response.into_body()), 1024 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+
+        assert!(body.contains("server_info"), "{body}");
+        assert!(body.contains("capabilities_list"), "{body}");
+
+        let call = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": { "name": "server_info", "arguments": {} }
+        });
+
+        let response = router
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/chatgpt/mcp")
+                    .header(header::HOST, "workspace.example.com")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::ACCEPT, "application/json, text/event-stream")
+                    .header("mcp-session-id", &session)
+                    .header("mcp-protocol-version", "2025-06-18")
+                    .body(Body::from(call.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(Body::new(response.into_body()), 1024 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+
+        assert!(body.contains("runtime_ready"), "{body}");
+        assert!(body.contains("schema_version"), "{body}");
     }
 
     #[tokio::test]
