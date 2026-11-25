@@ -9,11 +9,13 @@ use std::sync::Arc;
 use workspace_core::helper::Operation;
 use workspace_core::workspace::Workspace;
 use workspace_runtime::docker::{
-    ContainerSpec, Docker, INSTANCE_LABEL, KIND_LABEL, WORKSPACE_LABEL,
+    ContainerSpec, Docker, INSTANCE_LABEL, KIND_LABEL, Network, WORKSPACE_LABEL,
 };
 use workspace_runtime::quota;
 use workspace_runtime::status::RuntimeMonitor;
-use workspace_runtime::{RuntimeError, RuntimeSettings, container_name};
+use workspace_runtime::{
+    RuntimeError, RuntimeSettings, container_name, egress_proxy_name, workspace_network,
+};
 
 use crate::workspaces::{QuotaSnapshot, WorkspaceError, WorkspaceRuntime};
 
@@ -22,18 +24,30 @@ pub struct DockerWorkspaceRuntime {
     monitor: Arc<RuntimeMonitor>,
     settings: RuntimeSettings,
     instance_id: String,
+    allowlist: Vec<String>,
+    egress_binary: String,
 }
 
 impl DockerWorkspaceRuntime {
-    pub fn new(monitor: Arc<RuntimeMonitor>, instance_id: String) -> Result<Self, WorkspaceError> {
+    pub fn new(
+        monitor: Arc<RuntimeMonitor>,
+        instance_id: String,
+        allowlist: Vec<String>,
+        egress_binary: Option<String>,
+    ) -> Result<Self, WorkspaceError> {
         let settings = monitor.settings().cloned().ok_or_else(|| {
             WorkspaceError::RuntimeUnavailable("runtime is not configured".into())
         })?;
+
+        let egress_binary =
+            egress_binary.unwrap_or_else(|| format!("{}/bin/workspace-egress", settings.data_root));
 
         Ok(Self {
             monitor,
             settings,
             instance_id,
+            allowlist,
+            egress_binary,
         })
     }
 
@@ -59,9 +73,55 @@ impl DockerWorkspaceRuntime {
         container_name(&self.instance_id, "workspace", &workspace.id).map_err(map_runtime)
     }
 
+    fn allowlist_enabled(&self) -> bool {
+        !self.allowlist.is_empty()
+    }
+
+    fn workspace_network(&self, workspace: &Workspace) -> Result<String, WorkspaceError> {
+        workspace_network(&self.instance_id, &workspace.id).map_err(map_runtime)
+    }
+
+    fn proxy_name(&self) -> Result<String, WorkspaceError> {
+        egress_proxy_name(&self.instance_id).map_err(map_runtime)
+    }
+
+    fn allowlist_path(&self) -> String {
+        format!("{}/egress/allowlist", self.settings.data_root)
+    }
+
+    fn proxy_env(&self) -> Result<Vec<(String, String)>, WorkspaceError> {
+        let proxy = self.proxy_name()?;
+        let url = format!("http://{proxy}:3128");
+
+        Ok(vec![
+            ("HTTP_PROXY".to_owned(), url.clone()),
+            ("HTTPS_PROXY".to_owned(), url.clone()),
+            ("http_proxy".to_owned(), url.clone()),
+            ("https_proxy".to_owned(), url),
+            ("NO_PROXY".to_owned(), String::new()),
+        ])
+    }
+
     fn spec(&self, workspace: &Workspace, name: &str) -> Result<ContainerSpec, WorkspaceError> {
         let workspace_dir =
             crate::workspaces::workspace_data_dir(&self.settings.data_root, &workspace.id);
+
+        let allowlisted = self.allowlist_enabled() && workspace.network_mode == "allowlist";
+
+        let network = if allowlisted {
+            Network::Named(self.workspace_network(workspace)?)
+        } else {
+            Network::None
+        };
+
+        let mut environment = vec![
+            ("HOME".to_owned(), "/tmp".to_owned()),
+            ("PATH".to_owned(), "/usr/local/bin:/usr/bin:/bin".to_owned()),
+        ];
+
+        if allowlisted {
+            environment.extend(self.proxy_env()?);
+        }
 
         Ok(ContainerSpec {
             name: name.to_owned(),
@@ -79,16 +139,140 @@ impl DockerWorkspaceRuntime {
                 "-c".to_owned(),
                 "exec sleep infinity".to_owned(),
             ],
-            env: vec![
-                ("HOME".to_owned(), "/tmp".to_owned()),
-                ("PATH".to_owned(), "/usr/local/bin:/usr/bin:/bin".to_owned()),
-            ],
+            env: environment,
             cpu_millis: workspace.limits.cpu_millis,
             memory_mib: workspace.limits.memory_mib,
             pids: workspace.limits.pids,
             tmpfs_mib: 64,
-            network: false,
+            network,
+            extra_mounts: Vec::new(),
         })
+    }
+
+    fn proxy_spec(&self) -> Result<ContainerSpec, WorkspaceError> {
+        let name = self.proxy_name()?;
+
+        Ok(ContainerSpec {
+            name,
+            image: self.settings.base_image.clone(),
+            labels: vec![
+                (INSTANCE_LABEL.to_owned(), self.instance_id.clone()),
+                (KIND_LABEL.to_owned(), "egress".to_owned()),
+            ],
+            workspace_dir: format!("{}/egress", self.settings.data_root),
+            cache_dir: None,
+            argv: vec!["/egress".to_owned()],
+            env: vec![
+                ("HOME".to_owned(), "/tmp".to_owned()),
+                (
+                    "EGRESS_ALLOWLIST".to_owned(),
+                    "/etc/egress/allowlist".to_owned(),
+                ),
+                ("EGRESS_PORT".to_owned(), "3128".to_owned()),
+            ],
+            cpu_millis: 200,
+            memory_mib: 128,
+            pids: 64,
+            tmpfs_mib: 16,
+            network: Network::Named("bridge".to_owned()),
+            extra_mounts: vec![
+                (self.egress_binary.clone(), "/egress".to_owned()),
+                (self.allowlist_path(), "/etc/egress/allowlist".to_owned()),
+            ],
+        })
+    }
+
+    async fn write_allowlist(&self) -> Result<(), WorkspaceError> {
+        let helper = self.helper()?;
+
+        let mut hosts = self.allowlist.clone();
+        hosts.sort();
+        hosts.dedup();
+
+        let content = hosts.join("\n") + "\n";
+
+        helper
+            .call(
+                Operation::Mkdir {
+                    root: self.settings.data_root.clone(),
+                    path: "egress".to_owned(),
+                    parents: true,
+                },
+                &[],
+            )
+            .await
+            .map_err(map_runtime)?;
+
+        helper
+            .call(
+                Operation::Write {
+                    root: self.settings.data_root.clone(),
+                    path: "egress/allowlist".to_owned(),
+                    create_parents: false,
+                    replace: true,
+                    expected_sha256: None,
+                },
+                content.as_bytes(),
+            )
+            .await
+            .map_err(map_runtime)?;
+
+        Ok(())
+    }
+
+    /// Create the internal network and the instance egress proxy.
+    async fn ensure_egress(&self, workspace: &Workspace) -> Result<(), WorkspaceError> {
+        if !self.allowlist_enabled() || workspace.network_mode != "allowlist" {
+            return Ok(());
+        }
+
+        let docker = self.docker()?;
+        let network = self.workspace_network(workspace)?;
+        let proxy = self.proxy_name()?;
+
+        self.write_allowlist().await?;
+
+        docker
+            .network_create(&network, true, &self.instance_id)
+            .await
+            .map_err(map_runtime)?;
+
+        let running = docker
+            .inspect(&proxy)
+            .await
+            .is_ok_and(|state| state.running);
+
+        if !running {
+            let _ = docker.remove(&proxy).await;
+
+            let spec = self.proxy_spec()?;
+
+            docker.create(&spec).await.map_err(map_runtime)?;
+            docker.start(&proxy).await.map_err(map_runtime)?;
+        }
+
+        docker
+            .network_connect(&network, &proxy)
+            .await
+            .map_err(map_runtime)?;
+
+        Ok(())
+    }
+
+    /// Remove the workspace network; the shared proxy stays for other spaces.
+    async fn remove_egress(&self, workspace: &Workspace) -> Result<(), WorkspaceError> {
+        if !self.allowlist_enabled() || workspace.network_mode != "allowlist" {
+            return Ok(());
+        }
+
+        let docker = self.docker()?;
+        let network = self.workspace_network(workspace)?;
+        let proxy = self.proxy_name()?;
+
+        let _ = docker.network_disconnect(&network, &proxy).await;
+        let _ = docker.network_remove(&network).await;
+
+        Ok(())
     }
 }
 
@@ -140,12 +324,16 @@ impl WorkspaceRuntime for DockerWorkspaceRuntime {
         .await
         .map_err(map_runtime)?;
 
+        self.ensure_egress(workspace).await?;
+
         Ok(())
     }
 
     async fn release_storage(&self, workspace: &Workspace) -> Result<(), WorkspaceError> {
         let helper = self.helper()?;
         let host = self.host()?;
+
+        self.remove_egress(workspace).await?;
 
         helper
             .call(
@@ -166,9 +354,15 @@ impl WorkspaceRuntime for DockerWorkspaceRuntime {
         Ok(())
     }
 
+    async fn ensure_network(&self, workspace: &Workspace) -> Result<(), WorkspaceError> {
+        self.ensure_egress(workspace).await
+    }
+
     async fn start_container(&self, workspace: &Workspace) -> Result<String, WorkspaceError> {
         let docker = self.docker()?;
         let name = self.name(workspace)?;
+
+        self.ensure_egress(workspace).await?;
 
         match docker.inspect(&name).await {
             Ok(state) if state.running => return Ok(name),
@@ -315,14 +509,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn container_spec_is_derived_from_server_state_only() {
-        let monitor = Arc::new(RuntimeMonitor::new(
-            None,
-            "f32ac08f-5f8c-41df-8a72-820d9ff123d8",
-        ));
-        let runtime = DockerWorkspaceRuntime {
-            monitor,
+    fn runtime(allowlist: Vec<String>) -> DockerWorkspaceRuntime {
+        DockerWorkspaceRuntime {
+            monitor: Arc::new(RuntimeMonitor::new(
+                None,
+                "f32ac08f-5f8c-41df-8a72-820d9ff123d8",
+            )),
             settings: RuntimeSettings {
                 backend: workspace_runtime::RuntimeBackend::RootlessDocker,
                 socket: "unix:///run/user/1000/docker.sock".into(),
@@ -338,8 +530,14 @@ mod tests {
                 base_image: "debian@sha256:00".into(),
             },
             instance_id: "f32ac08f-5f8c-41df-8a72-820d9ff123d8".into(),
-        };
+            allowlist,
+            egress_binary: "/srv/alxprgs-workspace/bin/workspace-egress".into(),
+        }
+    }
 
+    #[test]
+    fn container_spec_is_derived_from_server_state_only() {
+        let runtime = runtime(Vec::new());
         let workspace = workspace();
         let name = runtime.name(&workspace).unwrap();
         let spec = runtime.spec(&workspace, &name).unwrap();
@@ -351,11 +549,48 @@ mod tests {
         );
         assert_eq!(spec.cpu_millis, 1000);
         assert_eq!(spec.memory_mib, 512);
-        assert!(!spec.network);
+        assert_eq!(spec.network, Network::None);
 
         let arguments = spec.arguments("create").unwrap().join(" ");
 
         assert!(arguments.contains("--cap-drop ALL"));
+        assert!(arguments.contains("--network none"));
         assert!(!arguments.contains("--privileged"));
+    }
+
+    #[test]
+    fn allowlisted_workspaces_use_an_internal_network_and_proxy() {
+        let runtime = runtime(vec!["crates.io".to_owned()]);
+        let mut workspace = workspace();
+        workspace.network_mode = "allowlist".to_owned();
+
+        let spec = runtime
+            .spec(&workspace, "alxprgs-f32ac08f-workspace-550e8400")
+            .unwrap();
+
+        assert_eq!(
+            spec.network,
+            Network::Named("alxprgs-f32ac08f-ws-550e8400".to_owned())
+        );
+        assert!(spec.env.iter().any(|(key, value)| {
+            key == "HTTPS_PROXY" && value.contains("alxprgs-f32ac08f-egress:3128")
+        }));
+
+        let arguments = spec.arguments("create").unwrap().join(" ");
+        assert!(arguments.contains("--network alxprgs-f32ac08f-ws-550e8400"));
+    }
+
+    #[test]
+    fn proxy_spec_mounts_only_server_generated_paths() {
+        let runtime = runtime(vec!["crates.io".to_owned()]);
+        let spec = runtime.proxy_spec().unwrap();
+
+        assert_eq!(spec.argv, vec!["/egress"]);
+        assert_eq!(spec.network, Network::Named("bridge".to_owned()));
+        assert_eq!(spec.extra_mounts.len(), 2);
+
+        let arguments = spec.arguments("create").unwrap().join(" ");
+        assert!(arguments.contains("target=/egress,readonly"));
+        assert!(arguments.contains("target=/etc/egress/allowlist,readonly"));
     }
 }

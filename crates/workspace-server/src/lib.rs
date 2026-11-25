@@ -130,6 +130,8 @@ impl AppState {
             match runtime_bridge::DockerWorkspaceRuntime::new(
                 Arc::clone(&runtime),
                 storage.instance_id.clone(),
+                config.network.allowlist.clone(),
+                config.network.egress_binary.clone(),
             ) {
                 Ok(bridge) => Arc::new(bridge),
                 Err(error) => Arc::new(runtime_bridge::UnavailableRuntime::new(error.to_string())),
@@ -147,11 +149,14 @@ impl AppState {
 
         let manager = Arc::new(manager);
 
-        let job_runtime: Arc<dyn jobs::JobRuntime> =
-            match jobs::DockerJobRuntime::new(&runtime, storage.instance_id.clone()) {
-                Ok(job_runtime) => Arc::new(job_runtime),
-                Err(error) => Arc::new(jobs::UnavailableJobRuntime::new(error.to_string())),
-            };
+        let job_runtime: Arc<dyn jobs::JobRuntime> = match jobs::DockerJobRuntime::new(
+            &runtime,
+            storage.instance_id.clone(),
+            config.network.allowlist.clone(),
+        ) {
+            Ok(job_runtime) => Arc::new(job_runtime),
+            Err(error) => Arc::new(jobs::UnavailableJobRuntime::new(error.to_string())),
+        };
 
         let executor = jobs::Executor::new(
             jobs::JobStore::new(config.storage.data_dir.clone()),
@@ -472,6 +477,8 @@ fn valid_local_mcp(config: &Config) -> bool {
 /// tolerates the cold start through the bounded engine retry, and later passes
 /// only re-verify. Nothing here starts user workloads.
 fn spawn_runtime_supervisor(runtime: Arc<RuntimeMonitor>, workspaces: Arc<workspaces::Manager>) {
+    let manager = Arc::clone(&workspaces);
+
     tokio::spawn(async move {
         if !runtime.configured() {
             tracing::warn!(
@@ -485,6 +492,12 @@ fn spawn_runtime_supervisor(runtime: Arc<RuntimeMonitor>, workspaces: Arc<worksp
         // Wake the dedicated environment before the first probe; a stopped
         // WSL2 distribution is a normal state, not an outage.
         runtime.warm_up().await;
+
+        // Repair internal networks and the egress proxy for existing
+        // workspaces; a missing runtime component fails closed (no network).
+        for (workspace, error) in manager.ensure_networks().await {
+            tracing::warn!(%workspace, %error, "Cannot restore workspace networking");
+        }
 
         let mut first = true;
 

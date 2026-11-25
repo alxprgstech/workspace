@@ -99,6 +99,11 @@ pub trait WorkspaceRuntime: Send + Sync {
     async fn start_container(&self, workspace: &Workspace) -> Result<String, WorkspaceError>;
     async fn stop_container(&self, workspace: &Workspace) -> Result<(), WorkspaceError>;
     async fn quota_usage(&self, workspace: &Workspace) -> Result<QuotaSnapshot, WorkspaceError>;
+
+    /// Recreate runtime networking for an existing workspace after a restart.
+    async fn ensure_network(&self, _workspace: &Workspace) -> Result<(), WorkspaceError> {
+        Ok(())
+    }
 }
 
 /// Instance-wide settings applied to every workspace.
@@ -892,6 +897,37 @@ impl Manager {
     /// Record a significant activity and optionally extend the TTL.
     pub fn touch(&self, id: &str) -> Result<(), WorkspaceError> {
         self.store.touch(id, true)
+    }
+
+    /// Repair per-workspace runtime networking after a restart.
+    ///
+    /// Workspaces whose policy needs an internal network have their network and
+    /// egress proxy recreated. Failures are reported but never block startup:
+    /// the workspace still fails closed (no network) until the next attempt.
+    pub async fn ensure_networks(&self) -> Vec<(String, String)> {
+        let mut failures = Vec::new();
+
+        let workspaces = match self.store.list_all() {
+            Ok(workspaces) => workspaces,
+            Err(error) => return vec![("store".to_owned(), error.to_string())],
+        };
+
+        for workspace in workspaces {
+            if workspace.network_mode != "allowlist"
+                || matches!(
+                    workspace.state,
+                    WorkspaceState::Deleting | WorkspaceState::Expired
+                )
+            {
+                continue;
+            }
+
+            if let Err(error) = self.runtime.ensure_network(&workspace).await {
+                failures.push((workspace.id, error.to_string()));
+            }
+        }
+
+        failures
     }
 
     /// Delete expired, unpinned workspaces and stop idle containers.

@@ -235,6 +235,10 @@ pub enum NetworkMode {
 pub struct NetworkConfig {
     pub default_mode: NetworkMode,
     pub allowlist: Vec<String>,
+    /// Absolute path of the trusted egress proxy binary inside the runtime.
+    /// Defaults to `<runtime.data_root>/bin/workspace-egress`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress_binary: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -382,6 +386,34 @@ impl Config {
         {
             return Err(ConfigError::Validation(
                 "allowlist entries must not be empty",
+            ));
+        }
+
+        // Entries become the trusted proxy's policy: hostnames only, no
+        // wildcards, ports, paths or IP literals.
+        for entry in &self.network.allowlist {
+            let entry = entry.trim();
+
+            let valid = entry.len() <= 253
+                && !entry.starts_with('.')
+                && !entry.ends_with('.')
+                && entry
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '-')
+                && entry.contains('.');
+
+            if !valid {
+                return Err(ConfigError::Validation(
+                    "allowlist entries must be lowercase hostnames such as crates.io",
+                ));
+            }
+        }
+
+        if let Some(binary) = self.network.egress_binary.as_deref()
+            && !binary.starts_with('/')
+        {
+            return Err(ConfigError::Validation(
+                "network.egress_binary must be an absolute path",
             ));
         }
 

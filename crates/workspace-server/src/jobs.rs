@@ -848,10 +848,15 @@ pub struct DockerJobRuntime {
     docker: Docker,
     settings: RuntimeSettings,
     instance_id: String,
+    allowlist: Vec<String>,
 }
 
 impl DockerJobRuntime {
-    pub fn new(monitor: &RuntimeMonitor, instance_id: String) -> Result<Self, JobError> {
+    pub fn new(
+        monitor: &RuntimeMonitor,
+        instance_id: String,
+        allowlist: Vec<String>,
+    ) -> Result<Self, JobError> {
         let settings = monitor.settings().cloned().ok_or_else(|| {
             JobError::RuntimeUnavailable("execution runtime is not configured".to_owned())
         })?;
@@ -864,6 +869,7 @@ impl DockerJobRuntime {
             docker,
             settings,
             instance_id,
+            allowlist,
         })
     }
 }
@@ -880,6 +886,36 @@ impl JobRuntime for DockerJobRuntime {
 
         let workspace_dir = format!("{}/workspaces/{}", self.settings.data_root, workspace.id);
 
+        let allowlisted = !self.allowlist.is_empty() && workspace.network_mode == "allowlist";
+
+        let network = if allowlisted {
+            workspace_runtime::docker::Network::Named(
+                workspace_runtime::workspace_network(&self.instance_id, &workspace.id)
+                    .map_err(|error| error.to_string())?,
+            )
+        } else {
+            workspace_runtime::docker::Network::None
+        };
+
+        let mut environment = default_environment(&spec.env);
+
+        if allowlisted {
+            let proxy = workspace_runtime::egress_proxy_name(&self.instance_id)
+                .map_err(|error| error.to_string())?;
+
+            let url = format!("http://{proxy}:3128");
+
+            for (key, value) in [
+                ("HTTP_PROXY", url.clone()),
+                ("HTTPS_PROXY", url.clone()),
+                ("http_proxy", url.clone()),
+                ("https_proxy", url),
+                ("NO_PROXY", String::new()),
+            ] {
+                environment.push((key.to_owned(), value));
+            }
+        }
+
         let container = ContainerSpec {
             name: job_container.clone(),
             image: workspace.image.clone(),
@@ -892,12 +928,13 @@ impl JobRuntime for DockerJobRuntime {
             workspace_dir: format!("{workspace_dir}/files"),
             cache_dir: Some(format!("{workspace_dir}/cache")),
             argv: spec.argv.clone(),
-            env: default_environment(&spec.env),
+            env: environment,
             cpu_millis: workspace.limits.cpu_millis,
             memory_mib: workspace.limits.memory_mib,
             pids: workspace.limits.pids,
             tmpfs_mib: 64,
-            network: false,
+            network,
+            extra_mounts: Vec::new(),
         };
 
         let workdir = if spec.cwd.is_empty() {

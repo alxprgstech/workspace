@@ -1,0 +1,18 @@
+[package]
+name = "workspace-egress"
+description = "Trusted allowlist egress proxy for the dedicated Workspace runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "workspace-egress"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }
+
+[dev-dependencies]

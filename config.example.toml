@@ -22,7 +22,12 @@ artifact_ttl_seconds = 86400
 
 [network]
 default_mode = "none"
+# Lowercase hostnames reachable through the trusted egress proxy. With a
+# non-empty allowlist, `default_mode = "allowlist"` puts workspaces on an
+# internal Docker network whose only route is that proxy. Plain HTTP, IP
+# literals, LAN, metadata and non-listed hosts are always denied.
 allowlist = []
+# egress_binary = "/srv/alxprgs-workspace/bin/workspace-egress"
 
 [logging]
 level = "info"

@@ -68,6 +68,12 @@ Invoke-Wsl -User "root" -Arguments @(
     "$DataRoot", "$DataRoot/workspaces", "$DataRoot/artifacts", "$DataRoot/staging", "$DataRoot/logs"
 )
 
+$egressSource = Join-Path $repoRoot "target\x86_64-unknown-linux-musl\release\workspace-egress"
+
+if (-not (Test-Path $egressSource)) {
+    throw "egress proxy not found at $egressSource; build it with 'cargo build --release -p workspace-egress --target x86_64-unknown-linux-musl'"
+}
+
 Write-Host "[2/6] Installing the trusted filesystem helper"
 cmd /c "`"$wsl`" -d $Distro -u $RuntimeUser --exec /usr/bin/tee /srv/alxprgs-workspace/bin/workspace-helper < `"$HelperSource`" > NUL"
 
@@ -77,6 +83,16 @@ if ($LASTEXITCODE -ne 0) {
 
 Invoke-Wsl -User $RuntimeUser -Arguments @(
     "/usr/bin/chmod", "0755", "/srv/alxprgs-workspace/bin/workspace-helper"
+Write-Host "[2/6] Installing the trusted egress proxy"
+cmd /c "`"$wsl`" -d $Distro -u $RuntimeUser --exec /usr/bin/tee /srv/alxprgs-workspace/bin/workspace-egress < `"$egressSource`" > NUL"
+
+if ($LASTEXITCODE -ne 0) {
+    throw "cannot copy the egress proxy"
+}
+
+& $wsl -d $Distro -u $RuntimeUser --exec @(
+    "/usr/bin/chmod", "0755", "/srv/alxprgs-workspace/bin/workspace-egress"
+)
 )
 
 Write-Host "[3/6] Installing the quota helper"

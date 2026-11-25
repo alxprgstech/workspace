@@ -933,7 +933,8 @@ impl RuntimeMonitor {
             memory_mib: PROBE_MEMORY_MIB,
             pids: PROBE_PIDS,
             tmpfs_mib: 16,
-            network: false,
+            network: crate::docker::Network::None,
+            extra_mounts: Vec::new(),
         };
 
         let mut checks = Vec::new();

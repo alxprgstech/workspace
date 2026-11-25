@@ -128,6 +128,50 @@ impl RuntimeSettings {
     }
 }
 
+/// Docker network name for one workspace's internal network.
+///
+/// The workspace only reaches the trusted egress proxy from this network.
+pub fn workspace_network(instance: &str, workspace_id: &str) -> Result<String, RuntimeError> {
+    let short = |value: &str| -> Result<String, RuntimeError> {
+        let cleaned: String = value
+            .chars()
+            .filter(|character| character.is_ascii_alphanumeric())
+            .take(8)
+            .collect();
+
+        if cleaned.len() < 6 {
+            return Err(RuntimeError::Protocol(
+                "identifier is too short to name a network".into(),
+            ));
+        }
+
+        Ok(cleaned)
+    };
+
+    Ok(format!(
+        "alxprgs-{}-ws-{}",
+        short(instance)?,
+        short(workspace_id)?
+    ))
+}
+
+/// Container name of the instance-wide egress proxy.
+pub fn egress_proxy_name(instance: &str) -> Result<String, RuntimeError> {
+    let cleaned: String = instance
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .take(8)
+        .collect();
+
+    if cleaned.len() < 6 {
+        return Err(RuntimeError::Protocol(
+            "identifier is too short to name the egress proxy".into(),
+        ));
+    }
+
+    Ok(format!("alxprgs-{cleaned}-egress"))
+}
+
 /// Generate a runtime container name from server-side identifiers only.
 ///
 /// Names never contain user input: the instance id and the resource ids are

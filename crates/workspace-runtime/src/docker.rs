@@ -27,8 +27,47 @@ pub struct ContainerSpec {
     pub memory_mib: u64,
     pub pids: u32,
     pub tmpfs_mib: u64,
-    /// `none` only: the allowlist mode requires the egress proxy (stage 013).
-    pub network: bool,
+    /// Network context: either fully disabled or one internal network whose
+    /// only reachable service is the trusted egress proxy.
+    pub network: Network,
+    /// Extra read-only bind mounts, used for the trusted egress proxy binary
+    /// and its allowlist. Server-generated paths only.
+    pub extra_mounts: Vec<(String, String)>,
+}
+
+/// Container network context.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Network {
+    /// No network interfaces beyond loopback.
+    None,
+    /// A dedicated Docker network; for workspaces it is an internal network
+    /// whose only route is the trusted egress proxy.
+    Named(String),
+}
+
+impl Network {
+    fn docker_argument(&self) -> Result<String, RuntimeError> {
+        match self {
+            Self::None => Ok("none".to_owned()),
+            Self::Named(name) => {
+                validate_network_name(name)?;
+                Ok(name.clone())
+            }
+        }
+    }
+}
+
+fn validate_network_name(name: &str) -> Result<(), RuntimeError> {
+    let valid = (3..=63).contains(&name.len())
+        && name.chars().all(|character| {
+            character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
+        });
+
+    if !valid {
+        return Err(RuntimeError::Protocol("invalid network name".to_owned()));
+    }
+
+    Ok(())
 }
 
 impl ContainerSpec {
@@ -71,13 +110,7 @@ impl ContainerSpec {
             return Err(RuntimeError::Protocol("tmpfs limit out of range".into()));
         }
 
-        if !self.network {
-            // Nothing to do: `--network none` is always passed below.
-        } else {
-            return Err(RuntimeError::Protocol(
-                "allowlist networking requires the egress proxy".into(),
-            ));
-        }
+        let network = self.network.docker_argument()?;
 
         let mut arguments = vec![
             subcommand.to_owned(),
@@ -94,7 +127,7 @@ impl ContainerSpec {
         // No inbound ports, no host namespaces, no extra capabilities.
         arguments.extend([
             "--network".to_owned(),
-            "none".to_owned(),
+            network,
             "--read-only".to_owned(),
             "--tmpfs".to_owned(),
             format!("/tmp:rw,nosuid,nodev,noexec,size={}m", self.tmpfs_mib),
@@ -129,6 +162,16 @@ impl ContainerSpec {
         if let Some(cache) = self.cache_dir.as_deref() {
             arguments.push("--mount".to_owned());
             arguments.push(format!("type=bind,source={cache},target=/cache"));
+        }
+
+        for (source, target) in &self.extra_mounts {
+            validate_path(source)?;
+            validate_path(target)?;
+
+            arguments.push("--mount".to_owned());
+            arguments.push(format!(
+                "type=bind,source={source},target={target},readonly"
+            ));
         }
 
         for (key, value) in &self.env {
@@ -291,6 +334,117 @@ impl Docker {
             }
 
             tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+
+    /// Create a Docker network. Internal networks have no default route.
+    pub async fn network_create(
+        &self,
+        name: &str,
+        internal: bool,
+        instance: &str,
+    ) -> Result<(), RuntimeError> {
+        validate_network_name(name)?;
+
+        let mut arguments = vec!["network".to_owned(), "create".to_owned()];
+
+        if internal {
+            arguments.push("--internal".to_owned());
+        }
+
+        arguments.push("--label".to_owned());
+        arguments.push(format!("{INSTANCE_LABEL}={instance}"));
+        arguments.push(name.to_owned());
+
+        self.host
+            .run(&self.docker_path, &self.arguments(arguments))
+            .await
+            .map(|_| ())
+    }
+
+    /// Remove a Docker network, ignoring an absent one.
+    pub async fn network_remove(&self, name: &str) -> Result<(), RuntimeError> {
+        validate_network_name(name)?;
+
+        let result = self
+            .host
+            .run(
+                &self.docker_path,
+                &self.arguments(vec!["network".to_owned(), "rm".to_owned(), name.to_owned()]),
+            )
+            .await;
+
+        match result {
+            Ok(_) => Ok(()),
+            Err(RuntimeError::Transport(message))
+                if message.contains("No such network") || message.contains("not found") =>
+            {
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Connect a container to a network.
+    pub async fn network_connect(
+        &self,
+        network: &str,
+        container: &str,
+    ) -> Result<(), RuntimeError> {
+        validate_network_name(network)?;
+        validate_container_name(container)?;
+
+        let result = self
+            .host
+            .run(
+                &self.docker_path,
+                &self.arguments(vec![
+                    "network".to_owned(),
+                    "connect".to_owned(),
+                    network.to_owned(),
+                    container.to_owned(),
+                ]),
+            )
+            .await;
+
+        match result {
+            Ok(_) => Ok(()),
+            // Already connected is not an error for an idempotent reconcile.
+            Err(RuntimeError::Transport(message)) if message.contains("already exists") => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Disconnect a container from a network, ignoring an absent endpoint.
+    pub async fn network_disconnect(
+        &self,
+        network: &str,
+        container: &str,
+    ) -> Result<(), RuntimeError> {
+        validate_network_name(network)?;
+        validate_container_name(container)?;
+
+        let result = self
+            .host
+            .run(
+                &self.docker_path,
+                &self.arguments(vec![
+                    "network".to_owned(),
+                    "disconnect".to_owned(),
+                    network.to_owned(),
+                    container.to_owned(),
+                ]),
+            )
+            .await;
+
+        match result {
+            Ok(_) => Ok(()),
+            Err(RuntimeError::Transport(message))
+                if message.contains("is not connected") || message.contains("No such network") =>
+            {
+                Ok(())
+            }
+            Err(error) => Err(error),
         }
     }
 
@@ -734,7 +888,8 @@ mod tests {
             memory_mib: 1024,
             pids: 128,
             tmpfs_mib: 64,
-            network: false,
+            network: Network::None,
+            extra_mounts: Vec::new(),
         }
     }
 
@@ -791,10 +946,14 @@ mod tests {
     }
 
     #[test]
-    fn allowlist_networking_is_blocked_until_the_proxy_exists() {
+    fn named_networks_are_validated() {
         let mut container = spec();
-        container.network = true;
+        container.network = Network::Named("alxprgs-f32ac08f-ws-550e8400".to_owned());
 
+        let arguments = container.arguments("create").unwrap().join(" ");
+        assert!(arguments.contains("--network alxprgs-f32ac08f-ws-550e8400"));
+
+        container.network = Network::Named("bad name".to_owned());
         assert!(container.arguments("create").is_err());
     }
 

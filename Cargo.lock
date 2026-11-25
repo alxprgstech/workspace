@@ -3334,6 +3334,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "workspace-egress"
+version = "0.1.0"
+dependencies = [
+ "tokio",
+]
+
+[[package]]
 name = "workspace-helper"
 version = "0.1.0"
 dependencies = [
