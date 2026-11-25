@@ -737,6 +737,41 @@ mod tests {
     }
 
     #[test]
+    fn logout_during_refresh_wins_over_the_pending_exchange() {
+        let (dir, store, config) = setup();
+
+        let credentials = near_expiry_session(dir.path(), &store, &config);
+
+        let lease = acquire_refresh(&store, &config, &credentials);
+
+        // Sign-out deletes the session while a refresh lease is in flight.
+        let revoked = store
+            .revoke_session(&config, &credentials.handle, &credentials.csrf_token)
+            .unwrap();
+
+        assert!(revoked.is_some());
+
+        // The in-flight exchange can neither resurrect the session nor
+        // report success to the refresh path.
+        assert!(!store.finish_refresh(&lease, rotated_tokens()).unwrap());
+        assert!(!store.abort_refresh(&lease).unwrap());
+
+        assert!(
+            store
+                .get_session(&config, &credentials.handle, None)
+                .unwrap()
+                .is_none()
+        );
+
+        assert!(matches!(
+            store
+                .begin_refresh(&config, &credentials.handle, None)
+                .unwrap(),
+            RefreshDecision::Missing
+        ));
+    }
+
+    #[test]
     fn ambiguous_refresh_revokes_session() {
         let (dir, store, config) = setup();
 
