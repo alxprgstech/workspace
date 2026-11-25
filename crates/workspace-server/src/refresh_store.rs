@@ -13,10 +13,10 @@ pub enum RefreshDecision {
 pub struct RefreshLease {
     config: SsoConfig,
     handle_hash: [u8; 32],
+    lease_id: [u8; 16],
     user_id: String,
     subject: String,
     generation: i64,
-    started_at: i64,
     expires_at: i64,
     refresh_token: String,
     previous_id_token: String,
@@ -204,13 +204,17 @@ impl AuthStore {
             return Ok(RefreshDecision::Missing);
         }
 
+        let lease_id = random_lease_id().map_err(|_| AuthStoreError::InvalidFlow)?;
+
         let changed = tx.execute(
             "UPDATE web_sessions
-             SET refresh_started_at_unix = ?1
+             SET refresh_started_at_unix = ?1,
+                 refresh_lease_id = ?4
              WHERE handle_hash = ?2
                AND generation = ?3
-               AND refresh_started_at_unix IS NULL",
-            params![now, &handle_hash[..], record.generation,],
+               AND refresh_started_at_unix IS NULL
+               AND refresh_lease_id IS NULL",
+            params![now, &handle_hash[..], record.generation, &lease_id[..]],
         )?;
 
         if changed != 1 {
@@ -222,10 +226,10 @@ impl AuthStore {
         Ok(RefreshDecision::Acquired(Box::new(RefreshLease {
             config: config.clone(),
             handle_hash,
+            lease_id,
             user_id: record.user_id,
             subject: record.subject,
             generation: record.generation,
-            started_at: now,
             expires_at: record.expires_at,
             refresh_token: tokens.refresh_token,
             previous_id_token: tokens.id_token,
@@ -282,20 +286,21 @@ impl AuthStore {
              SET encrypted_tokens = ?1,
                  access_expires_at_unix = ?2,
                  generation = ?3,
-                 refresh_started_at_unix = NULL
+                 refresh_started_at_unix = NULL,
+                 refresh_lease_id = NULL
              WHERE handle_hash = ?4
                AND generation = ?5
-               AND refresh_started_at_unix = ?6
+               AND refresh_lease_id = ?6
                AND user_id = ?7
                AND client_id = ?8
                AND expires_at_unix = ?9
                AND expires_at_unix > ?10
-               AND refresh_started_at_unix > ?11
+               AND refresh_started_at_unix IS NOT NULL
                AND revoked_at_unix IS NULL
                AND user_id IN (
                    SELECT id FROM users
-                   WHERE issuer = ?12
-                     AND subject = ?13
+                   WHERE issuer = ?11
+                     AND subject = ?12
                      AND is_enabled = 1
                )",
             params![
@@ -304,12 +309,11 @@ impl AuthStore {
                 generation,
                 &lease.handle_hash[..],
                 lease.generation,
-                lease.started_at,
+                &lease.lease_id[..],
                 &lease.user_id,
                 &lease.config.client_id,
                 lease.expires_at,
                 now,
-                now - REFRESH_TIMEOUT_SECONDS,
                 &lease.config.issuer,
                 &lease.subject,
             ],
@@ -353,14 +357,12 @@ impl AuthStore {
         let changed = connection.execute(
             "DELETE FROM web_sessions
              WHERE handle_hash = ?1
-               AND generation = ?2
-               AND refresh_started_at_unix = ?3
-               AND user_id = ?4
-               AND client_id = ?5",
+               AND refresh_lease_id = ?2
+               AND user_id = ?3
+               AND client_id = ?4",
             params![
                 &lease.handle_hash[..],
-                lease.generation,
-                lease.started_at,
+                &lease.lease_id[..],
                 &lease.user_id,
                 &lease.config.client_id,
             ],
@@ -380,17 +382,16 @@ impl AuthStore {
 
         let changed = connection.execute(
             "UPDATE web_sessions
-             SET refresh_started_at_unix = NULL
+             SET refresh_started_at_unix = NULL,
+                 refresh_lease_id = NULL
              WHERE handle_hash = ?1
-               AND generation = ?2
-               AND refresh_started_at_unix = ?3
-               AND user_id = ?4
-               AND client_id = ?5
+               AND refresh_lease_id = ?2
+               AND user_id = ?3
+               AND client_id = ?4
                AND revoked_at_unix IS NULL",
             params![
                 &lease.handle_hash[..],
-                lease.generation,
-                lease.started_at,
+                &lease.lease_id[..],
                 &lease.user_id,
                 &lease.config.client_id,
             ],

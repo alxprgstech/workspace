@@ -1,7 +1,7 @@
 use serde::Deserialize;
 use std::{
     fs,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
 };
 use thiserror::Error;
@@ -96,6 +96,11 @@ pub struct SsoConfig {
     pub issuer: String,
     pub client_id: String,
     pub redirect_uri: String,
+
+    /// Addresses of reverse proxies whose `X-Forwarded-For` may be trusted.
+    /// Empty by default: forwarded headers are then ignored entirely.
+    #[serde(default)]
+    pub trusted_proxies: Vec<IpAddr>,
 }
 
 #[derive(Debug, Error)]

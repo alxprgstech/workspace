@@ -304,6 +304,13 @@ p { margin: 8px 0 0; color: var(--muted); font-size: 14px; }
 
 .notice svg { flex-shrink: 0; }
 
+.notice-hint {
+  font-size: 0.875rem;
+  opacity: 0.8;
+}
+
+.notice .button { margin-top: 12px; }
+
 .warning { color: var(--warning); background: var(--warning-bg); }
 .error { color: var(--danger); background: var(--danger-bg); }
 

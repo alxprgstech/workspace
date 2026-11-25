@@ -353,6 +353,7 @@ mod tests {
             issuer: ISSUER.to_owned(),
             client_id: "test-client".to_owned(),
             redirect_uri: "https://workspace.example.com/auth/callback".to_owned(),
+            trusted_proxies: Vec::new(),
         }
     }
 
@@ -473,6 +474,7 @@ mod signed_token_tests {
                 issuer: ISSUER.to_owned(),
                 client_id: "test-client".to_owned(),
                 redirect_uri: "https://workspace.example.com/auth/callback".to_owned(),
+                trusted_proxies: Vec::new(),
             },
             jwks: serde_json::from_value(jwks).unwrap(),
         };

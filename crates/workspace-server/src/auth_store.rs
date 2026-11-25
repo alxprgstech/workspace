@@ -1,5 +1,5 @@
 use crate::{
-    crypto::{CryptoError, SecretCipher, hash_handle, random_handle},
+    crypto::{CryptoError, SecretCipher, hash_handle, random_handle, random_lease_id},
     sso::{self, AuthorizationRequest},
     storage::{self, StorageError},
 };
@@ -201,6 +201,7 @@ mod tests {
             issuer: "https://auth.alxprgs.tech".to_owned(),
             client_id: "test-client".to_owned(),
             redirect_uri: "https://workspace.example.com/auth/callback".to_owned(),
+            trusted_proxies: Vec::new(),
         }
     }
 

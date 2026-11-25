@@ -42,6 +42,21 @@ pub fn random_handle() -> Result<String, CryptoError> {
     Ok(URL_SAFE_NO_PAD.encode(bytes))
 }
 
+/// Unique identifier for a single refresh-lease acquisition.
+///
+/// Unrelated to the session generation: a released and re-acquired lease
+/// always receives a fresh identifier, so a stale lease can never match the
+/// row that a newer lease now owns.
+pub fn random_lease_id() -> Result<[u8; 16], CryptoError> {
+    let mut bytes = [0_u8; 16];
+
+    SystemRandom::new()
+        .fill(&mut bytes)
+        .map_err(|_| CryptoError::Random)?;
+
+    Ok(bytes)
+}
+
 pub fn hash_handle(value: &str) -> [u8; 32] {
     let digest = digest::digest(&digest::SHA256, value.as_bytes());
 

@@ -125,6 +125,7 @@ function App() {
   const [check, setCheck] = useState(0)
   const [fault, setFault] = useState<string | null>(null)
   const [loggingOut, setLoggingOut] = useState(false)
+  const [signOutError, setSignOutError] = useState<string | null>(null)
 
   const [data, setData] = useState<DashboardData | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -251,18 +252,32 @@ function App() {
 
   const signOut = useCallback(async () => {
     setLoggingOut(true)
+    setSignOutError(null)
 
     try {
       await logout()
-    } catch {
-      // The local interface is cleared even if the request failed.
-    } finally {
-      setLoggingOut(false)
+
+      // Only a confirmed server-side sign-out ends the session locally.
       setSession(null)
       setData(null)
       setError(null)
       setAuthNotice(null)
       setPhase('anonymous')
+    } catch (reason) {
+      // The outcome is unknown: the server may still hold a live session.
+      // Never present this as a successful sign-out.
+      setSignOutError(
+        reason instanceof ApiError && reason.status === 503
+          ? 'Workspace could not confirm the sign-out because the server is ' +
+            'temporarily unavailable. Your server session may still be active.'
+          : reason instanceof Error
+            ? `Workspace could not confirm the sign-out (${reason.message}). ` +
+              'Your server session may still be active.'
+            : 'Workspace could not confirm the sign-out. Your server session ' +
+              'may still be active.',
+      )
+    } finally {
+      setLoggingOut(false)
     }
   }, [])
 
@@ -464,6 +479,27 @@ function App() {
               </span>
             )}
           </div>
+
+          {signOutError && (
+            <div className="notice error" role="alert">
+              <ShieldAlert size={20} />
+              <div>
+                <strong>Sign-out was not confirmed</strong>
+                <p>{signOutError}</p>
+                <p className="notice-hint">
+                  You are still signed in on this page. Retry the sign-out, or
+                  close the browser if the server stays unreachable.
+                </p>
+                <button
+                  className="button primary"
+                  disabled={loggingOut}
+                  onClick={() => void signOut()}
+                >
+                  {loggingOut ? 'Signing out...' : 'Retry sign-out'}
+                </button>
+              </div>
+            </div>
+          )}
 
           {error && (
             <div className="notice error" role="alert">

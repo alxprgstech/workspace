@@ -33,3 +33,8 @@ level = "info"
 # issuer = "https://auth.alxprgs.tech"
 # client_id = "your-client-id"
 # redirect_uri = "https://workspace.example.com/auth/callback"
+#
+# trusted_proxies lists reverse-proxy addresses whose X-Forwarded-For header is
+# believed when rate limiting sign-in attempts per client. Leave it empty (the
+# default) unless a proxy in front of Workspace is under your control.
+# trusted_proxies = ["127.0.0.1", "::1"]

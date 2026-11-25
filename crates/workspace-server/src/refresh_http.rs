@@ -102,6 +102,9 @@ async fn perform_refresh(state: Arc<AuthState>, lease: RefreshLease) -> Result<b
                 tracing::warn!("SSO refresh timed out");
             }
 
+            // A rotated signing key must not stay pinned in the cache.
+            state.invalidate_discovery().await;
+
             blocking(move || state.store.abort_refresh(&lease)).await?;
 
             Err(StatusCode::SERVICE_UNAVAILABLE)

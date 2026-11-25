@@ -327,6 +327,7 @@ mod tests {
             issuer: "https://auth.alxprgs.tech".to_owned(),
             client_id: "test-client".to_owned(),
             redirect_uri: "https://workspace.example.com/auth/callback".to_owned(),
+            trusted_proxies: Vec::new(),
         }
     }
 
@@ -805,6 +806,56 @@ mod tests {
         let retry = acquire_refresh(&store, &config, &credentials);
 
         assert!(store.finish_refresh(&retry, rotated_tokens(),).unwrap());
+    }
+
+    #[test]
+    fn reacquired_lease_ignores_stale_owner_in_the_same_second() {
+        let (dir, store, config) = setup();
+
+        let credentials = near_expiry_session(dir.path(), &store, &config);
+
+        let stale = acquire_refresh(&store, &config, &credentials);
+
+        // Release and immediately re-acquire: both leases are created within
+        // the same wall-clock second and share the same generation.
+        assert!(store.release_unsubmitted_refresh(&stale).unwrap());
+
+        let active = acquire_refresh(&store, &config, &credentials);
+
+        // The stale owner must not be able to release, abort or complete the
+        // attempt that now belongs to a different lease.
+        assert!(!store.release_unsubmitted_refresh(&stale).unwrap());
+        assert!(!store.finish_refresh(&stale, rotated_tokens()).unwrap());
+        assert!(!store.abort_refresh(&stale).unwrap());
+
+        // The live lease still owns the row: the stale abort must not have
+        // deleted the session it no longer owns.
+        let connection = storage::open(dir.path()).unwrap();
+
+        let owned: Option<Vec<u8>> = connection
+            .query_row("SELECT refresh_lease_id FROM web_sessions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+
+        assert!(owned.is_some());
+
+        // The live lease is unaffected and still completes normally.
+        assert!(store.finish_refresh(&active, rotated_tokens()).unwrap());
+
+        assert!(
+            store
+                .get_session(&config, &credentials.handle, None)
+                .unwrap()
+                .is_some()
+        );
+
+        assert!(matches!(
+            store
+                .begin_refresh(&config, &credentials.handle, None)
+                .unwrap(),
+            RefreshDecision::NotNeeded
+        ));
     }
 
     #[test]

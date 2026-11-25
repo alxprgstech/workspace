@@ -2,6 +2,8 @@
 
 //! HTTP API, MCP gateway, authentication and administration.
 
+#[cfg(not(feature = "web-ui"))]
+use axum::response::{IntoResponse, Response};
 use axum::{Json, Router, extract::State, http::StatusCode, routing::get};
 #[cfg(feature = "web-ui")]
 mod web;
@@ -116,7 +118,37 @@ fn router(
     #[cfg(feature = "web-ui")]
     let router = router.merge(web::router());
 
+    // The SSO callback always redirects to `/`. A build without the bundled
+    // management interface must still answer there, otherwise a successful
+    // sign-in would land on a 404.
+    #[cfg(not(feature = "web-ui"))]
+    let router = router.route("/", get(headless_index));
+
     router.layer(axum::middleware::from_fn(auth_http::security_headers))
+}
+
+/// Small, dependency-free landing page for headless builds.
+#[cfg(not(feature = "web-ui"))]
+async fn headless_index() -> Response {
+    const PAGE: &str = concat!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">",
+        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">",
+        "<title>ALXPRGS Workspace</title></head><body>",
+        "<main style=\"font-family: system-ui, sans-serif; max-width: 32rem; ",
+        "margin: 4rem auto; padding: 0 1rem; line-height: 1.5\">",
+        "<h1>ALXPRGS Workspace</h1>",
+        "<p>This is a headless build: the management interface is not bundled.</p>",
+        "<p>You are signed in. Session details are available from ",
+        "<code>GET /auth/me</code> and server details from ",
+        "<code>GET /api/v1/server/info</code>.</p>",
+        "</main></body></html>",
+    );
+
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        PAGE,
+    )
+        .into_response()
 }
 
 pub async fn serve(config: Config) -> io::Result<()> {
@@ -195,9 +227,13 @@ pub async fn serve(config: Config) -> io::Result<()> {
 
     tracing::warn!("Execution runtime is not ready");
 
-    axum::serve(listener, router(&config, storage, auth))
-        .with_graceful_shutdown(shutdown)
-        .await?;
+    axum::serve(
+        listener,
+        router(&config, storage, auth)
+            .into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await?;
 
     tracing::info!("Workspace HTTP server stopped");
 
@@ -334,6 +370,7 @@ mod auth_http_tests {
             issuer: "https://auth.alxprgs.tech".to_owned(),
             client_id: "test-client".to_owned(),
             redirect_uri: format!("{ORIGIN}/auth/callback"),
+            trusted_proxies: Vec::new(),
         };
 
         config.sso = Some(sso.clone());
@@ -365,6 +402,23 @@ mod auth_http_tests {
         .await
     }
 
+    /// The SSO callback redirects to `/`; that target must exist even when the
+    /// management interface is not part of the build.
+    #[tokio::test]
+    async fn root_is_served_by_a_headless_build() {
+        let (_dir, router, _sso) = setup();
+
+        let response = get(&router, "/").await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let content_type = response.headers()[axum::http::header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .to_owned();
+
+        assert!(content_type.starts_with("text/html"), "{content_type}");
+    }
     fn create_session(dir: &std::path::Path, config: &SsoConfig) -> auth_store::SessionCredentials {
         users::grant_access(dir, config, SUBJECT, "admin").unwrap();
 
@@ -474,19 +528,106 @@ mod auth_http_tests {
         assert!(!location.contains("state="));
     }
 
+    fn peer(address: &str) -> std::net::SocketAddr {
+        address.parse().unwrap()
+    }
+
+    async fn get_from(router: &Router, uri: &str, address: std::net::SocketAddr) -> Response {
+        let mut request = Request::builder().uri(uri).body(Body::empty()).unwrap();
+
+        request
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo(address));
+
+        self::request(router, request).await
+    }
+
     #[tokio::test]
     async fn authorization_attempts_are_rate_limited() {
         let (_dir, router, _sso) = setup();
 
+        let client = peer("203.0.113.7:50000");
+
         for _ in 0..20 {
             assert_eq!(
-                get(&router, "/auth/login").await.status(),
+                get_from(&router, "/auth/login", client).await.status(),
                 StatusCode::SEE_OTHER
             );
         }
 
         assert_eq!(
-            get(&router, "/auth/login").await.status(),
+            get_from(&router, "/auth/login", client).await.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+        );
+    }
+
+    /// One noisy client must not exhaust the budget of every other client,
+    /// which is what a single shared window used to do.
+    #[tokio::test]
+    async fn exhausted_client_does_not_block_other_clients() {
+        let (_dir, router, _sso) = setup();
+
+        let noisy = peer("203.0.113.7:50000");
+        let quiet = peer("198.51.100.20:50000");
+
+        for _ in 0..21 {
+            let _ = get_from(&router, "/auth/login", noisy).await;
+        }
+
+        assert_eq!(
+            get_from(&router, "/auth/login", noisy).await.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+        );
+
+        assert_eq!(
+            get_from(&router, "/auth/login", quiet).await.status(),
+            StatusCode::SEE_OTHER,
+        );
+    }
+
+    /// A spoofed X-Forwarded-For must not move a client into a fresh bucket.
+    #[tokio::test]
+    async fn forwarded_header_cannot_evade_the_limit() {
+        let (_dir, router, _sso) = setup();
+
+        let client = peer("203.0.113.7:50000");
+
+        for attempt in 0..20 {
+            let mut request = Request::builder()
+                .uri("/auth/login")
+                .body(Body::empty())
+                .unwrap();
+
+            request
+                .extensions_mut()
+                .insert(axum::extract::ConnectInfo(client));
+
+            request.headers_mut().insert(
+                "x-forwarded-for",
+                format!("10.0.0.{attempt}").parse().unwrap(),
+            );
+
+            assert_eq!(
+                self::request(&router, request).await.status(),
+                StatusCode::SEE_OTHER
+            );
+        }
+
+        let mut request = Request::builder()
+            .uri("/auth/login")
+            .body(Body::empty())
+            .unwrap();
+
+        request
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo(client));
+
+        request
+            .headers_mut()
+            .insert("x-forwarded-for", "10.0.0.200".parse().unwrap());
+
+        assert_eq!(
+            self::request(&router, request).await.status(),
             StatusCode::TOO_MANY_REQUESTS,
         );
     }

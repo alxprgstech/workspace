@@ -8,13 +8,14 @@ use std::{
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 const APPLICATION_ID: i64 = 0x414C5857;
 const MIN_SQLITE_VERSION: i32 = 3_051_003;
 
 const MIGRATION_001: &str = include_str!("../migrations/0001_initial.sql");
 const MIGRATION_002: &str = include_str!("../migrations/0002_auth.sql");
+const MIGRATION_003: &str = include_str!("../migrations/0003_refresh_lease.sql");
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct StorageInfo {
@@ -124,6 +125,10 @@ fn migrate(connection: &mut Connection) -> Result<(), StorageError> {
 
     if version < 2 {
         tx.execute_batch(MIGRATION_002)?;
+    }
+
+    if version < 3 {
+        tx.execute_batch(MIGRATION_003)?;
     }
 
     tx.commit()?;
@@ -356,7 +361,7 @@ mod migration_tests {
 
         let info = initialize(dir.path()).unwrap();
 
-        assert_eq!(info.schema_version, 2);
+        assert_eq!(info.schema_version, SCHEMA_VERSION);
         assert_eq!(info.instance_id, INSTANCE_ID);
 
         let connection = open(dir.path()).unwrap();
