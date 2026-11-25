@@ -12,7 +12,7 @@ use workspace_core::config::SsoConfig;
 #[path = "sessions.rs"]
 mod sessions;
 
-pub use sessions::{SessionCredentials, SessionInfo};
+pub use sessions::{RefreshDecision, RefreshLease, SessionCredentials, SessionInfo};
 
 const FLOW_TTL_SECONDS: i64 = 600;
 

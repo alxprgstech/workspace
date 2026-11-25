@@ -4,6 +4,12 @@ use crate::{
     users::{self, UserRecord},
 };
 
+#[path = "refresh_store.rs"]
+mod refresh_store;
+
+use refresh_store::generation_aad;
+pub use refresh_store::{RefreshDecision, RefreshLease};
+
 const SESSION_TTL_SECONDS: i64 = 28_800;
 
 pub struct SessionCredentials {
@@ -152,7 +158,8 @@ impl AuthStore {
                 u.username, u.role, u.is_enabled,
                 s.expires_at_unix,
                 s.access_expires_at_unix,
-                s.encrypted_tokens
+                s.encrypted_tokens,
+                s.generation
              FROM web_sessions s
              JOIN users u ON u.id = s.user_id
              WHERE s.handle_hash = ?1
@@ -161,7 +168,6 @@ impl AuthStore {
                AND u.is_enabled = 1
                AND s.revoked_at_unix IS NULL
                AND s.refresh_started_at_unix IS NULL
-               AND s.generation = 0
                AND s.expires_at_unix > unixepoch()
                AND s.access_expires_at_unix > unixepoch()
                AND (?4 IS NULL OR s.csrf_hash = ?4)",
@@ -179,18 +185,25 @@ impl AuthStore {
                             access_expires_at_unix: row.get(7)?,
                         },
                         row.get::<_, Vec<u8>>(8)?,
+                        row.get::<_, i64>(9)?,
                     ))
                 },
             )
             .optional()?;
 
-        let Some((info, encrypted)) = record else {
+        let Some((info, encrypted, generation)) = record else {
             return Ok(None);
         };
 
         let plaintext = self.cipher.open(
             &encrypted,
-            &session_aad(config, &handle_hash, &info.user.id, info.expires_at_unix),
+            &generation_aad(
+                config,
+                &handle_hash,
+                &info.user.id,
+                info.expires_at_unix,
+                generation,
+            ),
         )?;
 
         let tokens: SessionTokens =
@@ -503,5 +516,249 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    fn near_expiry_session(
+        dir: &std::path::Path,
+        store: &AuthStore,
+        config: &SsoConfig,
+    ) -> SessionCredentials {
+        users::grant_access(dir, config, SUBJECT, "admin").unwrap();
+
+        let mut login = login();
+
+        login.tokens.access_expires_at_unix -= 275;
+
+        store.create_session(config, &login).unwrap().unwrap()
+    }
+
+    fn acquire_refresh(
+        store: &AuthStore,
+        config: &SsoConfig,
+        credentials: &SessionCredentials,
+    ) -> Box<RefreshLease> {
+        match store
+            .begin_refresh(config, &credentials.handle, None)
+            .unwrap()
+        {
+            RefreshDecision::Acquired(lease) => lease,
+            _ => panic!("Expected an acquired refresh lease"),
+        }
+    }
+
+    fn rotated_tokens() -> SessionTokens {
+        let mut tokens = login().tokens;
+
+        tokens.access_token = "rotated-access-token".to_owned();
+        tokens.refresh_token = "rotated-refresh-token".to_owned();
+        tokens.id_token = "rotated-id-token".to_owned();
+
+        tokens
+    }
+
+    #[test]
+    fn fresh_session_does_not_require_refresh() {
+        let (dir, store, config) = setup();
+
+        users::grant_access(dir.path(), &config, SUBJECT, "admin").unwrap();
+
+        let credentials = store.create_session(&config, &login()).unwrap().unwrap();
+
+        assert!(matches!(
+            store
+                .begin_refresh(&config, &credentials.handle, None,)
+                .unwrap(),
+            RefreshDecision::NotNeeded
+        ));
+    }
+
+    #[test]
+    fn concurrent_refresh_is_acquired_only_once() {
+        let (dir, store, config) = setup();
+
+        let credentials = near_expiry_session(dir.path(), &store, &config);
+
+        let results = std::thread::scope(|scope| {
+            let threads: Vec<_> = (0..2)
+                .map(|_| {
+                    let path = dir.path();
+                    let config = &config;
+                    let handle = &credentials.handle;
+
+                    scope.spawn(move || {
+                        let store = AuthStore::new(path, &KEY).unwrap();
+
+                        match store.begin_refresh(config, handle, None).unwrap() {
+                            RefreshDecision::Acquired(_) => 1,
+                            RefreshDecision::Pending => 0,
+                            _ => panic!("Unexpected refresh state"),
+                        }
+                    })
+                })
+                .collect();
+
+            threads
+                .into_iter()
+                .map(|thread| thread.join().unwrap())
+                .sum::<u32>()
+        });
+
+        assert_eq!(results, 1);
+    }
+
+    #[test]
+    fn successful_refresh_increments_generation() {
+        let (dir, store, config) = setup();
+
+        let credentials = near_expiry_session(dir.path(), &store, &config);
+
+        let lease = acquire_refresh(&store, &config, &credentials);
+
+        assert_eq!(lease.subject(), SUBJECT);
+        assert_eq!(lease.refresh_token(), "test-refresh-token");
+
+        assert!(store.finish_refresh(&lease, rotated_tokens(),).unwrap());
+
+        let info = store
+            .get_session(&config, &credentials.handle, None)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(info.expires_at_unix, credentials.expires_at_unix);
+
+        let connection = storage::open(dir.path()).unwrap();
+
+        let state: (i64, Option<i64>) = connection
+            .query_row(
+                "SELECT generation, refresh_started_at_unix
+                 FROM web_sessions",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+
+        assert_eq!(state, (1, None));
+
+        // A stale completion or cancellation cannot
+        // overwrite or delete the new generation.
+        assert!(!store.finish_refresh(&lease, rotated_tokens(),).unwrap());
+
+        assert!(!store.abort_refresh(&lease).unwrap());
+
+        assert!(
+            store
+                .get_session(&config, &credentials.handle, None,)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn ambiguous_refresh_revokes_session() {
+        let (dir, store, config) = setup();
+
+        let credentials = near_expiry_session(dir.path(), &store, &config);
+
+        let lease = acquire_refresh(&store, &config, &credentials);
+
+        assert!(store.abort_refresh(&lease).unwrap());
+
+        assert!(matches!(
+            store
+                .begin_refresh(&config, &credentials.handle, None,)
+                .unwrap(),
+            RefreshDecision::Missing
+        ));
+    }
+
+    #[test]
+    fn abandoned_refresh_is_never_reacquired() {
+        let (dir, store, config) = setup();
+
+        let credentials = near_expiry_session(dir.path(), &store, &config);
+
+        let lease = acquire_refresh(&store, &config, &credentials);
+
+        let connection = storage::open(dir.path()).unwrap();
+
+        connection
+            .execute(
+                "UPDATE web_sessions
+             SET refresh_started_at_unix = unixepoch() - 121",
+                [],
+            )
+            .unwrap();
+
+        // Simulate restarting the Workspace process.
+        let reopened = AuthStore::new(dir.path(), &KEY).unwrap();
+
+        assert!(matches!(
+            reopened
+                .begin_refresh(&config, &credentials.handle, None,)
+                .unwrap(),
+            RefreshDecision::Missing
+        ));
+
+        assert!(!store.finish_refresh(&lease, rotated_tokens(),).unwrap());
+    }
+
+    #[test]
+    fn refresh_cannot_restore_disabled_user_session() {
+        let (dir, store, config) = setup();
+
+        let credentials = near_expiry_session(dir.path(), &store, &config);
+
+        let lease = acquire_refresh(&store, &config, &credentials);
+
+        users::disable_access(dir.path(), &config, SUBJECT).unwrap();
+
+        assert!(!store.finish_refresh(&lease, rotated_tokens(),).unwrap());
+
+        assert!(
+            store
+                .get_session(&config, &credentials.handle, None,)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn refresh_cannot_restore_logged_out_session() {
+        let (dir, store, config) = setup();
+
+        let credentials = near_expiry_session(dir.path(), &store, &config);
+
+        let lease = acquire_refresh(&store, &config, &credentials);
+
+        assert!(
+            store
+                .revoke_session(&config, &credentials.handle, &credentials.csrf_token,)
+                .unwrap()
+        );
+
+        assert!(!store.finish_refresh(&lease, rotated_tokens(),).unwrap());
+    }
+
+    #[test]
+    fn refresh_requires_matching_csrf_when_supplied() {
+        let (dir, store, config) = setup();
+
+        let credentials = near_expiry_session(dir.path(), &store, &config);
+
+        let wrong = random_handle().unwrap();
+
+        assert!(matches!(
+            store
+                .begin_refresh(&config, &credentials.handle, Some(&wrong),)
+                .unwrap(),
+            RefreshDecision::Missing
+        ));
+
+        assert!(matches!(
+            store
+                .begin_refresh(&config, &credentials.handle, Some(&credentials.csrf_token),)
+                .unwrap(),
+            RefreshDecision::Acquired(_)
+        ));
     }
 }
