@@ -1,0 +1,28 @@
+[server]
+listen = "127.0.0.1:8765"
+
+[storage]
+data_dir = "data"
+max_import_mib = 256
+
+[resources]
+cpu_millis = 2000
+memory_mib = 4096
+storage_mib = 40960
+max_active_workspaces = 3
+max_concurrent_jobs = 1
+max_processes_per_workspace = 256
+max_job_seconds = 3600
+
+[workspace]
+default_mode = "ephemeral"
+idle_timeout_seconds = 300
+ttl_seconds = 86400
+artifact_ttl_seconds = 86400
+
+[network]
+default_mode = "none"
+allowlist = []
+
+[logging]
+level = "info"

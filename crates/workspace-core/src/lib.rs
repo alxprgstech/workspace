@@ -15,3 +15,5 @@ mod tests {
         assert!(!VERSION.is_empty());
     }
 }
+
+pub mod config;

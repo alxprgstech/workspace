@@ -16,6 +16,12 @@ repository = "https://github.com/alxprgstech/workspace"
 authors = ["ALXPRGS"]
 
 [workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
+thiserror = "2"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
 workspace-core = { path = "crates/workspace-core" }
 
 [profile.release]
