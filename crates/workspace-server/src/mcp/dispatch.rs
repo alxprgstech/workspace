@@ -103,11 +103,40 @@ pub async fn call(
         "job_status" => job_status(services, caller, arguments),
         "job_logs" => job_logs(services, caller, arguments),
         "job_cancel" => job_cancel(services, caller, arguments).await,
+        "files_list" => files_list(services, caller, arguments).await,
+        "file_read" => file_read(services, caller, arguments).await,
+        "file_write" => file_write(services, caller, arguments).await,
+        "file_patch" => file_patch(services, caller, arguments).await,
+        "artifact_publish" => artifact_publish(services, caller, arguments).await,
+        "artifact_list" => artifact_list(services, caller),
+        "artifact_download" => artifact_download(services, caller, arguments),
         other => Err(ToolError::new(
             "unknown_tool",
             format!("unknown tool: {other}"),
         )),
     }
+}
+
+fn files(services: &GatewayServices) -> Result<&crate::files::Files, ToolError> {
+    services
+        .files
+        .as_deref()
+        .ok_or_else(|| ToolError::unavailable("the file service is not available"))
+}
+
+fn artifacts(services: &GatewayServices) -> Result<&crate::artifacts::Artifacts, ToolError> {
+    services
+        .artifacts
+        .as_deref()
+        .ok_or_else(|| ToolError::unavailable("the artifact service is not available"))
+}
+
+fn files_error(error: crate::files::FilesError) -> ToolError {
+    ToolError::new(error.code(), error.to_string())
+}
+
+fn artifact_error(error: crate::artifacts::ArtifactError) -> ToolError {
+    ToolError::new(error.code(), error.to_string())
 }
 
 fn manager(services: &GatewayServices) -> Result<&crate::workspaces::Manager, ToolError> {
@@ -386,6 +415,146 @@ async fn job_cancel(
         .map_err(job_error)?;
 
     Ok(json!(job))
+}
+
+async fn files_list(
+    services: &GatewayServices,
+    caller: &Caller<'_>,
+    arguments: &Map<String, Value>,
+) -> Result<Value, ToolError> {
+    let workspace_id = string_argument(arguments, "workspace_id")?;
+
+    let listing = files(services)?
+        .list(
+            caller.user_id,
+            workspace_id,
+            &optional_string(arguments, "path")?.unwrap_or_default(),
+            optional_u64(arguments, "depth")?.unwrap_or(2) as u32,
+            optional_u64(arguments, "limit")?.unwrap_or(500) as u32,
+        )
+        .await
+        .map_err(files_error)?;
+
+    Ok(json!(listing))
+}
+
+async fn file_read(
+    services: &GatewayServices,
+    caller: &Caller<'_>,
+    arguments: &Map<String, Value>,
+) -> Result<Value, ToolError> {
+    let workspace_id = string_argument(arguments, "workspace_id")?;
+    let path = string_argument(arguments, "path")?;
+
+    let chunk = files(services)?
+        .read(
+            caller.user_id,
+            workspace_id,
+            path,
+            optional_u64(arguments, "offset")?.unwrap_or(0),
+            optional_u64(arguments, "length")?.unwrap_or(64 * 1024),
+        )
+        .await
+        .map_err(files_error)?;
+
+    Ok(json!(chunk))
+}
+
+async fn file_write(
+    services: &GatewayServices,
+    caller: &Caller<'_>,
+    arguments: &Map<String, Value>,
+) -> Result<Value, ToolError> {
+    let workspace_id = string_argument(arguments, "workspace_id")?;
+    let path = string_argument(arguments, "path")?;
+    let content = string_argument(arguments, "content")?;
+
+    let create = optional_bool(arguments, "create")?.unwrap_or(false);
+
+    let outcome = files(services)?
+        .write(
+            caller.user_id,
+            workspace_id,
+            path,
+            content.as_bytes(),
+            optional_string(arguments, "expected_sha256")?.as_deref(),
+            create,
+            !create,
+        )
+        .await
+        .map_err(files_error)?;
+
+    Ok(json!(outcome))
+}
+
+async fn file_patch(
+    services: &GatewayServices,
+    caller: &Caller<'_>,
+    arguments: &Map<String, Value>,
+) -> Result<Value, ToolError> {
+    let workspace_id = string_argument(arguments, "workspace_id")?;
+    let path = string_argument(arguments, "path")?;
+    let patch = string_argument(arguments, "patch")?;
+
+    let outcome = files(services)?
+        .patch(
+            caller.user_id,
+            workspace_id,
+            path,
+            patch,
+            optional_string(arguments, "expected_sha256")?.as_deref(),
+        )
+        .await
+        .map_err(files_error)?;
+
+    Ok(json!(outcome))
+}
+
+async fn artifact_publish(
+    services: &GatewayServices,
+    caller: &Caller<'_>,
+    arguments: &Map<String, Value>,
+) -> Result<Value, ToolError> {
+    let workspace_id = string_argument(arguments, "workspace_id")?;
+    let path = string_argument(arguments, "path")?;
+
+    let artifact = artifacts(services)?
+        .publish(
+            caller.user_id,
+            workspace_id,
+            path,
+            optional_string(arguments, "name")?.as_deref(),
+        )
+        .await
+        .map_err(artifact_error)?;
+
+    Ok(json!(artifact))
+}
+
+fn artifact_list(services: &GatewayServices, caller: &Caller<'_>) -> Result<Value, ToolError> {
+    let artifacts = artifacts(services)?
+        .list(caller.user_id)
+        .map_err(artifact_error)?;
+
+    Ok(json!({ "artifacts": artifacts }))
+}
+
+fn artifact_download(
+    services: &GatewayServices,
+    caller: &Caller<'_>,
+    arguments: &Map<String, Value>,
+) -> Result<Value, ToolError> {
+    let artifact_id = string_argument(arguments, "artifact_id")?;
+
+    let link = artifacts(services)?
+        .download_link(
+            caller.user_id,
+            artifact_id,
+            optional_u64(arguments, "ttl_seconds")?,
+        )
+        .map_err(artifact_error)?;
+
+    Ok(json!(link))
 }
 
 fn now() -> i64 {

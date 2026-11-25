@@ -510,6 +510,91 @@ impl SafeRoot {
     }
 }
 
+/// Copy a regular file between two capability roots.
+///
+/// Both roots are opened capabilities, so the copy can neither read nor write
+/// outside the directories the server named.
+pub fn copy_between(
+    source: &SafeRoot,
+    source_path: &str,
+    target: &SafeRoot,
+    target_path: &str,
+    replace: bool,
+    expected_sha256: Option<&str>,
+) -> Result<serde_json::Value, HelperError> {
+    source.verify_expected(source_path, expected_sha256)?;
+    helper::validate_relative_path(target_path)?;
+
+    if target_path.is_empty() {
+        return Err(HelperError::new(
+            helper::code::PATH_INVALID,
+            "a target path is required",
+        ));
+    }
+
+    if !replace && target.dir.try_exists(target_path).unwrap_or(false) {
+        return Err(HelperError::new(
+            helper::code::EXISTS,
+            "target already exists",
+        ));
+    }
+
+    let (mut input, metadata) = source.open_regular(source_path)?;
+
+    if metadata.len() > MAX_COPY_BYTES {
+        return Err(HelperError::new(
+            helper::code::TOO_LARGE,
+            "file exceeds the maximum copy size",
+        ));
+    }
+
+    let (temporary, mut output) = target.create_temp(target_path)?;
+
+    let mut hasher = Sha256::new();
+    let mut copied = 0u64;
+    let mut buffer = vec![0u8; 64 * 1024];
+
+    let result = (|| -> Result<(), HelperError> {
+        loop {
+            let read = input.read(&mut buffer).map_err(map_io)?;
+
+            if read == 0 {
+                break;
+            }
+
+            hasher.update(&buffer[..read]);
+            output.write_all(&buffer[..read]).map_err(map_io)?;
+            copied += read as u64;
+
+            if copied > MAX_COPY_BYTES {
+                return Err(HelperError::new(
+                    helper::code::TOO_LARGE,
+                    "file exceeds the maximum copy size",
+                ));
+            }
+        }
+
+        output.sync_all().map_err(map_io)
+    })();
+
+    drop(output);
+
+    if let Err(error) = result {
+        let _ = target.dir.remove_file(&temporary);
+        return Err(error);
+    }
+
+    if let Err(error) = target.dir.rename(&temporary, &target.dir, target_path) {
+        let _ = target.dir.remove_file(&temporary);
+        return Err(map_io(error));
+    }
+
+    Ok(serde_json::json!({
+        "sha256": hex(&hasher.finalize()),
+        "size": copied,
+    }))
+}
+
 /// Copy limit; larger files must use the chunked import path instead.
 const MAX_COPY_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
@@ -786,16 +871,15 @@ mod tests {
         root.write("source.bin", b"payload", false, false, None)
             .unwrap();
 
-        let copied = root.copy("source.bin", "nested/target.bin", false, None);
+        let copied = copy_between(&root, "source.bin", &root, "nested/target.bin", false, None);
 
         // The parent does not exist, so the copy fails instead of guessing.
         assert!(copied.is_err());
 
         root.mkdir("nested", false).unwrap();
 
-        let copied = root
-            .copy("source.bin", "nested/target.bin", false, None)
-            .unwrap();
+        let copied =
+            copy_between(&root, "source.bin", &root, "nested/target.bin", false, None).unwrap();
 
         assert_eq!(copied["size"], 7);
         assert_eq!(

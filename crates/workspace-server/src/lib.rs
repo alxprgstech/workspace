@@ -8,9 +8,12 @@ use axum::{Json, Router, extract::State, http::StatusCode, routing::get};
 #[cfg(feature = "web-ui")]
 mod web;
 
+pub mod artifacts;
 mod auth_http;
 pub mod auth_store;
 pub mod crypto;
+pub mod files;
+mod http_files;
 mod http_jobs;
 mod http_workspaces;
 pub mod jobs;
@@ -58,6 +61,9 @@ pub struct AppState {
     pub(crate) runtime: Arc<RuntimeMonitor>,
     pub(crate) workspaces: Arc<workspaces::Manager>,
     pub(crate) jobs: Arc<jobs::Executor>,
+    pub(crate) files: Option<Arc<files::Files>>,
+    pub(crate) artifacts: Option<Arc<artifacts::Artifacts>>,
+    pub(crate) max_import_bytes: u64,
 }
 
 impl AppState {
@@ -68,6 +74,8 @@ impl AppState {
             runtime: Arc::clone(&self.runtime),
             workspaces: Some(Arc::clone(&self.workspaces)),
             jobs: Some(Arc::clone(&self.jobs)),
+            files: self.files.clone(),
+            artifacts: self.artifacts.clone(),
         })
     }
 
@@ -151,14 +159,52 @@ impl AppState {
             storage.instance_id.clone(),
         );
 
+        let max_import_bytes = config.storage.max_import_mib * 1024 * 1024;
+
+        let files = files::Files::new(&runtime, Arc::clone(&manager), max_import_bytes)
+            .ok()
+            .map(Arc::new);
+
+        let artifacts = files.as_ref().map(|files| {
+            Arc::new(artifacts::Artifacts::new(
+                artifacts::ArtifactStore::new(config.storage.data_dir.clone()),
+                Arc::clone(files),
+                artifacts::ArtifactSettings {
+                    ttl_seconds: config.workspace.artifact_ttl_seconds,
+                    link_ttl_seconds: 900.min(config.workspace.artifact_ttl_seconds),
+                    public_base: public_base(config),
+                },
+            ))
+        });
+
         Self {
             storage,
             resources,
             runtime,
             workspaces: manager,
             jobs: Arc::new(executor),
+            files,
+            artifacts,
+            max_import_bytes,
         }
     }
+}
+
+/// Public origin used in artifact download links.
+fn public_base(config: &Config) -> String {
+    let candidate = config
+        .mcp
+        .as_ref()
+        .map(|mcp| mcp.resource.clone())
+        .or_else(|| config.sso.as_ref().map(|sso| sso.redirect_uri.clone()));
+
+    if let Some(url) = candidate
+        && let Ok(parsed) = openidconnect::reqwest::Url::parse(&url)
+    {
+        return parsed.origin().ascii_serialization();
+    }
+
+    format!("http://{}", config.server.listen)
 }
 
 async fn health() -> Json<HealthResponse> {
@@ -234,6 +280,13 @@ fn router_with_runtime(
     auth: Option<Arc<auth_http::AuthState>>,
 ) -> Router {
     let mcp_services = state.mcp_services();
+    let upload_limit = state.max_import_bytes as usize;
+
+    // Public download endpoint: authorisation is the opaque token itself.
+    let public: Router = Router::new()
+        .route("/artifacts/{token}", get(http_files::download))
+        .with_state(state.clone());
+
     let protected: Router = Router::new()
         .route("/ready", get(ready))
         .route("/api/v1/server/info", get(server_info))
@@ -267,6 +320,33 @@ fn router_with_runtime(
             "/api/v1/jobs/{id}/cancel",
             axum::routing::post(http_jobs::cancel),
         )
+        .route("/api/v1/workspaces/{id}/files", get(http_files::list))
+        .route(
+            "/api/v1/workspaces/{id}/file",
+            get(http_files::read).put(http_files::write),
+        )
+        .route(
+            "/api/v1/workspaces/{id}/patch",
+            axum::routing::post(http_files::patch),
+        )
+        .route(
+            "/api/v1/workspaces/{id}/uploads",
+            axum::routing::post(http_files::upload)
+                .layer(axum::extract::DefaultBodyLimit::max(upload_limit)),
+        )
+        .route(
+            "/api/v1/workspaces/{id}/artifacts",
+            axum::routing::post(http_files::publish),
+        )
+        .route("/api/v1/artifacts", get(http_files::artifacts_list))
+        .route(
+            "/api/v1/artifacts/{id}/link",
+            axum::routing::post(http_files::artifact_link),
+        )
+        .route(
+            "/api/v1/artifacts/{id}/revoke",
+            axum::routing::post(http_files::artifact_revoke),
+        )
         .with_state(state);
 
     let protected = match auth.as_ref() {
@@ -277,7 +357,10 @@ fn router_with_runtime(
         None => protected,
     };
 
-    let router = Router::new().route("/health", get(health)).merge(protected);
+    let router = Router::new()
+        .route("/health", get(health))
+        .merge(public)
+        .merge(protected);
 
     let router = match auth.as_ref() {
         Some(auth_state) => router.merge(auth_http::router(Arc::clone(auth_state))),

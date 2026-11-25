@@ -27,6 +27,8 @@ tokio.workspace = true
 serde.workspace = true
 tracing.workspace = true
 tower = "0.5"
+tokio-util = { version = "0.7", features = ["io"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 async-trait = "0.1"
 workspace-core.workspace = true
 workspace-runtime.workspace = true

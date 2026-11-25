@@ -18,6 +18,7 @@
 
 #![forbid(unsafe_code)]
 
+mod archive;
 mod ops;
 mod safe;
 

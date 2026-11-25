@@ -21,6 +21,8 @@ pub struct GatewayServices {
     pub schema_version: u32,
     pub runtime: Arc<workspace_runtime::status::RuntimeMonitor>,
     pub workspaces: Option<Arc<crate::workspaces::Manager>>,
+    pub files: Option<Arc<crate::files::Files>>,
+    pub artifacts: Option<Arc<crate::artifacts::Artifacts>>,
     pub jobs: Option<Arc<crate::jobs::Executor>>,
 }
 
@@ -36,6 +38,8 @@ impl GatewayServices {
             runtime,
             workspaces: None,
             jobs: None,
+            files: None,
+            artifacts: None,
         }
     }
 }

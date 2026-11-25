@@ -26,6 +26,7 @@ pub const ALLOWED_PROGRAMS: &[&str] = &[
     "/usr/bin/uname",
     "/usr/bin/sudo",
     "/usr/bin/timeout",
+    "/usr/bin/tee",
 ];
 
 /// Runner for fixed commands inside the dedicated runtime.
@@ -94,6 +95,25 @@ impl Host {
         }
 
         let mut command = self.build(helper_path, args);
+
+        command.stdin(Stdio::piped());
+
+        Ok(command)
+    }
+
+    /// Build a command whose stdin is a pipe, for bounded streaming uploads.
+    pub fn stream_stdin_command(
+        &self,
+        program: &str,
+        args: &[String],
+    ) -> Result<Command, RuntimeError> {
+        if !ALLOWED_PROGRAMS.contains(&program) {
+            return Err(RuntimeError::Protocol(format!(
+                "program {program} is not allowlisted"
+            )));
+        }
+
+        let mut command = self.build(program, args);
 
         command.stdin(Stdio::piped());
 

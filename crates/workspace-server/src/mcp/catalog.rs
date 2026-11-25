@@ -210,6 +210,104 @@ pub fn definitions() -> Vec<Definition> {
             true,
         ),
         tool(
+            "files_list",
+            "List files and directories of a workspace. File operations do not need a running container.",
+            object(
+                json!({
+                    "workspace_id": workspace_id.clone(),
+                    "path": {"type": "string", "description": "Workspace-relative directory."},
+                    "depth": {"type": "integer", "minimum": 0, "maximum": 8},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 5000}
+                }),
+                &["workspace_id"],
+            ),
+            "files:read",
+            true,
+        ),
+        tool(
+            "file_read",
+            "Read a workspace file. Text is returned as UTF-8, binary content as base64.",
+            object(
+                json!({
+                    "workspace_id": workspace_id.clone(),
+                    "path": {"type": "string"},
+                    "offset": {"type": "integer", "minimum": 0},
+                    "length": {"type": "integer", "minimum": 1, "maximum": 1048576}
+                }),
+                &["workspace_id", "path"],
+            ),
+            "files:read",
+            true,
+        ),
+        tool(
+            "file_write",
+            "Create or replace a workspace file atomically.",
+            object(
+                json!({
+                    "workspace_id": workspace_id.clone(),
+                    "path": {"type": "string"},
+                    "content": {"type": "string", "description": "UTF-8 text content."},
+                    "expected_sha256": {"type": "string", "description": "Fail unless the current file matches this digest."},
+                    "create": {"type": "boolean", "description": "Create only; fail if the file exists."}
+                }),
+                &["workspace_id", "path", "content"],
+            ),
+            "files:write",
+            false,
+        ),
+        tool(
+            "file_patch",
+            "Apply a unified diff to a workspace text file. Fails instead of guessing when the file changed.",
+            object(
+                json!({
+                    "workspace_id": workspace_id,
+                    "path": {"type": "string"},
+                    "patch": {"type": "string", "description": "Unified diff (git diff output)."},
+                    "expected_sha256": {"type": "string"}
+                }),
+                &["workspace_id", "path", "patch"],
+            ),
+            "files:write",
+            false,
+        ),
+        tool(
+            "artifact_publish",
+            "Publish a workspace file as an immutable artifact with its own lifetime.",
+            object(
+                json!({
+                    "workspace_id": workspace_id.clone(),
+                    "path": {"type": "string"},
+                    "name": {"type": "string", "description": "Optional download file name."}
+                }),
+                &["workspace_id", "path"],
+            ),
+            "artifacts:publish",
+            false,
+        ),
+        tool(
+            "artifact_list",
+            "List artifacts published by the calling connection.",
+            no_arguments(),
+            "artifacts:read",
+            true,
+        ),
+        tool(
+            "artifact_download",
+            "Create a temporary download link for a published artifact.",
+            object(
+                json!({
+                    "artifact_id": {
+                        "type": "string",
+                        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+                    },
+                    "ttl_seconds": {"type": "integer", "minimum": 60}
+                }),
+                &["artifact_id"],
+            ),
+            "artifacts:read",
+            true,
+        ),
+        tool(
             "job_cancel",
             "Cancel a queued or running job.",
             object(json!({"job_id": job_id}), &["job_id"]),

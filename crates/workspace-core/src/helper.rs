@@ -30,6 +30,12 @@ pub const MAX_PATH_BYTES: usize = 4096;
 /// Largest directory listing the helper returns in one response.
 pub const MAX_LIST_ENTRIES: u32 = 10_000;
 
+/// Largest archive the helper accepts for extraction.
+pub const MAX_ARCHIVE_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Largest total uncompressed size an extraction may produce.
+pub const MAX_EXTRACTED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
 /// One request. `body_len` bytes of raw body follow the header, if any.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Request {
@@ -96,6 +102,18 @@ pub enum Operation {
     },
     /// SHA-256 of a regular file.
     Sha256 { root: String, path: String },
+    /// Extract a trusted-format archive into a directory of `root`.
+    ///
+    /// Entries with absolute paths, `..`, links or special files are rejected;
+    /// the total uncompressed size and entry count are bounded.
+    Extract {
+        root: String,
+        path: String,
+        archive_root: String,
+        archive_path: String,
+        max_entries: u32,
+        max_bytes: u64,
+    },
     /// Recursive size and file count of a subtree.
     Usage {
         root: String,
@@ -116,6 +134,8 @@ pub mod code {
     pub const TOO_LARGE: &str = "too_large";
     pub const VERSION_MISMATCH: &str = "conflict";
     pub const UNSUPPORTED: &str = "unsupported";
+    pub const ARCHIVE: &str = "archive_invalid";
+    pub const LIMIT: &str = "limit_exceeded";
     pub const PERMISSION: &str = "permission_denied";
     pub const IO: &str = "io_error";
     pub const INTERNAL: &str = "internal";
@@ -303,6 +323,7 @@ impl Operation {
             Self::Remove { .. } => "remove",
             Self::Copy { .. } => "copy",
             Self::Sha256 { .. } => "sha256",
+            Self::Extract { .. } => "extract",
             Self::Usage { .. } => "usage",
         }
     }

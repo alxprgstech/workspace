@@ -160,26 +160,55 @@ pub fn execute(
         } => {
             let source = SafeRoot::open(prefixes, source_root)?;
 
-            if source_root == target_root {
-                return Ok(Outcome::json(source.copy(
-                    source_path,
-                    target_path,
-                    *replace,
-                    expected_sha256.as_deref(),
-                )?));
-            }
+            let target = SafeRoot::open(prefixes, target_root)?;
 
-            // Cross-root copies are not needed by the server and would widen
-            // the helper's authority; refuse instead of implementing them.
-            Err(HelperError::new(
-                helper::code::UNSUPPORTED,
-                "cross-root copies are not supported",
-            ))
+            Ok(Outcome::json(crate::safe::copy_between(
+                &source,
+                source_path,
+                &target,
+                target_path,
+                *replace,
+                expected_sha256.as_deref(),
+            )?))
         }
 
         Operation::Sha256 { root, path } => {
             let root = SafeRoot::open(prefixes, root)?;
             Ok(Outcome::json(root.sha256(path)?))
+        }
+
+        Operation::Extract {
+            root,
+            path,
+            archive_root,
+            archive_path,
+            max_entries,
+            max_bytes,
+        } => {
+            let root = SafeRoot::open(prefixes, root)?;
+            let archive_root = SafeRoot::open(prefixes, archive_root)?;
+
+            let (mut archive, metadata) = archive_root.open_regular(archive_path)?;
+
+            if metadata.len() > helper::MAX_ARCHIVE_BYTES {
+                return Err(HelperError::new(
+                    helper::code::TOO_LARGE,
+                    "the archive is larger than the protocol limit",
+                ));
+            }
+
+            let extracted = crate::archive::extract(
+                &root,
+                path,
+                &mut archive,
+                *max_entries,
+                (*max_bytes).min(helper::MAX_EXTRACTED_BYTES),
+            )?;
+
+            Ok(Outcome::json(serde_json::json!({
+                "entries": extracted.entries,
+                "bytes": extracted.bytes,
+            })))
         }
 
         Operation::Usage {
@@ -308,14 +337,16 @@ mod tests {
     }
 
     #[test]
-    fn cross_root_copy_is_refused() {
+    fn cross_root_copy_moves_bytes_between_capabilities() {
         let first = tempfile::tempdir().unwrap();
         let second = tempfile::tempdir().unwrap();
 
         let mut all = prefixes(first.path());
         all.extend(prefixes(second.path()));
 
-        let error = execute(
+        std::fs::write(first.path().join("a"), b"payload").unwrap();
+
+        let outcome = execute(
             &all,
             &request(Operation::Copy {
                 source_root: first.path().to_string_lossy().to_string(),
@@ -327,8 +358,9 @@ mod tests {
             }),
             &[],
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert_eq!(error.code, helper::code::UNSUPPORTED);
+        assert_eq!(outcome.value["size"], 7);
+        assert_eq!(std::fs::read(second.path().join("b")).unwrap(), b"payload");
     }
 }
