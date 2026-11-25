@@ -10,7 +10,7 @@ use axum::{
     http::{HeaderMap, HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::post,
+    routing::any,
 };
 use openidconnect::reqwest;
 use rmcp::{
@@ -289,6 +289,8 @@ fn host_of(resource: &str) -> Option<String> {
 
 pub type GatewayService = StreamableHttpService<GatewayServer, LocalSessionManager>;
 
+const MCP_PATH: &str = "/chatgpt/mcp";
+
 pub fn service(config: &McpConfig, schema_version: u32) -> Result<GatewayService, TokenError> {
     let mut allowed_hosts = vec!["localhost".to_owned(), "127.0.0.1".to_owned()];
 
@@ -369,9 +371,11 @@ fn build_router(
     };
 
     Ok(Router::new()
+        // Streamable HTTP uses POST for messages, GET for the server stream
+        // and DELETE for session termination; the transport decides.
         .route(
-            "/chatgpt/mcp",
-            post(move |request: Request| handle(service.clone(), request)),
+            MCP_PATH,
+            any(move |request: Request| handle(service.clone(), request)),
         )
         .layer(middleware::from_fn(gate)))
 }
