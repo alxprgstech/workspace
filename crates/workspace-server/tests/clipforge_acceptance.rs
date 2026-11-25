@@ -513,7 +513,7 @@ async fn clipforge_development_inside_a_workspace() {
         &fixture,
         &workspace.id,
         vec![
-            "/workspace/target/release/clipforge".to_owned(),
+            "/workspace/target/release/clipforge-cli".to_owned(),
             "--version".to_owned(),
         ],
         Vec::new(),
@@ -530,8 +530,8 @@ async fn clipforge_development_inside_a_workspace() {
         .publish(
             &fixture.owner,
             &workspace.id,
-            "target/release/clipforge",
-            Some("clipforge"),
+            "target/release/clipforge-cli",
+            Some("clipforge-cli"),
         )
         .await
         .expect("publish");
