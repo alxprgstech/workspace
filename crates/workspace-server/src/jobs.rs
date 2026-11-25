@@ -457,6 +457,11 @@ pub trait JobRuntime: Send + Sync {
         spec: JobSpec,
     ) -> Result<ExecutionResult, String>;
 
+    /// Whether an administrator configured allowlist egress.
+    fn allowlist_configured(&self) -> bool {
+        false
+    }
+
     /// Remove a leftover job container.
     async fn cleanup(&self, workspace: &workspace_core::workspace::Workspace, container: &str);
 }
@@ -559,10 +564,12 @@ impl Executor {
             return Err(JobError::Invalid("workspace is not ready yet"));
         }
 
-        if workspace.network_mode != "none" {
-            return Err(JobError::Invalid(
-                "allowlist networking is not available in this build",
-            ));
+        if !matches!(workspace.network_mode.as_str(), "none" | "allowlist") {
+            return Err(JobError::Invalid("unsupported workspace network mode"));
+        }
+
+        if workspace.network_mode == "allowlist" && !self.runtime.allowlist_configured() {
+            return Err(JobError::Invalid("allowlist networking is not configured"));
         }
 
         if self.store.active_for_workspace(workspace_id)? {
@@ -876,6 +883,10 @@ impl DockerJobRuntime {
 
 #[async_trait]
 impl JobRuntime for DockerJobRuntime {
+    fn allowlist_configured(&self) -> bool {
+        !self.allowlist.is_empty()
+    }
+
     async fn execute(
         &self,
         workspace: &workspace_core::workspace::Workspace,

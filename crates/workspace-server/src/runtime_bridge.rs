@@ -39,8 +39,17 @@ impl DockerWorkspaceRuntime {
             WorkspaceError::RuntimeUnavailable("runtime is not configured".into())
         })?;
 
-        let egress_binary =
-            egress_binary.unwrap_or_else(|| format!("{}/bin/workspace-egress", settings.data_root));
+        let egress_binary = egress_binary.unwrap_or_else(|| {
+            // The helper and the egress proxy live in the same runtime
+            // directory; build the Linux path with forward slashes because
+            // this code runs on a Windows host.
+            let directory = std::path::Path::new(&settings.helper_path)
+                .parent()
+                .map(|path| path.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_else(|| format!("{}/bin", settings.data_root));
+
+            format!("{directory}/workspace-egress")
+        });
 
         Ok(Self {
             monitor,

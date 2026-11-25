@@ -105,8 +105,13 @@ async fn fixture() -> Fixture {
     assert!(report.passed, "runtime acceptance must pass");
 
     let manager_runtime: Arc<dyn WorkspaceRuntime> = Arc::new(
-        DockerWorkspaceRuntime::new(Arc::clone(&runtime), "clipforge-instance-01".to_owned(), Vec::new(), None)
-            .unwrap(),
+        DockerWorkspaceRuntime::new(
+            Arc::clone(&runtime),
+            "clipforge-instance-01".to_owned(),
+            Vec::new(),
+            None,
+        )
+        .unwrap(),
     );
 
     let images = Arc::new(ImageBuilder::new(&runtime, directory.path().to_path_buf()).unwrap());
@@ -138,7 +143,10 @@ async fn fixture() -> Fixture {
     let executor = Arc::new(Executor::new(
         JobStore::new(directory.path()),
         Arc::clone(&manager),
-        Arc::new(DockerJobRuntime::new(&runtime, "clipforge-instance-01".to_owned(), Vec::new()).unwrap()),
+        Arc::new(
+            DockerJobRuntime::new(&runtime, "clipforge-instance-01".to_owned(), Vec::new())
+                .unwrap(),
+        ),
         Arc::clone(&runtime),
         ExecSettings {
             max_concurrent_jobs: 1,

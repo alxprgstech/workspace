@@ -97,7 +97,13 @@ async fn workspace_lifecycle_and_job_execution() {
     };
 
     let workspace_runtime: Arc<dyn WorkspaceRuntime> = Arc::new(
-        DockerWorkspaceRuntime::new(Arc::clone(&runtime), "e2e-instance-0001".to_owned(), Vec::new(), None).unwrap(),
+        DockerWorkspaceRuntime::new(
+            Arc::clone(&runtime),
+            "e2e-instance-0001".to_owned(),
+            Vec::new(),
+            None,
+        )
+        .unwrap(),
     );
 
     let manager = Arc::new(Manager::new(
@@ -126,7 +132,8 @@ async fn workspace_lifecycle_and_job_execution() {
 
     assert_eq!(workspace.execution_mode, ExecutionMode::Ephemeral);
 
-    let job_runtime = DockerJobRuntime::new(&runtime, "e2e-instance-0001".to_owned(), Vec::new()).unwrap();
+    let job_runtime =
+        DockerJobRuntime::new(&runtime, "e2e-instance-0001".to_owned(), Vec::new()).unwrap();
 
     let executor = Executor::new(
         JobStore::new(directory.path()),
