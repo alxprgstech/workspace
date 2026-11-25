@@ -76,7 +76,8 @@ async fn builds_and_caches_a_package_image() {
         memory_mib: 256,
         pids: 64,
         tmpfs_mib: 16,
-        network: false,
+        network: workspace_runtime::docker::Network::None,
+        extra_mounts: Vec::new(),
     };
 
     // The workspace directory must exist inside the Linux filesystem; this
@@ -150,7 +151,8 @@ async fn builds_the_rust_toolchain_image() {
         memory_mib: 1024,
         pids: 128,
         tmpfs_mib: 64,
-        network: false,
+        network: workspace_runtime::docker::Network::None,
+        extra_mounts: Vec::new(),
     };
 
     let run = docker
