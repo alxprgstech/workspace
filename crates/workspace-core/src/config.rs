@@ -19,6 +19,149 @@ pub struct Config {
     pub sso: Option<SsoConfig>,
     #[serde(default)]
     pub mcp: Option<McpConfig>,
+    #[serde(default)]
+    pub runtime: Option<RuntimeConfig>,
+}
+
+/// Container runtime backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeBackendKind {
+    /// Dedicated WSL2 distribution hosting its own rootless Docker Engine.
+    Wsl2,
+    /// Dedicated rootless Docker Engine on the local Linux host.
+    RootlessDocker,
+}
+
+/// Explicit description of the dedicated execution runtime.
+///
+/// The section is optional so the control plane can run without execution, but
+/// execution stays disabled unless every field below names the dedicated
+/// runtime explicitly. There are deliberately no defaults that could connect
+/// to Docker Desktop or another engine.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeConfig {
+    pub backend: RuntimeBackendKind,
+
+    /// WSL2 distribution name (`wsl2` backend only).
+    #[serde(default)]
+    pub distro: Option<String>,
+
+    /// Linux user inside the distribution (`wsl2` backend only).
+    #[serde(default)]
+    pub user: Option<String>,
+
+    /// Absolute path of the Docker client inside the dedicated environment.
+    pub docker_path: String,
+
+    /// Engine name that must be reported by `docker info`.
+    ///
+    /// This is what keeps the server from silently using Docker Desktop or any
+    /// other engine that happens to be reachable: a different name fails the
+    /// dedicated-runtime check.
+    pub engine_name: String,
+
+    /// Dedicated engine socket. Only `unix://` endpoints are accepted, so no
+    /// TCP Docker API can ever be used.
+    pub socket: String,
+
+    /// Root of the dedicated Linux data filesystem.
+    pub data_root: String,
+
+    /// Trusted helper binary inside the dedicated environment.
+    pub helper_path: String,
+
+    /// How long a cold WSL2/distribution start may take.
+    pub startup_timeout_seconds: u64,
+
+    /// Upper bound for a single control command.
+    pub command_timeout_seconds: u64,
+
+    /// Per-workspace hard storage quota.
+    pub workspace_storage_mib: u64,
+
+    /// Per-workspace hard file (inode) quota.
+    pub workspace_files: u64,
+
+    /// Minimum free space that must remain on the dedicated filesystem.
+    pub minimum_free_mib: u64,
+
+    /// Immutable base image reference (`name@sha256:...`).
+    pub base_image: String,
+}
+
+impl RuntimeConfig {
+    /// Check the parts that do not require touching the host.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if !self.docker_path.starts_with('/') {
+            return Err("runtime.docker_path must be an absolute Linux path");
+        }
+
+        if self.engine_name.is_empty()
+            || self.engine_name.len() > 64
+            || !self
+                .engine_name
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '-')
+        {
+            return Err("runtime.engine_name must be a simple engine name");
+        }
+
+        if !self.socket.starts_with("unix:///") {
+            return Err("runtime.socket must be a unix:// endpoint");
+        }
+
+        if !self.data_root.starts_with('/') || self.data_root.contains("..") {
+            return Err("runtime.data_root must be an absolute, closed Linux path");
+        }
+
+        if !self.helper_path.starts_with('/') || self.helper_path.contains("..") {
+            return Err("runtime.helper_path must be an absolute, closed Linux path");
+        }
+
+        if !self.helper_path.starts_with(&self.data_root)
+            && !self.helper_path.starts_with("/usr/local/")
+            && !self.helper_path.starts_with("/srv/")
+        {
+            return Err("runtime.helper_path must be a trusted installation path");
+        }
+
+        match self.backend {
+            RuntimeBackendKind::Wsl2 => {
+                if self.distro.as_deref().unwrap_or_default().is_empty() {
+                    return Err("runtime.distro is required for the wsl2 backend");
+                }
+
+                if self.user.as_deref().unwrap_or_default().is_empty() {
+                    return Err("runtime.user is required for the wsl2 backend");
+                }
+            }
+            RuntimeBackendKind::RootlessDocker => {
+                if self.distro.is_some() || self.user.is_some() {
+                    return Err("runtime.distro/user are only valid for the wsl2 backend");
+                }
+            }
+        }
+
+        if [
+            self.startup_timeout_seconds,
+            self.command_timeout_seconds,
+            self.workspace_storage_mib,
+            self.workspace_files,
+            self.minimum_free_mib,
+        ]
+        .contains(&0)
+        {
+            return Err("runtime timeouts and quotas must be positive");
+        }
+
+        if !self.base_image.contains("@sha256:") {
+            return Err("runtime.base_image must be pinned by digest");
+        }
+
+        Ok(())
+    }
 }
 
 /// MCP gateway settings.
@@ -240,6 +383,38 @@ impl Config {
             return Err(ConfigError::Validation(
                 "allowlist entries must not be empty",
             ));
+        }
+
+        if let Some(runtime) = self.runtime.as_ref() {
+            runtime.validate().map_err(ConfigError::Validation)?;
+
+            if runtime.workspace_storage_mib > self.resources.storage_mib {
+                return Err(ConfigError::Validation(
+                    "runtime.workspace_storage_mib exceeds the storage budget",
+                ));
+            }
+
+            let budget = runtime
+                .workspace_storage_mib
+                .saturating_mul(u64::from(self.resources.max_active_workspaces));
+
+            if budget > self.resources.storage_mib {
+                return Err(ConfigError::Validation(
+                    "per-workspace quotas exceed the global storage budget",
+                ));
+            }
+
+            if runtime.backend == RuntimeBackendKind::Wsl2 && !cfg!(windows) {
+                return Err(ConfigError::Validation(
+                    "the wsl2 backend is only available on Windows",
+                ));
+            }
+
+            if runtime.backend == RuntimeBackendKind::RootlessDocker && cfg!(windows) {
+                return Err(ConfigError::Validation(
+                    "the rootless_docker backend requires a Linux host",
+                ));
+            }
         }
 
         Ok(())

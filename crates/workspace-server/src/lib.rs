@@ -20,10 +20,14 @@ pub mod storage;
 pub mod users;
 
 use serde::Serialize;
-use std::{io, sync::Arc};
+use serde_json::{Value, json};
+use std::{io, sync::Arc, time::Duration};
 use tokio::net::TcpListener;
 use workspace_core::{PRODUCT_NAME, VERSION, config::Config};
-use workspace_runtime::{RuntimeProbe, SystemProbe};
+use workspace_runtime::status::RuntimeMonitor;
+
+/// How often the supervisor re-proves isolation while the server runs.
+const ACCEPTANCE_REFRESH: Duration = Duration::from_secs(300);
 
 #[derive(Serialize)]
 struct HealthResponse {
@@ -34,95 +38,123 @@ struct HealthResponse {
 struct ReadinessResponse {
     status: &'static str,
     runtime_ready: bool,
-    reason: &'static str,
+    infrastructure_ready: bool,
+    execution_ready: bool,
+    reason: String,
+    blocking: Vec<String>,
+    checks: Vec<workspace_runtime::StatusCheck>,
 }
 
-#[derive(Clone, Serialize)]
-struct ResourceBudget {
-    cpu_millis: u32,
-    memory_mib: u64,
-    storage_mib: u64,
-    max_active_workspaces: u32,
-    max_concurrent_jobs: u32,
-}
-
-#[derive(Clone, Serialize)]
-struct ServerInfo {
-    product: &'static str,
-    version: &'static str,
-    api_version: &'static str,
-    platform: &'static str,
-    architecture: &'static str,
-    runtime_ready: bool,
-    resources: ResourceBudget,
+/// State shared by the HTTP API and, indirectly, by the MCP gateway.
+#[derive(Clone)]
+pub struct AppState {
     storage: storage::StorageInfo,
+    resources: Value,
+    runtime: Arc<RuntimeMonitor>,
+}
+
+impl AppState {
+    fn new(config: &Config, storage: storage::StorageInfo, runtime: Arc<RuntimeMonitor>) -> Self {
+        let resources = json!({
+            "cpu_millis": config.resources.cpu_millis,
+            "memory_mib": config.resources.memory_mib,
+            "storage_mib": config.resources.storage_mib,
+            "max_active_workspaces": config.resources.max_active_workspaces,
+            "max_concurrent_jobs": config.resources.max_concurrent_jobs,
+            "max_processes_per_workspace": config.resources.max_processes_per_workspace,
+            "max_job_seconds": config.resources.max_job_seconds,
+        });
+
+        Self {
+            storage,
+            resources,
+            runtime,
+        }
+    }
 }
 
 async fn health() -> Json<HealthResponse> {
     Json(HealthResponse { status: "ok" })
 }
 
-async fn ready() -> (StatusCode, Json<ReadinessResponse>) {
-    // Readiness is a policy decision, not a guess: a host whose container
-    // engine has not been queried directly is never reported as ready.
-    let facts = SystemProbe.facts();
+async fn ready(State(state): State<AppState>) -> (StatusCode, Json<ReadinessResponse>) {
+    // Readiness is a policy decision, not a guess: it is true only when the
+    // dedicated runtime has passed its practical isolation acceptance.
+    let runtime = state.runtime.status().await;
 
-    match workspace_runtime::evaluate(&facts) {
-        Ok(_) => (
-            StatusCode::OK,
-            Json(ReadinessResponse {
-                status: "ready",
-                runtime_ready: true,
-                reason: "",
-            }),
-        ),
-        Err(issue) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ReadinessResponse {
-                status: "not_ready",
-                runtime_ready: false,
-                reason: issue.reason(),
-            }),
-        ),
-    }
+    let body = ReadinessResponse {
+        status: if runtime.execution_ready {
+            "ready"
+        } else {
+            "not_ready"
+        },
+        runtime_ready: runtime.execution_ready,
+        infrastructure_ready: runtime.infrastructure_ready,
+        execution_ready: runtime.execution_ready,
+        reason: runtime.blocking.first().cloned().unwrap_or_default(),
+        blocking: runtime.blocking.clone(),
+        checks: runtime.checks.clone(),
+    };
+
+    let status = if runtime.execution_ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+
+    (status, Json(body))
 }
 
-async fn server_info(State(info): State<ServerInfo>) -> Json<ServerInfo> {
-    Json(info)
+async fn server_info(State(state): State<AppState>) -> Json<Value> {
+    let runtime = state.runtime.status().await;
+
+    Json(json!({
+        "product": PRODUCT_NAME,
+        "version": VERSION,
+        "api_version": "v1",
+        "instance_id": state.storage.instance_id.clone(),
+        "platform": std::env::consts::OS,
+        "architecture": std::env::consts::ARCH,
+        "schema_version": state.storage.schema_version,
+        "runtime_ready": runtime.execution_ready,
+        "storage": state.storage.clone(),
+        "resources": state.resources.clone(),
+        "runtime": runtime,
+    }))
 }
 
+#[cfg(test)]
 fn router(
     config: &Config,
     storage: storage::StorageInfo,
     auth: Option<Arc<auth_http::AuthState>>,
 ) -> Router {
-    let schema_version = storage.schema_version;
+    let monitor = Arc::new(RuntimeMonitor::new(
+        config.runtime.as_ref(),
+        &storage.instance_id,
+    ));
 
-    let info = ServerInfo {
-        product: PRODUCT_NAME,
-        version: VERSION,
-        api_version: "v1",
-        platform: std::env::consts::OS,
-        architecture: std::env::consts::ARCH,
-        runtime_ready: false,
-        storage,
-        resources: ResourceBudget {
-            cpu_millis: config.resources.cpu_millis,
-            memory_mib: config.resources.memory_mib,
-            storage_mib: config.resources.storage_mib,
-            max_active_workspaces: config.resources.max_active_workspaces,
-            max_concurrent_jobs: config.resources.max_concurrent_jobs,
-        },
-    };
+    router_with_runtime(config, storage, auth, monitor)
+}
+
+/// Router bound to a monitor shared with the background supervisor.
+fn router_with_runtime(
+    config: &Config,
+    storage: storage::StorageInfo,
+    auth: Option<Arc<auth_http::AuthState>>,
+    runtime: Arc<RuntimeMonitor>,
+) -> Router {
+    let schema_version = storage.schema_version;
+    let state = AppState::new(config, storage, Arc::clone(&runtime));
 
     let protected: Router = Router::new()
         .route("/ready", get(ready))
         .route("/api/v1/server/info", get(server_info))
-        .with_state(info);
+        .with_state(state);
 
     let protected = match auth.as_ref() {
-        Some(state) => protected.route_layer(axum::middleware::from_fn_with_state(
-            Arc::clone(state),
+        Some(auth_state) => protected.route_layer(axum::middleware::from_fn_with_state(
+            Arc::clone(auth_state),
             auth_http::require_session,
         )),
         None => protected,
@@ -131,7 +163,7 @@ fn router(
     let router = Router::new().route("/health", get(health)).merge(protected);
 
     let router = match auth.as_ref() {
-        Some(state) => router.merge(auth_http::router(Arc::clone(state))),
+        Some(auth_state) => router.merge(auth_http::router(Arc::clone(auth_state))),
         None => router,
     };
 
@@ -139,30 +171,33 @@ fn router(
     // an unconfigured gateway must fail closed rather than answer with an
     // unverified resource.
     let router = match config.mcp.clone() {
-        Some(mcp) => {
-            match (config.sso.as_ref(), auth.as_ref()) {
-                (Some(sso), Some(auth)) => {
-                    match oauth_store::OAuthStore::new(&config.storage.data_dir, sso) {
-                        Ok(store) if valid_local_mcp(config) => {
-                            let store = Arc::new(store);
+        Some(mcp) => match (config.sso.as_ref(), auth.as_ref()) {
+            (Some(sso), Some(auth_state)) => {
+                match oauth_store::OAuthStore::new(&config.storage.data_dir, sso) {
+                    Ok(store) if valid_local_mcp(config) => {
+                        let store = Arc::new(store);
 
-                            router
-                                .merge(auth_http::oauth_router(
-                                    Arc::clone(auth),
-                                    Arc::clone(&store),
-                                ))
-                                .merge(mcp::local_router(mcp, schema_version, store))
-                        }
-                        _ => {
-                            tracing::error!("Invalid local MCP configuration");
-                            router
-                        }
+                        router
+                            .merge(auth_http::oauth_router(
+                                Arc::clone(auth_state),
+                                Arc::clone(&store),
+                            ))
+                            .merge(mcp::local_router(
+                                mcp,
+                                schema_version,
+                                Arc::clone(&runtime),
+                                store,
+                            ))
+                    }
+                    _ => {
+                        tracing::error!("Invalid local MCP configuration");
+                        router
                     }
                 }
-                // Preserve the existing isolated external-token tests.
-                _ => router.merge(mcp::router(mcp, schema_version)),
             }
-        }
+            // Preserve the existing isolated external-token tests.
+            _ => router.merge(mcp::router(mcp, schema_version, runtime)),
+        },
         None => router,
     };
 
@@ -222,6 +257,62 @@ fn valid_local_mcp(config: &Config) -> bool {
         && mcp.resource == resource
         && mcp.audience == resource
         && mcp.required_scopes == [oauth_store::SCOPE]
+}
+
+/// Keep the practical isolation acceptance fresh while the server runs.
+///
+/// A stopped WSL2 distribution is woken by the same probe: the first pass
+/// tolerates the cold start through the bounded engine retry, and later passes
+/// only re-verify. Nothing here starts user workloads.
+fn spawn_runtime_supervisor(runtime: Arc<RuntimeMonitor>) {
+    tokio::spawn(async move {
+        if !runtime.configured() {
+            tracing::warn!(
+                reason = runtime.configuration_error().unwrap_or("not configured"),
+                "Execution runtime is not configured; workloads stay disabled"
+            );
+
+            return;
+        }
+
+        let mut first = true;
+
+        loop {
+            let status = runtime.refresh().await;
+
+            if status.infrastructure_ready {
+                match runtime.run_acceptance().await {
+                    Ok(report) if report.passed => {
+                        tracing::info!(
+                            duration_ms = report.duration_ms,
+                            "Runtime isolation acceptance passed"
+                        );
+                    }
+                    Ok(report) => {
+                        tracing::error!(
+                            blocking = ?report.checks.iter()
+                                .filter(|check| check.required && !check.ok)
+                                .map(|check| format!("{}: {}", check.id, check.detail))
+                                .collect::<Vec<_>>(),
+                            "Runtime isolation acceptance failed"
+                        );
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "Runtime isolation acceptance could not run");
+                    }
+                }
+            } else if first {
+                tracing::warn!(
+                    blocking = ?status.blocking,
+                    "Execution runtime is not ready; workloads stay disabled"
+                );
+            }
+
+            first = false;
+
+            tokio::time::sleep(ACCEPTANCE_REFRESH).await;
+        }
+    });
 }
 
 pub async fn serve(config: Config) -> io::Result<()> {
@@ -305,11 +396,24 @@ pub async fn serve(config: Config) -> io::Result<()> {
         "Workspace HTTP server started"
     );
 
-    tracing::warn!("Execution runtime is not ready");
+    let runtime = Arc::new(RuntimeMonitor::new(
+        config.runtime.as_ref(),
+        &storage.instance_id,
+    ));
+
+    spawn_runtime_supervisor(Arc::clone(&runtime));
+
+    tracing::info!(
+        backend = runtime
+            .settings()
+            .map(|settings| settings.backend.name())
+            .unwrap_or("none"),
+        "Execution runtime supervisor started"
+    );
 
     axum::serve(
         listener,
-        router(&config, storage, auth)
+        router_with_runtime(&config, storage, auth, Arc::clone(&runtime))
             .into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
     .with_graceful_shutdown(shutdown)

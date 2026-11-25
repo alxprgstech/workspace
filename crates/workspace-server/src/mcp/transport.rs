@@ -212,6 +212,7 @@ pub struct GatewayServer {
     info: ServerConfig,
     tools: Vec<Tool>,
     schema_version: u32,
+    runtime: Arc<crate::mcp::SharedRuntime>,
 }
 
 impl ServerHandler for GatewayServer {
@@ -232,9 +233,11 @@ impl ServerHandler for GatewayServer {
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
+        let runtime = self.runtime.status().await;
+
         let payload = match request.name.as_ref() {
-            "server_info" => server_information(self.schema_version),
-            "capabilities_list" => capabilities_catalog(self.schema_version),
+            "server_info" => server_information(self.schema_version, &runtime),
+            "capabilities_list" => capabilities_catalog(self.schema_version, &runtime),
             other => {
                 return Err(McpError::invalid_params(
                     format!("unknown tool: {other}"),
@@ -312,13 +315,18 @@ pub type GatewayService = StreamableHttpService<GatewayServer, LocalSessionManag
 
 const MCP_PATH: &str = "/chatgpt/mcp";
 
-pub fn service(config: &McpConfig, schema_version: u32) -> Result<GatewayService, TokenError> {
-    service_with_mode(config, schema_version, true)
+pub fn service(
+    config: &McpConfig,
+    schema_version: u32,
+    runtime: Arc<crate::mcp::SharedRuntime>,
+) -> Result<GatewayService, TokenError> {
+    service_with_mode(config, schema_version, runtime, true)
 }
 
 fn service_with_mode(
     config: &McpConfig,
     schema_version: u32,
+    runtime: Arc<crate::mcp::SharedRuntime>,
     stateful: bool,
 ) -> Result<GatewayService, TokenError> {
     let mut allowed_hosts = vec!["localhost".to_owned(), "127.0.0.1".to_owned()];
@@ -337,6 +345,7 @@ fn service_with_mode(
             )),
         tools: tool_definitions(),
         schema_version,
+        runtime,
     };
 
     let mut http = StreamableHttpServerConfig::default();
@@ -352,8 +361,12 @@ fn service_with_mode(
 }
 
 /// Router fragment for the MCP endpoint, mounted behind a bearer-token gate.
-pub fn router(config: &McpConfig, schema_version: u32) -> Result<Router, TokenError> {
-    build_router(config, schema_version, None)
+pub fn router(
+    config: &McpConfig,
+    schema_version: u32,
+    runtime: Arc<crate::mcp::SharedRuntime>,
+) -> Result<Router, TokenError> {
+    build_router(config, schema_version, runtime, None)
 }
 
 /// Same router with pre-seeded signing keys, for hermetic end-to-end tests.
@@ -361,14 +374,16 @@ pub fn router(config: &McpConfig, schema_version: u32) -> Result<Router, TokenEr
 pub fn router_with_keys(
     config: &McpConfig,
     schema_version: u32,
+    runtime: Arc<crate::mcp::SharedRuntime>,
     keys: Vec<Jwk>,
 ) -> Result<Router, TokenError> {
-    build_router(config, schema_version, Some(keys))
+    build_router(config, schema_version, runtime, Some(keys))
 }
 
 fn build_router(
     config: &McpConfig,
     schema_version: u32,
+    runtime: Arc<crate::mcp::SharedRuntime>,
     keys: Option<Vec<Jwk>>,
 ) -> Result<Router, TokenError> {
     let expectations = McpExpectations {
@@ -391,7 +406,7 @@ fn build_router(
 
     let auth = Arc::new(GatewayAuth { keys, expectations });
 
-    let service = service(config, schema_version)?;
+    let service = service(config, schema_version, Arc::clone(&runtime))?;
 
     let auth = Arc::clone(&auth);
 
@@ -425,9 +440,10 @@ async fn handle(service: GatewayService, request: Request) -> Response {
 pub fn local_router(
     config: &McpConfig,
     schema_version: u32,
+    runtime: Arc<crate::mcp::SharedRuntime>,
     store: Arc<crate::oauth_store::OAuthStore>,
 ) -> Result<Router, TokenError> {
-    let service = service_with_mode(config, schema_version, false)?;
+    let service = service_with_mode(config, schema_version, runtime, false)?;
 
     let metadata_url = format!(
         "{}/.well-known/oauth-protected-resource/chatgpt/mcp",
@@ -621,6 +637,13 @@ mod tests {
         )
     }
 
+    fn test_runtime() -> Arc<crate::mcp::SharedRuntime> {
+        Arc::new(crate::mcp::SharedRuntime::new(
+            None,
+            "550e8400-e29b-41d4-a716-446655440000",
+        ))
+    }
+
     fn mcp_config() -> McpConfig {
         McpConfig {
             issuer: "https://auth.alxprgs.tech".to_owned(),
@@ -636,7 +659,7 @@ mod tests {
         let config = mcp_config();
         let token = signer.token(&config);
 
-        let router = super::router_with_keys(&config, 3, keys).unwrap();
+        let router = super::router_with_keys(&config, 3, test_runtime(), keys).unwrap();
 
         let initialize = serde_json::json!({
             "jsonrpc": "2.0",
@@ -756,6 +779,7 @@ mod tests {
                 required_scopes: vec!["workspace.read".to_owned()],
             },
             3,
+            test_runtime(),
         )
         .unwrap();
 

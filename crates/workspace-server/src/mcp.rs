@@ -14,6 +14,9 @@ use serde::Serialize;
 use std::sync::Arc;
 use workspace_core::config::McpConfig;
 
+/// Runtime state shared with the MCP gateway.
+pub type SharedRuntime = workspace_runtime::status::RuntimeMonitor;
+
 /// Path an MCP client connects to.
 pub const MCP_ENDPOINT: &str = "/chatgpt/mcp";
 
@@ -72,10 +75,10 @@ fn discovery_router(config: McpConfig) -> Router {
         .with_state(Arc::new(config))
 }
 
-pub fn router(config: McpConfig, schema_version: u32) -> Router {
+pub fn router(config: McpConfig, schema_version: u32, runtime: Arc<SharedRuntime>) -> Router {
     let discovery = discovery_router(config.clone());
 
-    match transport::router(&config, schema_version) {
+    match transport::router(&config, schema_version, runtime) {
         Ok(transport) => discovery.merge(transport),
         Err(error) => {
             tracing::warn!(%error, "MCP transport unavailable; endpoint stays closed");
@@ -88,9 +91,10 @@ pub fn router(config: McpConfig, schema_version: u32) -> Router {
 pub fn local_router(
     config: McpConfig,
     schema_version: u32,
+    runtime: Arc<SharedRuntime>,
     store: Arc<crate::oauth_store::OAuthStore>,
 ) -> Router {
-    match transport::local_router(&config, schema_version, store) {
+    match transport::local_router(&config, schema_version, runtime, store) {
         Ok(transport) => discovery_router(config).merge(transport),
         Err(error) => {
             tracing::error!(%error, "Local MCP transport unavailable");
@@ -113,8 +117,15 @@ mod tests {
         }
     }
 
+    fn test_runtime() -> Arc<SharedRuntime> {
+        Arc::new(SharedRuntime::new(
+            None,
+            "550e8400-e29b-41d4-a716-446655440000",
+        ))
+    }
+
     async fn get_json(uri: &str) -> (StatusCode, serde_json::Value) {
-        let response = router(config(), 3)
+        let response = router(config(), 3, test_runtime())
             .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
             .await
             .unwrap();
@@ -155,7 +166,7 @@ mod tests {
 
     #[tokio::test]
     async fn protocol_endpoint_requires_a_token() {
-        let response = router(config(), 3)
+        let response = router(config(), 3, test_runtime())
             .oneshot(
                 Request::builder()
                     .method("POST")

@@ -27,6 +27,26 @@ allowlist = []
 [logging]
 level = "info"
 
+# Dedicated execution runtime (stage 008). Execution stays disabled unless this
+# section names the dedicated backend explicitly. There are no fallbacks: the
+# server never discovers Docker Desktop or another engine on its own.
+#
+# [runtime]
+# backend = "wsl2"                       # or "rootless_docker" on Linux
+# distro = "ALXPRGS-Workspace"
+# user = "workspace"
+# docker_path = "/usr/bin/docker"
+# engine_name = "alxprgs-workspace"
+# socket = "unix:///run/user/1000/docker.sock"
+# data_root = "/srv/alxprgs-workspace/data"
+# helper_path = "/srv/alxprgs-workspace/bin/workspace-helper"
+# startup_timeout_seconds = 120
+# command_timeout_seconds = 60
+# workspace_storage_mib = 8192
+# workspace_files = 200000
+# minimum_free_mib = 4096
+# base_image = "debian@sha256:8aa5a7bf5a1955bddbe7d74fcdd0b91ab30e74362a8b73af672b0481b35b44a0"
+
 # Optional ALXPRGS SSO configuration:
 #
 # [sso]

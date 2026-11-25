@@ -1,0 +1,23 @@
+[package]
+name = "workspace-helper"
+description = "Trusted Linux filesystem helper for the dedicated Workspace runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "workspace-helper"
+path = "src/main.rs"
+
+[dependencies]
+workspace-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+cap-std = "3"
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile.workspace = true

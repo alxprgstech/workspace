@@ -1,0 +1,107 @@
+#!/bin/bash
+# ALXPRGS Workspace — narrowly scoped quota administration helper.
+#
+# This is the only program the Workspace service may execute through sudo. It
+# accepts exactly four operations with strictly validated numeric/identifier
+# arguments and never evaluates a caller-provided string as shell code. There is
+# no generic command execution here, and the file must stay root-owned.
+#
+# Install with deploy/windows/provision-runtime.ps1 (or the Linux equivalent).
+
+set -euo pipefail
+
+DATA_ROOT="/srv/alxprgs-workspace/data"
+WORKSPACES="${DATA_ROOT}/workspaces"
+FIRST_PROJECT=1010
+MAX_PROJECT=999999
+MAX_BYTES=$((1 << 40))
+MAX_FILES=10000000
+
+fail() {
+    echo "alxprgs-quota: $*" >&2
+    exit 64
+}
+
+is_uint() {
+    [[ "$1" =~ ^[0-9]{1,12}$ ]]
+}
+
+command="${1:-}"
+shift || true
+
+case "${command}" in
+assign)
+    [[ $# -eq 2 ]] || fail "usage: assign <project-id> <workspace-uuid>"
+
+    project="$1"
+    uuid="$2"
+
+    is_uint "${project}" || fail "invalid project identifier"
+    (( project >= FIRST_PROJECT && project <= MAX_PROJECT )) || fail "project identifier out of range"
+
+    [[ "${uuid}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] \
+        || fail "invalid workspace identifier"
+
+    target="${WORKSPACES}/${uuid}"
+
+    [[ -d "${target}" ]] || fail "workspace directory does not exist"
+
+    # The data directory belongs to the unprivileged runtime user; only the
+    # project identifier and the inheritance flag need root here.
+    chown 1000:1000 "${target}"
+    chmod 0750 "${target}"
+    chattr -p "${project}" +P "${target}"
+    ;;
+
+set)
+    [[ $# -eq 3 ]] || fail "usage: set <project-id> <bytes> <files>"
+
+    project="$1"
+    bytes="$2"
+    files="$3"
+
+    is_uint "${project}" || fail "invalid project identifier"
+    (( project >= FIRST_PROJECT && project <= MAX_PROJECT )) || fail "project identifier out of range"
+    is_uint "${bytes}" || fail "invalid block quota"
+    is_uint "${files}" || fail "invalid inode quota"
+    (( bytes > 0 && bytes <= MAX_BYTES )) || fail "block quota out of range"
+    (( files > 0 && files <= MAX_FILES )) || fail "inode quota out of range"
+
+    # ext4 quota blocks are 1 KiB units.
+    blocks=$(( (bytes + 1023) / 1024 ))
+
+    setquota -P "${project}" "${blocks}" "${blocks}" "${files}" "${files}" "${DATA_ROOT}"
+    ;;
+
+show)
+    [[ $# -eq 1 ]] || fail "usage: show <project-id>"
+
+    project="$1"
+    is_uint "${project}" || fail "invalid project identifier"
+
+    report="$(repquota -P "${DATA_ROOT}" 2>/dev/null | awk -v id="#${project}" '
+        $1 == id {
+            printf "%d %d %d %d %d %d %d\n", substr($1, 2), $3 * 1024, $7, $4 * 1024, $5 * 1024, $8, $9
+        }')"
+
+    if [[ -z "${report}" ]]; then
+        echo "none"
+    else
+        echo "${report}"
+    fi
+    ;;
+
+clear)
+    [[ $# -eq 1 ]] || fail "usage: clear <project-id>"
+
+    project="$1"
+    is_uint "${project}" || fail "invalid project identifier"
+    (( project >= FIRST_PROJECT && project <= MAX_PROJECT )) || fail "project identifier out of range"
+
+    setquota -P "${project}" 0 0 0 0 "${DATA_ROOT}"
+    ;;
+
+*)
+    fail "usage: alxprgs-quota {assign|set|show|clear} ..."
+    ;;
+esac

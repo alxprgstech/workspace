@@ -1,11 +1,14 @@
 //! Tool payloads served by the MCP gateway.
 //!
-//! Both tools are read-only and describe only what this build actually does.
+//! Every payload is derived from the same [`RuntimeStatus`] the HTTP API and
+//! `doctor` use, so the surfaces cannot disagree.
 
 use serde_json::{Value, json};
+use workspace_core::capabilities;
+use workspace_runtime::status::RuntimeStatus;
 
 /// Build and runtime information for this instance.
-pub fn server_information(schema_version: u32) -> Value {
+pub fn server_information(schema_version: u32, runtime: &RuntimeStatus) -> Value {
     json!({
         "product": workspace_core::PRODUCT_NAME,
         "version": workspace_core::VERSION,
@@ -13,21 +16,47 @@ pub fn server_information(schema_version: u32) -> Value {
         "platform": std::env::consts::OS,
         "architecture": std::env::consts::ARCH,
         "schema_version": schema_version,
-        // The execution runtime is not implemented yet; reporting it as ready
-        // would make every later status claim unreliable.
-        "runtime_ready": false,
+        // `runtime_ready` keeps its historic meaning: untrusted execution is
+        // possible right now, proven by the practical acceptance.
+        "runtime_ready": runtime.execution_ready,
+        "infrastructure_ready": runtime.infrastructure_ready,
+        "execution_ready": runtime.execution_ready,
+        "runtime": runtime,
     })
 }
 
-/// Catalog of capabilities with their real implementation status.
-pub fn capabilities_catalog(schema_version: u32) -> Value {
+/// Catalog of workspace capabilities and service modules.
+pub fn capabilities_catalog(schema_version: u32, runtime: &RuntimeStatus) -> Value {
+    let modules: Vec<Value> = capabilities::MODULES
+        .iter()
+        .map(|module| {
+            json!({
+                "id": module.id,
+                "name": module.name,
+                "description": module.description,
+                "version": module.version,
+                "tools": module.tools,
+                "depends_on": module.depends_on,
+                "status": if module.available { "available" } else { "not_installed" },
+            })
+        })
+        .collect();
+
+    let docker = if runtime.execution_ready {
+        "ready"
+    } else if runtime.infrastructure_ready {
+        "partial"
+    } else {
+        "not_ready"
+    };
+
     json!({
         "schema_version": schema_version,
-        "capabilities": [
+        "services": [
             {
                 "id": "http_api",
                 "status": "ready",
-                "description": "Loopback HTTP API for health, readiness and server information.",
+                "description": "HTTP API for health, readiness and server information.",
             },
             {
                 "id": "sso_web_session",
@@ -37,24 +66,26 @@ pub fn capabilities_catalog(schema_version: u32) -> Value {
             {
                 "id": "mcp_gateway",
                 "status": "ready",
-                "description": "Local OAuth authorization, token issuance, refresh rotation, revocation and authenticated MCP transport are implemented.",
+                "description": "Local OAuth authorization, token issuance, refresh rotation, revocation and authenticated MCP transport.",
             },
             {
                 "id": "docker_runtime",
-                "status": "partial",
-                "description": "Dedicated WSL2 rootless Docker and quota storage preflight are implemented; execution remains disabled.",
+                "status": docker,
+                "description": "Dedicated rootless Docker runtime with hard quotas and proven isolation.",
             },
             {
                 "id": "workspace_manager",
-                "status": "absent",
-                "description": "Workspace lifecycle management (stage 009) is not implemented.",
+                "status": "in_progress",
+                "description": "Workspace lifecycle management is being completed.",
             },
             {
                 "id": "job_execution",
-                "status": "absent",
-                "description": "Job execution (stage 011) is not implemented.",
+                "status": "in_progress",
+                "description": "Job execution inside isolated containers is being completed.",
             },
         ],
+        "modules": modules,
+        "runtime_blocking": runtime.blocking,
     })
 }
 
@@ -62,34 +93,47 @@ pub fn capabilities_catalog(schema_version: u32) -> Value {
 mod tests {
     use super::*;
 
-    #[test]
-    fn server_information_reports_the_build() {
-        let info = server_information(3);
-
-        assert_eq!(info["product"], workspace_core::PRODUCT_NAME);
-        assert_eq!(info["version"], workspace_core::VERSION);
-        assert_eq!(info["schema_version"], 3);
-        assert_eq!(info["runtime_ready"], false);
-        assert!(info["platform"].is_string());
+    fn unconfigured() -> RuntimeStatus {
+        RuntimeStatus::unconfigured("execution runtime is not configured")
     }
 
     #[test]
-    fn catalog_never_claims_unimplemented_capabilities() {
-        let catalog = capabilities_catalog(3);
+    fn server_information_never_claims_readiness_without_acceptance() {
+        let info = server_information(4, &unconfigured());
 
-        let entries = catalog["capabilities"].as_array().unwrap();
+        assert_eq!(info["product"], workspace_core::PRODUCT_NAME);
+        assert_eq!(info["schema_version"], 4);
+        assert_eq!(info["runtime_ready"], false);
+        assert_eq!(info["execution_ready"], false);
+        assert_eq!(info["infrastructure_ready"], false);
+    }
+
+    #[test]
+    fn catalog_reports_the_real_module_state() {
+        let catalog = capabilities_catalog(4, &unconfigured());
+        let modules = catalog["modules"].as_array().unwrap();
 
         let status = |id: &str| {
-            entries
+            modules
                 .iter()
                 .find(|entry| entry["id"] == id)
                 .map(|entry| entry["status"].as_str().unwrap().to_owned())
-                .unwrap_or_else(|| panic!("missing capability {id}"))
+                .unwrap_or_else(|| panic!("missing module {id}"))
         };
 
-        assert_eq!(status("http_api"), "ready");
-        assert_eq!(status("mcp_gateway"), "ready");
-        assert_eq!(status("docker_runtime"), "partial");
-        assert_eq!(status("workspace_manager"), "absent");
+        for id in [
+            "base",
+            "rust",
+            "cpp",
+            "git",
+            "python",
+            "ffmpeg",
+            "whisper-vad",
+        ] {
+            assert_eq!(status(id), "not_installed", "{id}");
+        }
+
+        assert_eq!(catalog["services"][3]["id"], "docker_runtime");
+        assert_eq!(catalog["services"][3]["status"], "not_ready");
     }
 }

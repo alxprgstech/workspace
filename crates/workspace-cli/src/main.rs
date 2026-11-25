@@ -7,7 +7,6 @@ use workspace_core::{
     PRODUCT_NAME, VERSION,
     config::{Config, LogLevel},
 };
-use workspace_runtime::RuntimeProbe;
 
 type AppResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -55,7 +54,17 @@ enum Command {
     },
 
     /// Diagnose the local installation
-    Doctor,
+    Doctor {
+        /// Skip the practical isolation acceptance (fast, infrastructure only)
+        #[arg(long)]
+        quick: bool,
+    },
+
+    /// Inspect or accept the dedicated execution runtime
+    Runtime {
+        #[command(subcommand)]
+        command: RuntimeCommand,
+    },
 
     /// Start the Workspace HTTP server
     Serve,
@@ -87,6 +96,18 @@ enum UsersCommand {
         #[arg(long)]
         subject: String,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum RuntimeCommand {
+    /// Show runtime checks without running containers
+    Status,
+
+    /// Run the practical isolation and quota acceptance
+    Accept,
+
+    /// Create the dedicated storage layout and verify quotas
+    Init,
 }
 
 #[derive(Debug, Subcommand)]
@@ -306,84 +327,265 @@ fn run(cli: Cli) -> AppResult<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
 
-        Command::Doctor => {
-            println!("{PRODUCT_NAME} {VERSION}");
-            println!();
-            println!("[OK] Configuration");
-            println!(
-                "[INFO] Platform: {}/{}",
-                std::env::consts::OS,
-                std::env::consts::ARCH
-            );
+        Command::Doctor { quick } => diagnose(&config, quick),
 
-            if std::env::consts::OS == "windows" || std::env::consts::OS == "linux" {
-                println!("[OK] Supported operating system");
-            } else {
-                println!("[FAIL] Unsupported operating system");
-                return Ok(ExitCode::FAILURE);
-            }
+        Command::Runtime { command } => {
+            let instance = instance_id(&config)?;
+            let monitor =
+                workspace_runtime::status::RuntimeMonitor::new(config.runtime.as_ref(), &instance);
 
-            match workspace_server::storage::inspect(&config.storage.data_dir)? {
-                Some(storage) => {
-                    println!("[OK] SQLite {}", storage.sqlite_version);
-                    println!("[OK] Database integrity");
-                    if storage.schema_version == workspace_server::storage::SCHEMA_VERSION {
-                        println!("[OK] Schema version: {}", storage.schema_version);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+
+            match command {
+                RuntimeCommand::Status => {
+                    let status = runtime.block_on(monitor.status());
+                    print_runtime_status(&status);
+
+                    Ok(if status.execution_ready {
+                        ExitCode::SUCCESS
                     } else {
-                        println!(
-                            "[PENDING] Schema version: {} (migrates to {} on server start)",
-                            storage.schema_version,
-                            workspace_server::storage::SCHEMA_VERSION
-                        );
-                    }
-                    println!("[INFO] Journal mode: {}", storage.journal_mode);
-                    println!("[INFO] Instance ID: {}", storage.instance_id);
+                        ExitCode::from(2)
+                    })
                 }
-                None => {
-                    println!("[PENDING] Database is not initialized");
+
+                RuntimeCommand::Accept => {
+                    runtime.block_on(monitor.warm_up());
+
+                    let status = runtime.block_on(monitor.status());
+
+                    if !status.infrastructure_ready {
+                        print_runtime_status(&status);
+                        return Ok(ExitCode::from(2));
+                    }
+
+                    println!("Running practical runtime acceptance...");
+                    println!();
+
+                    let report = runtime.block_on(monitor.run_acceptance())?;
+
+                    for check in &report.checks {
+                        print_check(check);
+                    }
+
+                    println!();
+                    println!(
+                        "Acceptance: {} in {} ms",
+                        if report.passed { "PASSED" } else { "FAILED" },
+                        report.duration_ms
+                    );
+
+                    Ok(if report.passed {
+                        ExitCode::SUCCESS
+                    } else {
+                        ExitCode::from(2)
+                    })
+                }
+
+                RuntimeCommand::Init => {
+                    let Some(settings) = monitor.settings().cloned() else {
+                        println!("[FAIL] Execution runtime is not configured");
+                        return Ok(ExitCode::from(2));
+                    };
+
+                    let Some(helper) = monitor.helper().cloned() else {
+                        println!("[FAIL] Trusted helper is unavailable");
+                        return Ok(ExitCode::from(2));
+                    };
+
+                    for directory in ["workspaces", "artifacts", "staging", "logs"] {
+                        runtime.block_on(helper.call(
+                            workspace_core::helper::Operation::Mkdir {
+                                root: settings.data_root.clone(),
+                                path: directory.to_owned(),
+                                parents: true,
+                            },
+                            &[],
+                        ))?;
+
+                        println!("[OK] {}/{}", settings.data_root, directory);
+                    }
+
+                    let status = runtime.block_on(monitor.status());
+                    print_runtime_status(&status);
+
+                    Ok(if status.infrastructure_ready {
+                        ExitCode::SUCCESS
+                    } else {
+                        ExitCode::from(2)
+                    })
                 }
             }
-
-            if !cfg!(windows) {
-                let facts = workspace_runtime::SystemProbe.facts();
-
-                match workspace_runtime::evaluate(&facts) {
-                    Ok(kind) => println!("[OK] Container runtime: {kind:?}"),
-                    Err(issue) => println!("[PENDING] Container runtime: {}", issue.reason()),
-                }
-            }
-            if cfg!(windows) {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()?;
-
-                match runtime.block_on(workspace_runtime::probe_wsl()) {
-                    Ok(report) => {
-                        println!("[OK] Dedicated WSL2 Docker: {}", report.engine);
-                        println!("[OK] Cgroup version: {}", report.cgroup_version);
-                        println!("[OK] Storage: {}", report.storage);
-                    }
-                    Err(error) => {
-                        println!("[FAIL] Runtime preflight: {error}");
-                    }
-                }
-            }
-
-            println!("[PENDING] Automatic resource isolation acceptance");
-            println!("[PENDING] Storage quotas");
-            println!("[PENDING] Network isolation");
-            println!("[PENDING] ALXPRGS SSO");
-            println!("[PENDING] MCP gateway");
-            println!();
-            println!("Runtime readiness: NOT READY");
-
-            tracing::warn!("Runtime readiness has not been established");
-
-            Ok(ExitCode::from(2))
         }
     }
 }
 
+fn instance_id(config: &Config) -> AppResult<String> {
+    Ok(
+        workspace_server::storage::inspect(&config.storage.data_dir)?
+            .map(|info| info.instance_id)
+            .unwrap_or_else(|| "unprovisioned-instance".to_owned()),
+    )
+}
+
+fn print_check(check: &workspace_runtime::StatusCheck) {
+    let marker = if !check.required {
+        "[INFO]"
+    } else if check.ok {
+        "[OK]"
+    } else {
+        "[FAIL]"
+    };
+
+    println!("{marker} {}: {}", check.id, check.detail);
+}
+
+fn print_runtime_status(status: &workspace_runtime::RuntimeStatus) {
+    println!();
+    println!(
+        "Runtime backend: {}",
+        status.backend.as_deref().unwrap_or("not configured")
+    );
+
+    for check in &status.checks {
+        print_check(check);
+    }
+
+    if let Some(storage) = status.storage.as_ref() {
+        println!(
+            "[INFO] Storage: {}/{} used, {} available",
+            storage.used_bytes, storage.size_bytes, storage.available_bytes
+        );
+    }
+
+    println!();
+    println!(
+        "Runtime readiness: {}",
+        if status.execution_ready {
+            "READY (execution)"
+        } else if status.infrastructure_ready {
+            "READY (infrastructure only)"
+        } else {
+            "NOT READY"
+        }
+    );
+
+    for reason in &status.blocking {
+        println!("[BLOCKING] {reason}");
+    }
+}
+
+fn diagnose(config: &Config, quick: bool) -> AppResult<ExitCode> {
+    println!("{PRODUCT_NAME} {VERSION}");
+    println!();
+    println!("[OK] Configuration");
+    println!(
+        "[INFO] Platform: {}/{}",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    );
+
+    if std::env::consts::OS != "windows" && std::env::consts::OS != "linux" {
+        println!("[FAIL] Unsupported operating system");
+        return Ok(ExitCode::FAILURE);
+    }
+
+    println!("[OK] Supported operating system");
+
+    match workspace_server::storage::inspect(&config.storage.data_dir)? {
+        Some(storage) => {
+            println!("[OK] SQLite {}", storage.sqlite_version);
+            println!("[OK] Database integrity");
+
+            if storage.schema_version == workspace_server::storage::SCHEMA_VERSION {
+                println!("[OK] Schema version: {}", storage.schema_version);
+            } else {
+                println!(
+                    "[PENDING] Schema version: {} (migrates to {} on server start)",
+                    storage.schema_version,
+                    workspace_server::storage::SCHEMA_VERSION
+                );
+            }
+
+            println!("[INFO] Journal mode: {}", storage.journal_mode);
+            println!("[INFO] Instance ID: {}", storage.instance_id);
+        }
+        None => println!("[PENDING] Database is not initialized"),
+    }
+
+    println!(
+        "[{}] ALXPRGS SSO: {}",
+        if config.sso.is_some() {
+            "OK"
+        } else {
+            "PENDING"
+        },
+        if config.sso.is_some() {
+            "configured"
+        } else {
+            "not configured"
+        }
+    );
+
+    println!(
+        "[{}] MCP gateway: {}",
+        if config.mcp.is_some() {
+            "OK"
+        } else {
+            "PENDING"
+        },
+        if config.mcp.is_some() {
+            "configured"
+        } else {
+            "not configured"
+        }
+    );
+
+    let instance = instance_id(config)?;
+    let monitor =
+        workspace_runtime::status::RuntimeMonitor::new(config.runtime.as_ref(), &instance);
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+
+    runtime.block_on(monitor.warm_up());
+
+    let mut status = runtime.block_on(monitor.status());
+
+    if !quick && status.infrastructure_ready {
+        println!();
+        println!("Running practical runtime acceptance...");
+
+        match runtime.block_on(monitor.run_acceptance()) {
+            Ok(report) => {
+                for check in report
+                    .checks
+                    .iter()
+                    .filter(|check| check.required && !check.ok)
+                {
+                    print_check(check);
+                }
+
+                if !report.passed {
+                    println!("[FAIL] Practical runtime acceptance failed");
+                }
+
+                status = runtime.block_on(monitor.status());
+            }
+            Err(error) => println!("[FAIL] runtime.acceptance: {error}"),
+        }
+    }
+
+    print_runtime_status(&status);
+
+    Ok(if status.execution_ready {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(2)
+    })
+}
 fn main() -> ExitCode {
     match run(Cli::parse()) {
         Ok(code) => code,

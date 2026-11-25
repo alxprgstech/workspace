@@ -1,250 +1,187 @@
 #![forbid(unsafe_code)]
 
-//! Container runtime, job execution, storage and resource management.
+//! Dedicated container runtime: Docker control, quota storage, the trusted
+//! Linux helper and one unified readiness model.
 //!
-//! Stage 008 starts with runtime discovery: nothing here creates containers.
-//! The evaluation is a pure function over observed facts so the fail-closed
-//! rules can be tested without touching a host runtime.
+//! Two rules shape this crate:
+//!
+//! 1. Nothing here guesses. A property is either proven by a direct query or
+//!    the corresponding check fails closed.
+//! 2. Nothing here builds a shell command. Every invocation is a fixed program
+//!    with fixed arguments; user input never reaches a shell.
 
-mod live;
-mod probe;
+pub mod docker;
+pub mod helper;
+pub mod host;
+pub mod quota;
+pub mod status;
+pub mod storage;
 
-pub use live::{LiveReport, probe_wsl};
+pub use docker::{ContainerSpec, ContainerState, EngineInfo};
+pub use helper::Helper;
+pub use host::Host;
+pub use status::{RuntimeStatus, StatusCheck};
 
-pub use probe::{RuntimeProbe, SystemProbe};
+use thiserror::Error;
+use workspace_core::config::RuntimeConfig;
 
-/// Host family that determines which runtime shape is acceptable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Platform {
-    Windows,
-    Linux,
-    Other,
+/// Failure while talking to the dedicated runtime.
+#[derive(Debug, Error)]
+pub enum RuntimeError {
+    #[error("the execution runtime is not configured")]
+    NotConfigured,
+
+    #[error("runtime transport failed: {0}")]
+    Transport(String),
+
+    #[error("runtime command timed out after {0} seconds")]
+    Timeout(u64),
+
+    #[error("the Docker engine rejected the request: {0}")]
+    Engine(String),
+
+    #[error("unexpected runtime response: {0}")]
+    Protocol(String),
+
+    #[error("runtime helper failed [{code}]: {message}")]
+    Helper { code: String, message: String },
+
+    #[error("storage operation failed: {0}")]
+    Storage(String),
+
+    #[error("quota operation failed: {0}")]
+    Quota(String),
+
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
 }
 
-/// Runtime shape that satisfies the isolation architecture.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RuntimeKind {
-    /// Dedicated WSL2 distribution hosting its own Docker Engine.
-    Wsl2,
-    /// Dedicated rootless Docker Engine on Linux.
+impl RuntimeError {
+    /// Whether the runtime itself, rather than one command, is unavailable.
+    pub fn is_unavailable(&self) -> bool {
+        matches!(self, Self::NotConfigured | Self::Timeout(_))
+    }
+}
+
+/// Resolved runtime settings, derived from configuration.
+#[derive(Debug, Clone)]
+pub struct RuntimeSettings {
+    pub backend: RuntimeBackend,
+    pub socket: String,
+    pub docker_path: String,
+    pub engine_name: String,
+    pub data_root: String,
+    pub helper_path: String,
+    pub startup_timeout: std::time::Duration,
+    pub command_timeout: std::time::Duration,
+    pub workspace_storage_mib: u64,
+    pub workspace_files: u64,
+    pub minimum_free_mib: u64,
+    pub base_image: String,
+}
+
+/// Concrete transport shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeBackend {
+    /// Dedicated WSL2 distribution.
+    Wsl2 { distro: String, user: String },
+    /// Rootless Docker on the local Linux host.
     RootlessDocker,
 }
 
-/// Facts collected by host probes.
-///
-/// `None` always means "could not be determined" and is treated as a failure
-/// by [`evaluate`], never as an implicit success.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RuntimeFacts {
-    pub platform: Platform,
-    /// Whether a WSL2 distribution is installed and running.
-    pub wsl2_available: Option<bool>,
-    /// Whether a Docker Engine binary is reachable at all.
-    pub docker_present: bool,
-    /// Whether the reachable engine runs rootless.
-    pub docker_rootless: Option<bool>,
-    /// Whether the engine would grant privileged containers by default.
-    pub docker_privileged_default: bool,
-    /// Whether the engine was actually queried, rather than merely found on
-    /// the PATH. Static discovery can never prove isolation, so it leaves this
-    /// false and readiness stays closed.
-    pub engine_verified: bool,
-}
-
-/// Why a host cannot host Workspace workspaces yet.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RuntimeIssue {
-    UnsupportedPlatform,
-    /// Windows without a usable WSL2 distribution.
-    Wsl2Missing,
-    DockerMissing,
-    /// Rootless mode is a hard requirement on Linux.
-    RootfulDocker,
-    /// Rootless state was not proven; assume the worst.
-    RootlessUnknown,
-    /// An engine that grants privileged containers is never acceptable.
-    PrivilegedContainersAllowed,
-    /// The engine was not queried directly, so its policies are unproven.
-    EngineNotVerified,
-}
-
-impl RuntimeIssue {
-    /// Operator-facing explanation; these strings end up in diagnostics.
-    pub fn reason(self) -> &'static str {
+impl RuntimeBackend {
+    pub fn name(&self) -> &'static str {
         match self {
-            Self::UnsupportedPlatform => {
-                "unsupported host platform: only Windows with WSL2 and Linux are supported"
-            }
-            Self::Wsl2Missing => "WSL2 is not available; a dedicated WSL2 distribution is required",
-            Self::DockerMissing => "no Docker Engine is reachable from the dedicated environment",
-            Self::RootfulDocker => {
-                "the Docker Engine runs as root; a dedicated rootless engine is required"
-            }
-            Self::RootlessUnknown => {
-                "rootless mode could not be proven; refusing to assume isolation"
-            }
-            Self::PrivilegedContainersAllowed => {
-                "the Docker Engine permits privileged containers; isolation cannot be guaranteed"
-            }
-            Self::EngineNotVerified => {
-                "the Docker Engine has not been queried directly; isolation is unproven"
-            }
+            Self::Wsl2 { .. } => "wsl2",
+            Self::RootlessDocker => "rootless_docker",
         }
     }
 }
 
-/// Decide whether the host may host workspaces.
-///
-/// The function fails closed: every uncertainty resolves to an issue.
-pub fn evaluate(facts: &RuntimeFacts) -> Result<RuntimeKind, RuntimeIssue> {
-    if facts.docker_privileged_default {
-        return Err(RuntimeIssue::PrivilegedContainersAllowed);
+impl RuntimeSettings {
+    /// Build settings from configuration.
+    pub fn from_config(config: &RuntimeConfig) -> Self {
+        let backend = match config.backend {
+            workspace_core::config::RuntimeBackendKind::Wsl2 => RuntimeBackend::Wsl2 {
+                distro: config.distro.clone().unwrap_or_default(),
+                user: config.user.clone().unwrap_or_default(),
+            },
+            workspace_core::config::RuntimeBackendKind::RootlessDocker => {
+                RuntimeBackend::RootlessDocker
+            }
+        };
+
+        Self {
+            backend,
+            socket: config.socket.clone(),
+            docker_path: config.docker_path.clone(),
+            engine_name: config.engine_name.clone(),
+            data_root: config.data_root.trim_end_matches('/').to_owned(),
+            helper_path: config.helper_path.clone(),
+            startup_timeout: std::time::Duration::from_secs(config.startup_timeout_seconds),
+            command_timeout: std::time::Duration::from_secs(config.command_timeout_seconds),
+            workspace_storage_mib: config.workspace_storage_mib,
+            workspace_files: config.workspace_files,
+            minimum_free_mib: config.minimum_free_mib,
+            base_image: config.base_image.clone(),
+        }
     }
+}
 
-    let kind = match facts.platform {
-        Platform::Windows => {
-            if facts.wsl2_available != Some(true) {
-                return Err(RuntimeIssue::Wsl2Missing);
-            }
+/// Generate a runtime container name from server-side identifiers only.
+///
+/// Names never contain user input: the instance id and the resource ids are
+/// server-assigned, and the function refuses anything unexpected.
+pub fn container_name(instance: &str, kind: &str, id: &str) -> Result<String, RuntimeError> {
+    let short = |value: &str| -> Result<String, RuntimeError> {
+        let cleaned: String = value
+            .chars()
+            .filter(|character| character.is_ascii_alphanumeric())
+            .take(8)
+            .collect();
 
-            if !facts.docker_present {
-                return Err(RuntimeIssue::DockerMissing);
-            }
-
-            // Windows relies on the WSL2 boundary; a rootful engine inside the
-            // dedicated distribution is still confined to it, but we only
-            // accept it when rootless state is not contradicted.
-            if facts.docker_rootless == Some(false) {
-                return Err(RuntimeIssue::RootfulDocker);
-            }
-
-            RuntimeKind::Wsl2
+        if cleaned.len() < 6 {
+            return Err(RuntimeError::Protocol(
+                "identifier is too short to name a container".into(),
+            ));
         }
-        Platform::Linux => {
-            if !facts.docker_present {
-                return Err(RuntimeIssue::DockerMissing);
-            }
 
-            match facts.docker_rootless {
-                Some(true) => RuntimeKind::RootlessDocker,
-                Some(false) => return Err(RuntimeIssue::RootfulDocker),
-                None => return Err(RuntimeIssue::RootlessUnknown),
-            }
-        }
-        Platform::Other => return Err(RuntimeIssue::UnsupportedPlatform),
+        Ok(cleaned)
     };
 
-    // Static discovery can describe an engine but never prove its policies.
-    if !facts.engine_verified {
-        return Err(RuntimeIssue::EngineNotVerified);
+    if !matches!(kind, "job" | "workspace" | "build" | "probe") {
+        return Err(RuntimeError::Protocol("unknown container kind".into()));
     }
 
-    Ok(kind)
+    Ok(format!(
+        "alxprgs-{}-{kind}-{}",
+        short(instance)?,
+        short(id)?
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn facts(platform: Platform) -> RuntimeFacts {
-        RuntimeFacts {
-            platform,
-            wsl2_available: None,
-            docker_present: false,
-            docker_rootless: None,
-            docker_privileged_default: false,
-            engine_verified: false,
-        }
+    #[test]
+    fn container_names_are_server_generated() {
+        let name = container_name(
+            "f32ac08f-5f8c-41df-8a72-820d9ff123d8",
+            "job",
+            "550e8400-e29b-41d4-a716-446655440000",
+        )
+        .unwrap();
+
+        assert_eq!(name, "alxprgs-f32ac08f-job-550e8400");
+        assert!(!name.contains('='));
     }
 
     #[test]
-    fn windows_requires_a_running_wsl2_distribution() {
-        let mut host = facts(Platform::Windows);
-
-        assert_eq!(evaluate(&host), Err(RuntimeIssue::Wsl2Missing));
-
-        host.wsl2_available = Some(false);
-        assert_eq!(evaluate(&host), Err(RuntimeIssue::Wsl2Missing));
-
-        host.wsl2_available = Some(true);
-        assert_eq!(evaluate(&host), Err(RuntimeIssue::DockerMissing));
-
-        host.docker_present = true;
-        assert_eq!(evaluate(&host), Err(RuntimeIssue::EngineNotVerified));
-
-        host.engine_verified = true;
-        assert_eq!(evaluate(&host), Ok(RuntimeKind::Wsl2));
-
-        host.docker_rootless = Some(false);
-        assert_eq!(evaluate(&host), Err(RuntimeIssue::RootfulDocker));
-    }
-
-    #[test]
-    fn linux_requires_a_proven_rootless_engine() {
-        let mut host = facts(Platform::Linux);
-
-        assert_eq!(evaluate(&host), Err(RuntimeIssue::DockerMissing));
-
-        host.docker_present = true;
-
-        // Unknown is a failure, never an implicit pass.
-        assert_eq!(evaluate(&host), Err(RuntimeIssue::RootlessUnknown));
-
-        host.docker_rootless = Some(false);
-        assert_eq!(evaluate(&host), Err(RuntimeIssue::RootfulDocker));
-
-        host.docker_rootless = Some(true);
-        assert_eq!(evaluate(&host), Err(RuntimeIssue::EngineNotVerified));
-
-        host.engine_verified = true;
-        assert_eq!(evaluate(&host), Ok(RuntimeKind::RootlessDocker));
-    }
-
-    #[test]
-    fn privileged_engines_are_rejected_even_when_otherwise_ready() {
-        for platform in [Platform::Windows, Platform::Linux] {
-            let host = RuntimeFacts {
-                platform,
-                wsl2_available: Some(true),
-                docker_present: true,
-                docker_rootless: Some(true),
-                docker_privileged_default: true,
-                engine_verified: true,
-            };
-
-            assert_eq!(
-                evaluate(&host),
-                Err(RuntimeIssue::PrivilegedContainersAllowed),
-                "{platform:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn unsupported_platforms_fail_closed() {
-        let host = RuntimeFacts {
-            platform: Platform::Other,
-            wsl2_available: Some(true),
-            docker_present: true,
-            docker_rootless: Some(true),
-            docker_privileged_default: false,
-            engine_verified: true,
-        };
-
-        assert_eq!(evaluate(&host), Err(RuntimeIssue::UnsupportedPlatform));
-    }
-
-    #[test]
-    fn every_issue_explains_itself() {
-        for issue in [
-            RuntimeIssue::UnsupportedPlatform,
-            RuntimeIssue::Wsl2Missing,
-            RuntimeIssue::DockerMissing,
-            RuntimeIssue::RootfulDocker,
-            RuntimeIssue::RootlessUnknown,
-            RuntimeIssue::PrivilegedContainersAllowed,
-        ] {
-            assert!(!issue.reason().is_empty());
-        }
+    fn container_names_reject_unknown_kinds_and_short_ids() {
+        assert!(
+            container_name("f32ac08f-5f8c-41df-8a72-820d9ff123d8", "shell", "550e8400").is_err()
+        );
+        assert!(container_name("abc", "job", "550e8400").is_err());
     }
 }
