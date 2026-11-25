@@ -80,6 +80,8 @@ fn router(
     storage: storage::StorageInfo,
     auth: Option<Arc<auth_http::AuthState>>,
 ) -> Router {
+    let schema_version = storage.schema_version;
+
     let info = ServerInfo {
         product: PRODUCT_NAME,
         version: VERSION,
@@ -121,7 +123,7 @@ fn router(
     // an unconfigured gateway must fail closed rather than answer with an
     // unverified resource.
     let router = match config.mcp.clone() {
-        Some(mcp) => router.merge(mcp::router(mcp)),
+        Some(mcp) => router.merge(mcp::router(mcp, schema_version)),
         None => router,
     };
 
@@ -660,10 +662,10 @@ mod auth_http_tests {
         }
     }
 
-    /// With an audience declared, discovery is served but the protocol
-    /// endpoint stays closed until the transport is wired.
+    /// With an audience declared, discovery is served and the protocol
+    /// endpoint is mounted but requires an MCP access token.
     #[tokio::test]
-    async fn configured_mcp_publishes_discovery_only() {
+    async fn configured_mcp_requires_a_token() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = Config::parse(include_str!("../../../config.example.toml")).unwrap();
 
@@ -686,8 +688,20 @@ mod auth_http_tests {
         );
 
         assert_eq!(
-            get(&router, "/chatgpt/mcp").await.status(),
-            StatusCode::NOT_IMPLEMENTED
+            request(
+                &router,
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/chatgpt/mcp")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .status(),
+            StatusCode::UNAUTHORIZED
         );
     }
 

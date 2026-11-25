@@ -13,13 +13,16 @@
 | Protected Resource Metadata (RFC 9728) | реализовано |
 | Проверка MCP access token (RS256, issuer, audience, resource, срок, scopes) | реализовано |
 | Отключение шлюза без конфигурации (fail-closed) | реализовано |
-| Streamable HTTP транспорт (`rmcp`) | не реализовано |
-| Инструменты `server_info`, `capabilities_list` | не реализовано (контракты ниже) |
+| Streamable HTTP транспорт (`rmcp`) | реализовано |
+| Инструменты `server_info`, `capabilities_list` | реализовано |
+| JWKS-кеш с обновлением при ротации ключей для MCP | реализовано |
 | OAuth-сервер: authorization code + PKCE, DCR, refresh, revoke | не реализовано |
-| JWKS-кеш с обновлением при ротации ключей для MCP | не реализовано |
 
-Пока транспорт не готов, `POST /chatgpt/mcp` и `GET /chatgpt/mcp` отвечают
-`501 mcp_transport_pending`. Незащищённый MCP-endpoint не публикуется.
+`POST /chatgpt/mcp` смонтирован через `rmcp` Streamable HTTP и защищён
+Bearer-токеном (§4). Запрос без токена, с истёкшим токеном или с токеном
+чужой аудитории получает `401` с `WWW-Authenticate` и ссылкой на
+protected-resource metadata. Если транспорт не удалось собрать (например,
+некорректный `resource`), endpoint отвечает `501 mcp_transport_pending`.
 
 ## 2. Конфигурация
 
@@ -78,7 +81,7 @@ required_scopes = ["workspace.read"]                  # обязательные
 отдельная аудитория, отзыв браузерной сессии не продлевает и не отзывает
 MCP-токен (отзыв появится вместе с OAuth-сервером).
 
-## 5. Инструменты (контракты, ещё не реализованы)
+## 5. Инструменты (реализованы как read-only)
 
 `server_info` — read-only, без аргументов:
 
@@ -112,17 +115,16 @@ MCP-токен (отзыв появится вместе с OAuth-серверо
 
 ## 6. Что нужно сделать для завершения этапа 007
 
-1. Подключить `rmcp` (Streamable HTTP, `server` + `transport-streamable-http-server`)
-   и смонтировать сервис в `/chatgpt/mcp` за middleware проверки Bearer-токена
-   из §4; сейчас зависимость не подключена.
-2. Реализовать `server_info` и `capabilities_list` по контрактам §5,
-   с интеграционными тестами `initialize` → `tools/list` → `tools/call`.
-3. Добавить JWKS-кеш с TTL и принудительным обновлением при неизвестном `kid`.
-4. Реализовать OAuth-сервер: authorization code + PKCE S256, metadata,
+1. Реализовать OAuth-сервер: authorization code + PKCE S256, AS metadata,
    refresh token rotation, отзыв, точные redirect URI, статические clients.
-5. Ограничить размеры запросов и ответов, добавить структурированные ошибки.
-6. Проверить подключение из обычного веб-чата ChatGPT на целевом аккаунте;
-   до этого этапа NGINX Basic Auth остаётся включённой.
+   Сейчас токены принимаются, но выпускаются внешним IdP.
+2. Проверить подключение из обычного веб-чата ChatGPT на целевом аккаунте
+   (initialize → tools/list → tools/call на реальном аккаунте); до этого
+   NGINX Basic Auth остаётся включённой.
+3. Добавить интеграционный тест полного пути с подписанным токеном и
+   подставленным JWKS (сейчас транспорт проверен на `initialize`).
+4. Ограничить число одновременных MCP-сессий и размеры ответов на уровне
+   gateway, если это потребуется по результатам нагрузки.
 
 ## 7. Безопасность
 

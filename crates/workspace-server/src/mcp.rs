@@ -1,17 +1,20 @@
-//! MCP gateway foundation (stage 007).
+//! MCP gateway (stage 007).
 //!
-//! This module currently publishes only the discovery surface that clients
-//! need before they can obtain a token, plus a fail-closed placeholder for the
-//! protocol endpoint itself. The Streamable HTTP transport is not wired yet,
-//! so no MCP request can be served — an unauthenticated protocol endpoint must
-//! never be exposed in the meantime.
+//! The gateway publishes discovery metadata (RFC 9728) and, when the transport
+//! can be built, a Streamable HTTP endpoint guarded by an MCP access token.
+//! It is absent entirely unless the deployment declares its audience: an
+//! unconfigured gateway must fail closed rather than serve an unverified
+//! resource.
+
+mod tools;
+mod transport;
 
 use axum::{Json, Router, extract::State, http::StatusCode, response::IntoResponse, routing::get};
 use serde::Serialize;
 use std::sync::Arc;
 use workspace_core::config::McpConfig;
 
-/// Path the MCP client connects to once the transport exists.
+/// Path an MCP client connects to.
 pub const MCP_ENDPOINT: &str = "/chatgpt/mcp";
 
 #[derive(Serialize)]
@@ -42,10 +45,7 @@ async fn protected_resource(State(config): State<Arc<McpConfig>>) -> impl IntoRe
     )
 }
 
-/// The protocol endpoint exists but is not served yet.
-///
-/// Returning a documented 501 keeps the advertisement honest and avoids
-/// exposing an unauthenticated transport while stage 007 is incomplete.
+/// The protocol endpoint exists but no transport could be built.
 async fn transport_pending() -> impl IntoResponse {
     (
         StatusCode::NOT_IMPLEMENTED,
@@ -56,10 +56,11 @@ async fn transport_pending() -> impl IntoResponse {
     )
 }
 
-pub fn router(config: McpConfig) -> Router {
+/// Discovery routes shared by both the working and the pending transport.
+fn discovery_router(config: McpConfig) -> Router {
     Router::new()
-        // RFC 9728 protected-resource metadata, including the path-specific
-        // form a client derives from the MCP endpoint URL.
+        // RFC 9728, including the path-specific form a client derives from
+        // the MCP endpoint URL.
         .route(
             "/.well-known/oauth-protected-resource",
             get(protected_resource),
@@ -68,8 +69,20 @@ pub fn router(config: McpConfig) -> Router {
             "/.well-known/oauth-protected-resource/chatgpt/mcp",
             get(protected_resource),
         )
-        .route(MCP_ENDPOINT, get(transport_pending).post(transport_pending))
         .with_state(Arc::new(config))
+}
+
+pub fn router(config: McpConfig, schema_version: u32) -> Router {
+    let discovery = discovery_router(config.clone());
+
+    match transport::router(&config, schema_version) {
+        Ok(transport) => discovery.merge(transport),
+        Err(error) => {
+            tracing::warn!(%error, "MCP transport unavailable; endpoint stays closed");
+
+            discovery.route(MCP_ENDPOINT, get(transport_pending).post(transport_pending))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -88,7 +101,7 @@ mod tests {
     }
 
     async fn get_json(uri: &str) -> (StatusCode, serde_json::Value) {
-        let response = router(config())
+        let response = router(config(), 3)
             .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
             .await
             .unwrap();
@@ -128,10 +141,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn protocol_endpoint_is_not_served_unauthenticated() {
-        let (status, body) = get_json(MCP_ENDPOINT).await;
+    async fn protocol_endpoint_requires_a_token() {
+        let response = router(config(), 3)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(MCP_ENDPOINT)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
 
-        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
-        assert_eq!(body["error"], "mcp_transport_pending");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let challenge = response.headers()["www-authenticate"].to_str().unwrap();
+
+        assert!(challenge.contains("resource_metadata="), "{challenge}");
     }
 }
