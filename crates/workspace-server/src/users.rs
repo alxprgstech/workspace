@@ -113,6 +113,17 @@ pub fn grant_access(
         params![&config.issuer, subject],
     )?;
 
+    tx.execute(
+        "UPDATE mcp_oauth_grants
+         SET revoked_at_unix = unixepoch()
+         WHERE revoked_at_unix IS NULL
+           AND user_id IN (
+               SELECT id FROM users
+               WHERE issuer = ?1 AND subject = ?2
+           )",
+        params![&config.issuer, subject],
+    )?;
+
     tx.commit()?;
 
     Ok(())
@@ -143,6 +154,17 @@ pub fn disable_access(
             SELECT id FROM users
             WHERE issuer = ?1 AND subject = ?2
          )",
+        params![&config.issuer, subject],
+    )?;
+
+    tx.execute(
+        "UPDATE mcp_oauth_grants
+         SET revoked_at_unix = unixepoch()
+         WHERE revoked_at_unix IS NULL
+           AND user_id IN (
+               SELECT id FROM users
+               WHERE issuer = ?1 AND subject = ?2
+           )",
         params![&config.issuer, subject],
     )?;
 

@@ -8,7 +8,7 @@ use std::{
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 const APPLICATION_ID: i64 = 0x414C5857;
 const MIN_SQLITE_VERSION: i32 = 3_051_003;
@@ -16,6 +16,7 @@ const MIN_SQLITE_VERSION: i32 = 3_051_003;
 const MIGRATION_001: &str = include_str!("../migrations/0001_initial.sql");
 const MIGRATION_002: &str = include_str!("../migrations/0002_auth.sql");
 const MIGRATION_003: &str = include_str!("../migrations/0003_refresh_lease.sql");
+const MIGRATION_004: &str = include_str!("../migrations/0004_mcp_oauth.sql");
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct StorageInfo {
@@ -129,6 +130,10 @@ fn migrate(connection: &mut Connection) -> Result<(), StorageError> {
 
     if version < 3 {
         tx.execute_batch(MIGRATION_003)?;
+    }
+
+    if version < 4 {
+        tx.execute_batch(MIGRATION_004)?;
     }
 
     tx.commit()?;
@@ -529,5 +534,123 @@ mod migration_tests {
             .unwrap();
 
         assert_eq!(count, 0);
+    }
+}
+
+#[cfg(test)]
+mod mcp_oauth_migration_tests {
+    use super::*;
+
+    #[test]
+    fn upgrades_v3_preserving_existing_users() {
+        let dir = tempfile::tempdir().unwrap();
+
+        fs::create_dir_all(dir.path().join("state")).unwrap();
+
+        let connection = Connection::open(database_path(dir.path())).unwrap();
+
+        configure(&connection).unwrap();
+
+        connection.execute_batch(MIGRATION_001).unwrap();
+        connection.execute_batch(MIGRATION_002).unwrap();
+        connection.execute_batch(MIGRATION_003).unwrap();
+
+        connection
+            .execute_batch(
+                "INSERT INTO instances
+             (singleton, instance_id, created_at_unix)
+             VALUES (
+                1,
+                '550e8400-e29b-41d4-a716-446655440000',
+                1
+             );
+
+             INSERT INTO users
+             (id, issuer, subject, role, is_enabled,
+              created_at_unix, updated_at_unix)
+             VALUES (
+                'user-1',
+                'https://auth.alxprgs.tech',
+                'subject-1',
+                'admin', 1, 1, 1
+             );",
+            )
+            .unwrap();
+
+        drop(connection);
+
+        let info = initialize(dir.path()).unwrap();
+
+        assert_eq!(info.schema_version, 4);
+        assert_eq!(info.instance_id, "550e8400-e29b-41d4-a716-446655440000");
+
+        let connection = open(dir.path()).unwrap();
+
+        let users: i64 = connection
+            .query_row("SELECT count(*) FROM users", [], |row| row.get(0))
+            .unwrap();
+
+        assert_eq!(users, 1);
+
+        let tables: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema
+             WHERE type = 'table'
+               AND name IN (
+                 'mcp_oauth_clients',
+                 'mcp_oauth_requests',
+                 'mcp_oauth_grants',
+                 'mcp_oauth_codes',
+                 'mcp_access_tokens',
+                 'mcp_refresh_tokens'
+               )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(tables, 6);
+    }
+
+    #[test]
+    fn rejects_invalid_client_secret_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        initialize(dir.path()).unwrap();
+
+        let connection = open(dir.path()).unwrap();
+
+        let result = connection.execute(
+            "INSERT INTO mcp_oauth_clients
+             (client_id, name, secret_hash, redirect_uri,
+              allowed_scope, created_at_unix)
+             VALUES (
+                'test-client', 'Test', x'01',
+                'https://example.com/callback',
+                'workspace.read', 1
+             )",
+            [],
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_tokens_without_existing_grant() {
+        let dir = tempfile::tempdir().unwrap();
+        initialize(dir.path()).unwrap();
+
+        let connection = open(dir.path()).unwrap();
+
+        let result = connection.execute(
+            "INSERT INTO mcp_access_tokens
+             (token_hash, grant_id,
+              created_at_unix, expires_at_unix)
+             VALUES (
+                randomblob(32), 'missing-grant', 1, 600
+             )",
+            [],
+        );
+
+        assert!(result.is_err());
     }
 }

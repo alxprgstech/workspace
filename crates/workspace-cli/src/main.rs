@@ -48,6 +48,12 @@ enum Command {
         command: UsersCommand,
     },
 
+    /// Manage registered MCP OAuth clients
+    McpClients {
+        #[command(subcommand)]
+        command: McpClientsCommand,
+    },
+
     /// Diagnose the local installation
     Doctor,
 
@@ -80,6 +86,27 @@ enum UsersCommand {
     Disable {
         #[arg(long)]
         subject: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum McpClientsCommand {
+    /// Register a confidential OAuth client
+    Register {
+        #[arg(long)]
+        name: String,
+
+        #[arg(long)]
+        redirect_uri: String,
+    },
+
+    /// List OAuth clients without secrets
+    List,
+
+    /// Disable an OAuth client and revoke its grants
+    Disable {
+        #[arg(long)]
+        client_id: String,
     },
 }
 
@@ -187,6 +214,58 @@ fn run(cli: Cli) -> AppResult<ExitCode> {
 
                     println!("[OK] Access disabled");
                     println!("[OK] Local sessions revoked");
+                }
+            }
+
+            Ok(ExitCode::SUCCESS)
+        }
+
+        Command::McpClients { command } => {
+            let sso = config.sso.as_ref().ok_or(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "SSO is not configured",
+            ))?;
+
+            let store =
+                workspace_server::oauth_store::OAuthStore::new(&config.storage.data_dir, sso)?;
+
+            match command {
+                McpClientsCommand::Register { name, redirect_uri } => {
+                    let credentials = store.register_client(&name, &redirect_uri)?;
+
+                    println!("[OK] OAuth client registered");
+                    println!("Client ID: {}", credentials.client_id);
+                    println!("Client Secret: {}", credentials.client_secret);
+                    println!("Redirect URI: {redirect_uri}");
+                    println!("Resource: {}", store.resource());
+                    println!("Scope: workspace.read");
+                    println!("Save the client secret securely. It cannot be recovered.");
+                }
+
+                McpClientsCommand::List => {
+                    let clients = store.list_clients()?;
+
+                    println!("OAuth clients: {}", clients.len());
+
+                    for client in clients {
+                        println!(
+                            "{}  enabled={}  name={:?}  redirect={:?}",
+                            client.client_id, client.is_enabled, client.name, client.redirect_uri,
+                        );
+                    }
+                }
+
+                McpClientsCommand::Disable { client_id } => {
+                    if !store.disable_client(&client_id)? {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            "OAuth client not found",
+                        )
+                        .into());
+                    }
+
+                    println!("[OK] OAuth client disabled");
+                    println!("[OK] Client grants revoked");
                 }
             }
 
@@ -353,6 +432,32 @@ mod users_cli_tests {
             cli.command,
             Command::Users {
                 command: UsersCommand::Grant { .. }
+            }
+        ));
+    }
+}
+
+#[cfg(test)]
+mod mcp_cli_tests {
+    use super::*;
+
+    #[test]
+    fn parses_mcp_client_registration() {
+        let cli = Cli::try_parse_from([
+            "workspace",
+            "mcp-clients",
+            "register",
+            "--name",
+            "ChatGPT",
+            "--redirect-uri",
+            "https://chatgpt.com/connector_platform_oauth_redirect",
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Command::McpClients {
+                command: McpClientsCommand::Register { .. }
             }
         ));
     }

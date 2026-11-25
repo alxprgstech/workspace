@@ -13,6 +13,7 @@ pub mod auth_store;
 pub mod crypto;
 mod mcp;
 pub mod mcp_auth;
+pub mod oauth_store;
 pub mod secrets;
 pub mod sso;
 pub mod storage;
