@@ -399,6 +399,57 @@ async fn clipforge_development_inside_a_workspace() {
 
     println!("patched cli/Cargo.toml to 0.4.0 ({})", patched.sha256);
 
+    // The version bump is a real source change: the project's own test still
+    // asserts 0.3.0, so it has to be updated in the same change.
+    let test_source = files
+        .read(
+            &fixture.owner,
+            &workspace.id,
+            "cli/tests/cli.rs",
+            0,
+            256 * 1024,
+        )
+        .await
+        .expect("cli tests");
+
+    let lines: Vec<&str> = test_source.content.lines().collect();
+    let index = lines
+        .iter()
+        .position(|line| line.contains("0.3.0"))
+        .expect("a 0.3.0 assertion in the CLI tests");
+
+    let start = index.saturating_sub(1);
+    let end = (start + 3).min(lines.len());
+
+    let mut patch = format!(
+        "--- a/cli/tests/cli.rs\n+++ b/cli/tests/cli.rs\n@@ -{},{} +{},{} @@\n",
+        start + 1,
+        end - start,
+        start + 1,
+        end - start
+    );
+
+    for (offset, line) in lines[start..end].iter().enumerate() {
+        if start + offset == index {
+            patch.push_str(&format!("-{}\n+{}\n", line, line.replace("0.3.0", "0.4.0")));
+        } else {
+            patch.push_str(&format!(" {line}\n"));
+        }
+    }
+
+    files
+        .patch(
+            &fixture.owner,
+            &workspace.id,
+            "cli/tests/cli.rs",
+            &patch,
+            Some(&test_source.sha256),
+        )
+        .await
+        .expect("test expectation update");
+
+    println!("updated cli/tests/cli.rs expectation");
+
     // ---- cargo check / test / build inside the workspace -----------------
     let (_, check_err) = run_job(
         &fixture,
@@ -425,6 +476,10 @@ async fn clipforge_development_inside_a_workspace() {
             "--offline".to_owned(),
             "-p".to_owned(),
             "clipforge-cli".to_owned(),
+            // The project's integration tests need media fixtures and a
+            // whisper-cli binary that are not part of the workspace image;
+            // library tests are the representative check here.
+            "--lib".to_owned(),
         ],
         Vec::new(),
     )

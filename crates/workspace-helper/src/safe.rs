@@ -194,6 +194,23 @@ impl SafeRoot {
         Ok((file, metadata))
     }
 
+    /// Mark a file executable, preserving an archive's execute bit.
+    #[cfg(unix)]
+    pub fn set_executable(&self, path: &str) -> Result<(), HelperError> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let permissions =
+            cap_std::fs::Permissions::from_std(std::fs::Permissions::from_mode(0o755));
+
+        self.dir.set_permissions(path, permissions).map_err(map_io)
+    }
+
+    /// Windows hosts only run this crate in unit tests; exec bits are a Unix concept.
+    #[cfg(not(unix))]
+    pub fn set_executable(&self, _path: &str) -> Result<(), HelperError> {
+        Ok(())
+    }
+
     /// Create a directory.
     pub fn mkdir(&self, path: &str, parents: bool) -> Result<(), HelperError> {
         helper::validate_relative_path(path)?;

@@ -184,6 +184,10 @@ fn extract_zip(
         extracted.entries += 1;
 
         root.write_unsynced(&target, &content, true, true)?;
+
+        if entry.unix_mode().is_some_and(|mode| mode & 0o111 != 0) {
+            root.set_executable(&target)?;
+        }
     }
 
     Ok(extracted)
@@ -269,6 +273,10 @@ fn extract_tar(
         extracted.entries += 1;
 
         root.write_unsynced(&target, &content, true, true)?;
+
+        if entry.header().mode().is_ok_and(|mode| mode & 0o111 != 0) {
+            root.set_executable(&target)?;
+        }
     }
 
     Ok(extracted)
