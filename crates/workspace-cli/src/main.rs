@@ -37,6 +37,9 @@ enum Command {
 
     /// Diagnose the local installation
     Doctor,
+
+    /// Start the Workspace HTTP server
+    Serve,
 }
 
 #[derive(Debug, Subcommand)]
@@ -91,6 +94,17 @@ fn run(cli: Cli) -> AppResult<ExitCode> {
             println!("Storage budget: {} MiB", config.resources.storage_mib);
             println!("Container mode: {:?}", config.workspace.default_mode);
             println!("Network mode: {:?}", config.network.default_mode);
+
+            Ok(ExitCode::SUCCESS)
+        }
+
+        Command::Serve => {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()?;
+
+            runtime.block_on(workspace_server::serve(config))?;
 
             Ok(ExitCode::SUCCESS)
         }
@@ -160,6 +174,12 @@ mod tests {
                 command: ConfigCommand::Check
             }
         ));
+    }
+
+    #[test]
+    fn parses_serve_command() {
+        let cli = Cli::try_parse_from(["workspace", "serve"]).unwrap();
+        assert!(matches!(cli.command, Command::Serve));
     }
 
     #[test]

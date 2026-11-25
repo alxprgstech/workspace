@@ -9,3 +9,12 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+axum.workspace = true
+tokio.workspace = true
+serde.workspace = true
+tracing.workspace = true
+workspace-core.workspace = true
+
+[dev-dependencies]
+tower.workspace = true
+serde_json.workspace = true

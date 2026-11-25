@@ -16,6 +16,11 @@ repository = "https://github.com/alxprgstech/workspace"
 authors = ["ALXPRGS"]
 
 [workspace.dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
+tower = { version = "0.5", features = ["util"] }
+serde_json = "1"
+workspace-server = { path = "crates/workspace-server" }
 serde = { version = "1", features = ["derive"] }
 toml = "0.9"
 thiserror = "2"

@@ -17,3 +17,5 @@ workspace-core.workspace = true
 clap.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+tokio.workspace = true
+workspace-server.workspace = true
