@@ -379,6 +379,85 @@ mod migration_tests {
         assert_eq!(count, 3);
     }
 
+    fn create_v2(data_dir: &Path) -> Connection {
+        let connection = create_v1(data_dir);
+
+        connection.execute_batch(MIGRATION_002).unwrap();
+
+        connection
+    }
+
+    #[test]
+    fn upgrades_v2_without_losing_auth_rows() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let connection = create_v2(dir.path());
+
+        connection
+            .execute_batch(
+                "INSERT INTO users
+                 (id, issuer, subject, role, is_enabled, created_at_unix, updated_at_unix)
+                 VALUES ('user-1', 'https://auth.example.com', 'subject-1', 'admin', 1, 1, 1);",
+            )
+            .unwrap();
+
+        drop(connection);
+
+        let info = initialize(dir.path()).unwrap();
+
+        assert_eq!(info.schema_version, SCHEMA_VERSION);
+        assert_eq!(info.instance_id, INSTANCE_ID);
+
+        let connection = open(dir.path()).unwrap();
+
+        let users: i64 = connection
+            .query_row("SELECT count(*) FROM users", [], |row| row.get(0))
+            .unwrap();
+
+        assert_eq!(users, 1);
+
+        let lease_columns: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('web_sessions')
+                 WHERE name = 'refresh_lease_id'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(lease_columns, 1);
+
+        // The lease identifier is unique while it exists and is free when NULL.
+        connection
+            .execute_batch(
+                "INSERT INTO web_sessions
+                 (handle_hash, user_id, client_id, csrf_hash, encrypted_tokens,
+                  created_at_unix, expires_at_unix, access_expires_at_unix)
+                 VALUES (randomblob(32), 'user-1', 'c', randomblob(32), x'03', 1, 100, 10),
+                        (randomblob(32), 'user-1', 'c', randomblob(32), x'04', 1, 100, 10);
+
+                 UPDATE web_sessions
+                 SET refresh_lease_id = x'00000000000000000000000000000001'
+                 WHERE rowid = 1;",
+            )
+            .unwrap();
+
+        // A lease identifier can only belong to one session at a time.
+        let duplicate = connection.execute(
+            "UPDATE web_sessions
+             SET refresh_lease_id = x'00000000000000000000000000000001'
+             WHERE rowid = 2",
+            [],
+        );
+
+        assert!(duplicate.is_err());
+
+        // Released leases are free again, so many rows can hold NULL.
+        connection
+            .execute_batch("UPDATE web_sessions SET refresh_lease_id = NULL;")
+            .unwrap();
+    }
+
     #[test]
     fn failed_migration_rolls_back_schema_changes() {
         let dir = tempfile::tempdir().unwrap();
