@@ -137,19 +137,33 @@ fn migrate(connection: &mut Connection) -> Result<(), StorageError> {
 }
 
 fn read_info(connection: &Connection) -> Result<StorageInfo, StorageError> {
+    read_info_versioned(connection, false)
+}
+
+/// Read storage metadata.
+///
+/// `allow_outdated` exists for read-only diagnostics: a database created by an
+/// older build is migratable, not broken, so `doctor` must be able to report it
+/// instead of failing before the server has had a chance to migrate it.
+fn read_info_versioned(
+    connection: &Connection,
+    allow_outdated: bool,
+) -> Result<StorageInfo, StorageError> {
     if application_id(connection)? != APPLICATION_ID {
         return Err(StorageError::ForeignDatabase);
     }
 
     let version = schema_version(connection)?;
 
-    if version != SCHEMA_VERSION {
+    if version > SCHEMA_VERSION || (version != SCHEMA_VERSION && !allow_outdated) {
         return Err(StorageError::UnsupportedSchema(version));
     }
 
     let journal_mode: String = connection.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
 
-    if journal_mode != "wal" {
+    // Diagnostics report the mode instead of failing: a writable open()
+    // switches the database to WAL on the next server start anyway.
+    if journal_mode != "wal" && !allow_outdated {
         return Err(StorageError::WalUnavailable);
     }
 
@@ -221,7 +235,7 @@ pub fn inspect(data_dir: &Path) -> Result<Option<StorageInfo>, StorageError> {
 
     connection.busy_timeout(Duration::from_secs(5))?;
 
-    let info = read_info(&connection)?;
+    let info = read_info_versioned(&connection, true)?;
 
     let integrity: String = connection.query_row("PRAGMA quick_check(1)", [], |row| row.get(0))?;
 
@@ -456,6 +470,31 @@ mod migration_tests {
         connection
             .execute_batch("UPDATE web_sessions SET refresh_lease_id = NULL;")
             .unwrap();
+    }
+
+    #[test]
+    fn inspect_reports_a_migratable_database() {
+        let dir = tempfile::tempdir().unwrap();
+
+        drop(create_v2(dir.path()));
+
+        // Read-only diagnostics must not fail before the server migrates.
+        let info = inspect(dir.path()).unwrap().expect("database exists");
+
+        assert_eq!(info.schema_version, 2);
+        assert_eq!(info.instance_id, INSTANCE_ID);
+
+        // A newer schema stays an error: this build cannot read it.
+        let connection = Connection::open(database_path(dir.path())).unwrap();
+        connection
+            .execute_batch("PRAGMA user_version = 999;")
+            .unwrap();
+        drop(connection);
+
+        assert!(matches!(
+            inspect(dir.path()),
+            Err(StorageError::UnsupportedSchema(999))
+        ));
     }
 
     #[test]

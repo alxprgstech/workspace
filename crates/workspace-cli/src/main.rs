@@ -7,6 +7,7 @@ use workspace_core::{
     PRODUCT_NAME, VERSION,
     config::{Config, LogLevel},
 };
+use workspace_runtime::RuntimeProbe;
 
 type AppResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -247,8 +248,16 @@ fn run(cli: Cli) -> AppResult<ExitCode> {
                 Some(storage) => {
                     println!("[OK] SQLite {}", storage.sqlite_version);
                     println!("[OK] Database integrity");
-                    println!("[OK] Schema version: {}", storage.schema_version);
-                    println!("[OK] Journal mode: {}", storage.journal_mode);
+                    if storage.schema_version == workspace_server::storage::SCHEMA_VERSION {
+                        println!("[OK] Schema version: {}", storage.schema_version);
+                    } else {
+                        println!(
+                            "[PENDING] Schema version: {} (migrates to {} on server start)",
+                            storage.schema_version,
+                            workspace_server::storage::SCHEMA_VERSION
+                        );
+                    }
+                    println!("[INFO] Journal mode: {}", storage.journal_mode);
                     println!("[INFO] Instance ID: {}", storage.instance_id);
                 }
                 None => {
@@ -256,7 +265,12 @@ fn run(cli: Cli) -> AppResult<ExitCode> {
                 }
             }
 
-            println!("[PENDING] Docker runtime");
+            let facts = workspace_runtime::SystemProbe.facts();
+
+            match workspace_runtime::evaluate(&facts) {
+                Ok(kind) => println!("[OK] Container runtime: {kind:?}"),
+                Err(issue) => println!("[PENDING] Container runtime: {}", issue.reason()),
+            }
             println!("[PENDING] Resource isolation");
             println!("[PENDING] Storage quotas");
             println!("[PENDING] Network isolation");

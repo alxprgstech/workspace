@@ -6,6 +6,10 @@
 //! The evaluation is a pure function over observed facts so the fail-closed
 //! rules can be tested without touching a host runtime.
 
+mod probe;
+
+pub use probe::{RuntimeProbe, SystemProbe};
+
 /// Host family that determines which runtime shape is acceptable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Platform {
@@ -38,6 +42,10 @@ pub struct RuntimeFacts {
     pub docker_rootless: Option<bool>,
     /// Whether the engine would grant privileged containers by default.
     pub docker_privileged_default: bool,
+    /// Whether the engine was actually queried, rather than merely found on
+    /// the PATH. Static discovery can never prove isolation, so it leaves this
+    /// false and readiness stays closed.
+    pub engine_verified: bool,
 }
 
 /// Why a host cannot host Workspace workspaces yet.
@@ -53,6 +61,8 @@ pub enum RuntimeIssue {
     RootlessUnknown,
     /// An engine that grants privileged containers is never acceptable.
     PrivilegedContainersAllowed,
+    /// The engine was not queried directly, so its policies are unproven.
+    EngineNotVerified,
 }
 
 impl RuntimeIssue {
@@ -73,6 +83,9 @@ impl RuntimeIssue {
             Self::PrivilegedContainersAllowed => {
                 "the Docker Engine permits privileged containers; isolation cannot be guaranteed"
             }
+            Self::EngineNotVerified => {
+                "the Docker Engine has not been queried directly; isolation is unproven"
+            }
         }
     }
 }
@@ -85,7 +98,7 @@ pub fn evaluate(facts: &RuntimeFacts) -> Result<RuntimeKind, RuntimeIssue> {
         return Err(RuntimeIssue::PrivilegedContainersAllowed);
     }
 
-    match facts.platform {
+    let kind = match facts.platform {
         Platform::Windows => {
             if facts.wsl2_available != Some(true) {
                 return Err(RuntimeIssue::Wsl2Missing);
@@ -102,7 +115,7 @@ pub fn evaluate(facts: &RuntimeFacts) -> Result<RuntimeKind, RuntimeIssue> {
                 return Err(RuntimeIssue::RootfulDocker);
             }
 
-            Ok(RuntimeKind::Wsl2)
+            RuntimeKind::Wsl2
         }
         Platform::Linux => {
             if !facts.docker_present {
@@ -110,13 +123,20 @@ pub fn evaluate(facts: &RuntimeFacts) -> Result<RuntimeKind, RuntimeIssue> {
             }
 
             match facts.docker_rootless {
-                Some(true) => Ok(RuntimeKind::RootlessDocker),
-                Some(false) => Err(RuntimeIssue::RootfulDocker),
-                None => Err(RuntimeIssue::RootlessUnknown),
+                Some(true) => RuntimeKind::RootlessDocker,
+                Some(false) => return Err(RuntimeIssue::RootfulDocker),
+                None => return Err(RuntimeIssue::RootlessUnknown),
             }
         }
-        Platform::Other => Err(RuntimeIssue::UnsupportedPlatform),
+        Platform::Other => return Err(RuntimeIssue::UnsupportedPlatform),
+    };
+
+    // Static discovery can describe an engine but never prove its policies.
+    if !facts.engine_verified {
+        return Err(RuntimeIssue::EngineNotVerified);
     }
+
+    Ok(kind)
 }
 
 #[cfg(test)]
@@ -130,6 +150,7 @@ mod tests {
             docker_present: false,
             docker_rootless: None,
             docker_privileged_default: false,
+            engine_verified: false,
         }
     }
 
@@ -146,6 +167,9 @@ mod tests {
         assert_eq!(evaluate(&host), Err(RuntimeIssue::DockerMissing));
 
         host.docker_present = true;
+        assert_eq!(evaluate(&host), Err(RuntimeIssue::EngineNotVerified));
+
+        host.engine_verified = true;
         assert_eq!(evaluate(&host), Ok(RuntimeKind::Wsl2));
 
         host.docker_rootless = Some(false);
@@ -167,6 +191,9 @@ mod tests {
         assert_eq!(evaluate(&host), Err(RuntimeIssue::RootfulDocker));
 
         host.docker_rootless = Some(true);
+        assert_eq!(evaluate(&host), Err(RuntimeIssue::EngineNotVerified));
+
+        host.engine_verified = true;
         assert_eq!(evaluate(&host), Ok(RuntimeKind::RootlessDocker));
     }
 
@@ -179,6 +206,7 @@ mod tests {
                 docker_present: true,
                 docker_rootless: Some(true),
                 docker_privileged_default: true,
+                engine_verified: true,
             };
 
             assert_eq!(
@@ -197,6 +225,7 @@ mod tests {
             docker_present: true,
             docker_rootless: Some(true),
             docker_privileged_default: false,
+            engine_verified: true,
         };
 
         assert_eq!(evaluate(&host), Err(RuntimeIssue::UnsupportedPlatform));

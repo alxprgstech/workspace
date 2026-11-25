@@ -3096,6 +3096,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "workspace-core",
+ "workspace-runtime",
  "workspace-server",
 ]
 

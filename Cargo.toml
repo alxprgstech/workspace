@@ -36,6 +36,7 @@ clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
 workspace-core = { path = "crates/workspace-core" }
+workspace-runtime = { path = "crates/workspace-runtime" }
 
 [profile.release]
 opt-level = 3
