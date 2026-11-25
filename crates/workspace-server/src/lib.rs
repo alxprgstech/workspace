@@ -6,6 +6,8 @@ use axum::{Json, Router, extract::State, http::StatusCode, routing::get};
 #[cfg(feature = "web-ui")]
 mod web;
 
+pub mod auth_store;
+pub mod crypto;
 pub mod sso;
 pub mod storage;
 
@@ -235,7 +237,7 @@ mod tests {
         assert_eq!(body["api_version"], "v1");
         assert_eq!(body["runtime_ready"], false);
         assert_eq!(body["resources"]["cpu_millis"], 2000);
-        assert_eq!(body["storage"]["schema_version"], 1);
+        assert_eq!(body["storage"]["schema_version"], storage::SCHEMA_VERSION);
         assert_eq!(body["storage"]["journal_mode"], "wal");
 
         assert!(uuid::Uuid::parse_str(body["storage"]["instance_id"].as_str().unwrap()).is_ok());

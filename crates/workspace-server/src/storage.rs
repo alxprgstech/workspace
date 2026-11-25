@@ -8,12 +8,13 @@ use std::{
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 const APPLICATION_ID: i64 = 0x414C5857;
 const MIN_SQLITE_VERSION: i32 = 3_051_003;
 
 const MIGRATION_001: &str = include_str!("../migrations/0001_initial.sql");
+const MIGRATION_002: &str = include_str!("../migrations/0002_auth.sql");
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct StorageInfo {
@@ -116,9 +117,13 @@ fn migrate(connection: &mut Connection) -> Result<(), StorageError> {
             return Err(StorageError::ForeignDatabase);
         }
 
-        if version != SCHEMA_VERSION {
+        if version > SCHEMA_VERSION {
             return Err(StorageError::UnsupportedSchema(version));
         }
+    }
+
+    if version < 2 {
+        tx.execute_batch(MIGRATION_002)?;
     }
 
     tx.commit()?;
@@ -184,6 +189,18 @@ pub fn initialize(data_dir: &Path) -> Result<StorageInfo, StorageError> {
     }
 
     read_info(&connection)
+}
+
+pub(crate) fn open(data_dir: &Path) -> Result<Connection, StorageError> {
+    check_sqlite_version()?;
+
+    let connection =
+        Connection::open_with_flags(database_path(data_dir), OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+
+    configure(&connection)?;
+    read_info(&connection)?;
+
+    Ok(connection)
 }
 
 pub fn inspect(data_dir: &Path) -> Result<Option<StorageInfo>, StorageError> {
@@ -302,5 +319,92 @@ mod tests {
             initialize(dir.path()),
             Err(StorageError::UnsupportedSchema(999))
         ));
+    }
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+
+    const INSTANCE_ID: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn create_v1(data_dir: &Path) -> Connection {
+        fs::create_dir_all(data_dir.join("state")).unwrap();
+
+        let connection = Connection::open(database_path(data_dir)).unwrap();
+
+        configure(&connection).unwrap();
+        connection.execute_batch(MIGRATION_001).unwrap();
+
+        connection
+            .execute(
+                "INSERT INTO instances
+             (singleton, instance_id, created_at_unix)
+             VALUES (1, ?1, unixepoch())",
+                params![INSTANCE_ID],
+            )
+            .unwrap();
+
+        connection
+    }
+
+    #[test]
+    fn upgrades_v1_preserving_instance_identity() {
+        let dir = tempfile::tempdir().unwrap();
+
+        drop(create_v1(dir.path()));
+
+        let info = initialize(dir.path()).unwrap();
+
+        assert_eq!(info.schema_version, 2);
+        assert_eq!(info.instance_id, INSTANCE_ID);
+
+        let connection = open(dir.path()).unwrap();
+
+        let count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema
+             WHERE type = 'table'
+             AND name IN ('users', 'auth_flows', 'web_sessions')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn failed_migration_rolls_back_schema_changes() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let connection = create_v1(dir.path());
+
+        connection
+            .execute_batch(
+                "CREATE TABLE web_sessions (
+                id INTEGER PRIMARY KEY
+            );",
+            )
+            .unwrap();
+
+        drop(connection);
+
+        assert!(initialize(dir.path()).is_err());
+
+        let connection = Connection::open(database_path(dir.path())).unwrap();
+
+        assert_eq!(schema_version(&connection).unwrap(), 1);
+
+        let count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema
+             WHERE name IN ('users', 'auth_flows')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(count, 0);
     }
 }
