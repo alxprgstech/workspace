@@ -247,6 +247,24 @@ pub async fn delete(
     }
 }
 
+/// Read-only capability catalog for the web panel.
+pub async fn capabilities(
+    State(state): State<AppState>,
+    extension: Option<Extension<Arc<SessionInfo>>>,
+) -> Response {
+    if let Err(response) = session(extension) {
+        return response;
+    }
+
+    let runtime = state.runtime.status().await;
+
+    Json(crate::mcp::capabilities_catalog(
+        state.storage.schema_version,
+        &runtime,
+    ))
+    .into_response()
+}
+
 pub async fn runtime_status(
     State(state): State<AppState>,
     extension: Option<Extension<Arc<SessionInfo>>>,

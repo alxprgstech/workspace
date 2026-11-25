@@ -6,6 +6,7 @@ import {
   CheckCircle2,
   Cpu,
   Database,
+  File as FileIcon,
   Folder,
   HardDrive,
   LayoutDashboard,
@@ -13,7 +14,6 @@ import {
   LogOut,
   MemoryStick,
   Moon,
-  Plug,
   RefreshCw,
   Settings,
   ShieldAlert,
@@ -25,18 +25,27 @@ import {
   ApiError,
   loadDashboard,
   loadSession,
+  listWorkspaces,
   logout,
   type DashboardData,
   type SessionInfo,
+  type Workspace,
 } from './api'
+import {
+  ArtifactsSection,
+  FilesSection,
+  JobsSection,
+  SettingsSection,
+  WorkspacesSection,
+} from './sections'
 
 const sections = [
-  { name: 'Dashboard', icon: LayoutDashboard, enabled: true },
-  { name: 'Workspaces', icon: Folder, enabled: false },
-  { name: 'Jobs', icon: Terminal, enabled: false },
-  { name: 'Artifacts', icon: Database, enabled: false },
-  { name: 'Integrations', icon: Plug, enabled: false },
-  { name: 'Settings', icon: Settings, enabled: false },
+  { id: 'dashboard', name: 'Dashboard', icon: LayoutDashboard },
+  { id: 'workspaces', name: 'Workspaces', icon: Folder },
+  { id: 'jobs', name: 'Jobs', icon: Terminal },
+  { id: 'files', name: 'Files', icon: FileIcon },
+  { id: 'artifacts', name: 'Artifacts', icon: Database },
+  { id: 'settings', name: 'Settings', icon: Settings },
 ]
 
 type Phase = 'checking' | 'anonymous' | 'unavailable' | 'error' | 'authenticated'
@@ -131,6 +140,9 @@ function App() {
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
   const [revision, setRevision] = useState(0)
+  const [section, setSection] = useState('dashboard')
+  const [workspaces, setWorkspaces] = useState<Workspace[]>([])
+  const [workspaceError, setWorkspaceError] = useState<string | null>(null)
 
   useEffect(() => {
     document.documentElement.dataset.theme = dark ? 'dark' : 'light'
@@ -281,6 +293,25 @@ function App() {
     }
   }, [])
 
+  const refreshWorkspaces = useCallback(() => {
+    listWorkspaces()
+      .then(next => {
+        setWorkspaces(next)
+        setWorkspaceError(null)
+      })
+      .catch((reason: unknown) => {
+        setWorkspaceError(
+          reason instanceof Error ? reason.message : 'Cannot load workspaces',
+        )
+      })
+  }, [])
+
+  useEffect(() => {
+    if (phase === 'authenticated') {
+      refreshWorkspaces()
+    }
+  }, [phase, refreshWorkspaces])
+
   const themeButton = (
     <ThemeButton dark={dark} onToggle={() => setDark(value => !value)} />
   )
@@ -403,16 +434,15 @@ function App() {
         <div className="nav-heading">MANAGEMENT</div>
 
         <nav aria-label="Main navigation">
-          {sections.map(section => (
+          {sections.map(entry => (
             <button
-              key={section.name}
-              className={`nav-item ${section.enabled ? 'active' : ''}`}
-              disabled={!section.enabled}
-              aria-current={section.enabled ? 'page' : undefined}
-              title={!section.enabled ? 'Not implemented yet' : undefined}
+              key={entry.id}
+              className={`nav-item ${section === entry.id ? 'active' : ''}`}
+              aria-current={section === entry.id ? 'page' : undefined}
+              onClick={() => setSection(entry.id)}
             >
-              <section.icon size={19} />
-              <span>{section.name}</span>
+              <entry.icon size={19} />
+              <span>{entry.name}</span>
             </button>
           ))}
         </nav>
@@ -424,7 +454,7 @@ function App() {
 
       <main className="main">
         <header className="topbar">
-          <div className="breadcrumb">Workspace / Dashboard</div>
+          <div className="breadcrumb">Workspace / {sections.find(entry => entry.id === section)?.name}</div>
 
           <div className="actions">
             <div className="user-chip" title={session.user.issuer}>
@@ -468,8 +498,15 @@ function App() {
         <section className="content">
           <div className="page-heading">
             <div>
-              <h1>Dashboard</h1>
-              <p>Server overview and configured resource limits.</p>
+              <h1>{sections.find(entry => entry.id === section)?.name}</h1>
+              <p>
+                {section === 'dashboard' && 'Server overview and configured resource limits.'}
+                {section === 'workspaces' && 'Isolated execution workspaces, quotas and lifetimes.'}
+                {section === 'jobs' && 'Command execution and captured output.'}
+                {section === 'files' && 'Browse, edit and upload workspace files.'}
+                {section === 'artifacts' && 'Published immutable results and download links.'}
+                {section === 'settings' && 'Runtime diagnostics and capability catalog.'}
+              </p>
             </div>
 
             {data && (
@@ -480,6 +517,17 @@ function App() {
             )}
           </div>
 
+          {workspaceError && section !== 'dashboard' && (
+            <div className="notice error" role="alert">
+              <AlertCircle size={20} />
+              <div>
+                <strong>Cannot load workspaces</strong>
+                <p>{workspaceError}</p>
+              </div>
+            </div>
+          )}
+
+          {section === 'dashboard' && (<>
           {signOutError && (
             <div className="notice error" role="alert">
               <ShieldAlert size={20} />
@@ -577,6 +625,36 @@ function App() {
               </section>
             </>
           )}
+          </>)}
+
+          {section === 'workspaces' && (
+            <WorkspacesSection
+              workspaces={workspaces}
+              refreshWorkspaces={refreshWorkspaces}
+            />
+          )}
+
+          {section === 'jobs' && (
+            <JobsSection
+              workspaces={workspaces}
+              refreshWorkspaces={refreshWorkspaces}
+            />
+          )}
+
+          {section === 'files' && (
+            <FilesSection
+              workspaces={workspaces}
+              refreshWorkspaces={refreshWorkspaces}
+              onPublished={() => setSection('artifacts')}
+            />
+          )}
+
+          {section === 'artifacts' && (
+            <ArtifactsSection onChanged={refreshWorkspaces} />
+          )}
+
+          {section === 'settings' && <SettingsSection />}
+
         </section>
       </main>
     </div>

@@ -46,6 +46,14 @@ impl GatewayServices {
     }
 }
 
+/// Capability catalog shared with the web panel.
+pub fn capabilities_catalog(
+    schema_version: u32,
+    runtime: &workspace_runtime::status::RuntimeStatus,
+) -> serde_json::Value {
+    tools::capabilities_catalog(schema_version, runtime)
+}
+
 /// Path an MCP client connects to.
 pub const MCP_ENDPOINT: &str = "/chatgpt/mcp";
 

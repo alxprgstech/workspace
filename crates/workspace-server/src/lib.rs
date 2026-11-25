@@ -302,6 +302,7 @@ fn router_with_runtime(
         .route("/ready", get(ready))
         .route("/api/v1/server/info", get(server_info))
         .route("/api/v1/runtime", get(http_workspaces::runtime_status))
+        .route("/api/v1/capabilities", get(http_workspaces::capabilities))
         .route(
             "/api/v1/workspaces",
             get(http_workspaces::list).post(http_workspaces::create),
