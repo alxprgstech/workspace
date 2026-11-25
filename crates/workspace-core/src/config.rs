@@ -15,6 +15,8 @@ pub struct Config {
     pub workspace: WorkspaceConfig,
     pub network: NetworkConfig,
     pub logging: LoggingConfig,
+    #[serde(default)]
+    pub sso: Option<SsoConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -86,6 +88,14 @@ pub enum LogLevel {
 #[serde(deny_unknown_fields)]
 pub struct LoggingConfig {
     pub level: LogLevel,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SsoConfig {
+    pub issuer: String,
+    pub client_id: String,
+    pub redirect_uri: String,
 }
 
 #[derive(Debug, Error)]

@@ -35,6 +35,9 @@ enum Command {
         command: ConfigCommand,
     },
 
+    /// Validate ALXPRGS SSO discovery and signing keys
+    SsoCheck,
+
     /// Diagnose the local installation
     Doctor,
 
@@ -105,6 +108,31 @@ fn run(cli: Cli) -> AppResult<ExitCode> {
                 .build()?;
 
             runtime.block_on(workspace_server::serve(config))?;
+
+            Ok(ExitCode::SUCCESS)
+        }
+
+        Command::SsoCheck => {
+            let sso = config.sso.as_ref().ok_or(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "SSO is not configured",
+            ))?;
+
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+
+            let client = runtime.block_on(workspace_server::sso::SsoClient::discover(sso))?;
+
+            println!("[OK] SSO discovery");
+            println!("[OK] Trusted HTTPS endpoints");
+            println!("[OK] Authorization Code");
+            println!("[OK] PKCE S256");
+            println!("[OK] RS256");
+            println!("[OK] JWKS: {} keys", client.signing_key_count());
+            println!("[INFO] Issuer: {}", sso.issuer);
+            println!("[INFO] Client ID: {}", sso.client_id);
+            println!("[INFO] Redirect URI: {}", sso.redirect_uri);
 
             Ok(ExitCode::SUCCESS)
         }

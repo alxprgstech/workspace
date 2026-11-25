@@ -26,3 +26,10 @@ allowlist = []
 
 [logging]
 level = "info"
+
+# Optional ALXPRGS SSO configuration:
+#
+# [sso]
+# issuer = "https://auth.alxprgs.tech"
+# client_id = "your-client-id"
+# redirect_uri = "https://workspace.example.com/auth/callback"

@@ -6,6 +6,7 @@ use axum::{Json, Router, extract::State, http::StatusCode, routing::get};
 #[cfg(feature = "web-ui")]
 mod web;
 
+pub mod sso;
 pub mod storage;
 
 use serde::Serialize;
