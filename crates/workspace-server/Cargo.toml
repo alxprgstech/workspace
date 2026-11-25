@@ -13,6 +13,9 @@ default = []
 web-ui = ["dep:rust-embed", "dep:mime_guess"]
 
 [dependencies]
+rusqlite.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
 rust-embed = { workspace = true, optional = true }
 mime_guess = { workspace = true, optional = true }
 axum.workspace = true
@@ -22,5 +25,6 @@ tracing.workspace = true
 workspace-core.workspace = true
 
 [dev-dependencies]
+tempfile.workspace = true
 tower.workspace = true
 serde_json.workspace = true

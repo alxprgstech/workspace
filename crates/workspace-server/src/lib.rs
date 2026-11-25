@@ -6,6 +6,8 @@ use axum::{Json, Router, extract::State, http::StatusCode, routing::get};
 #[cfg(feature = "web-ui")]
 mod web;
 
+pub mod storage;
+
 use serde::Serialize;
 use std::io;
 use tokio::net::TcpListener;
@@ -41,6 +43,7 @@ struct ServerInfo {
     architecture: &'static str,
     runtime_ready: bool,
     resources: ResourceBudget,
+    storage: storage::StorageInfo,
 }
 
 async fn health() -> Json<HealthResponse> {
@@ -62,7 +65,7 @@ async fn server_info(State(info): State<ServerInfo>) -> Json<ServerInfo> {
     Json(info)
 }
 
-fn router(config: &Config) -> Router {
+fn router(config: &Config, storage: storage::StorageInfo) -> Router {
     let info = ServerInfo {
         product: PRODUCT_NAME,
         version: VERSION,
@@ -70,6 +73,7 @@ fn router(config: &Config) -> Router {
         platform: std::env::consts::OS,
         architecture: std::env::consts::ARCH,
         runtime_ready: false,
+        storage,
         resources: ResourceBudget {
             cpu_millis: config.resources.cpu_millis,
             memory_mib: config.resources.memory_mib,
@@ -101,6 +105,21 @@ pub async fn serve(config: Config) -> io::Result<()> {
 
     let listener = TcpListener::bind(config.server.listen).await?;
     let address = listener.local_addr()?;
+
+    let data_dir = config.storage.data_dir.clone();
+
+    let storage = tokio::task::spawn_blocking(move || storage::initialize(&data_dir))
+        .await
+        .map_err(io::Error::other)?
+        .map_err(io::Error::other)?;
+
+    tracing::info!(
+        instance_id = %storage.instance_id,
+        schema_version = storage.schema_version,
+        sqlite_version = %storage.sqlite_version,
+        journal_mode = %storage.journal_mode,
+        "SQLite storage initialized"
+    );
 
     #[cfg(unix)]
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -136,7 +155,7 @@ pub async fn serve(config: Config) -> io::Result<()> {
 
     tracing::warn!("Execution runtime is not ready");
 
-    axum::serve(listener, router(&config))
+    axum::serve(listener, router(&config, storage))
         .with_graceful_shutdown(shutdown)
         .await?;
 
@@ -161,7 +180,10 @@ mod tests {
     }
 
     async fn request(method: Method, path: &str) -> Response {
-        router(&config())
+        let dir = tempfile::tempdir().unwrap();
+        let storage = storage::initialize(dir.path()).unwrap();
+
+        router(&config(), storage)
             .oneshot(
                 Request::builder()
                     .method(method)
@@ -212,6 +234,10 @@ mod tests {
         assert_eq!(body["api_version"], "v1");
         assert_eq!(body["runtime_ready"], false);
         assert_eq!(body["resources"]["cpu_millis"], 2000);
+        assert_eq!(body["storage"]["schema_version"], 1);
+        assert_eq!(body["storage"]["journal_mode"], "wal");
+
+        assert!(uuid::Uuid::parse_str(body["storage"]["instance_id"].as_str().unwrap()).is_ok());
     }
 
     #[tokio::test]

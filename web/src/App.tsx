@@ -229,6 +229,20 @@ function App() {
                   <dd>
                     {data.readiness.runtime_ready ? 'Ready' : 'Not ready'}
                   </dd>
+                  <dt>Instance ID</dt>
+                  <dd>{data.info.storage.instance_id}</dd>
+                  <dt>SQLite version</dt>
+                  <dd>{data.info.storage.sqlite_version}</dd>
+                  <dt>Database schema</dt>
+                  <dd>{data.info.storage.schema_version}</dd>
+                  <dt>Journal mode</dt>
+                  <dd>{data.info.storage.journal_mode.toUpperCase()}</dd>
+                  <dt>Instance created</dt>
+                  <dd>
+                    {new Date(
+                      data.info.storage.created_at_unix * 1000,
+                    ).toLocaleString()}
+                  </dd>
                   <dt>Maximum active workspaces</dt>
                   <dd>{data.info.resources.max_active_workspaces}</dd>
                 </dl>

@@ -126,6 +126,19 @@ fn run(cli: Cli) -> AppResult<ExitCode> {
                 return Ok(ExitCode::FAILURE);
             }
 
+            match workspace_server::storage::inspect(&config.storage.data_dir)? {
+                Some(storage) => {
+                    println!("[OK] SQLite {}", storage.sqlite_version);
+                    println!("[OK] Database integrity");
+                    println!("[OK] Schema version: {}", storage.schema_version);
+                    println!("[OK] Journal mode: {}", storage.journal_mode);
+                    println!("[INFO] Instance ID: {}", storage.instance_id);
+                }
+                None => {
+                    println!("[PENDING] Database is not initialized");
+                }
+            }
+
             println!("[PENDING] Docker runtime");
             println!("[PENDING] Resource isolation");
             println!("[PENDING] Storage quotas");

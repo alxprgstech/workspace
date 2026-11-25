@@ -6,7 +6,16 @@ export interface ResourceBudget {
   max_concurrent_jobs: number
 }
 
+export interface StorageInfo {
+  instance_id: string
+  schema_version: number
+  sqlite_version: string
+  journal_mode: string
+  created_at_unix: number
+}
+
 export interface ServerInfo {
+  storage: StorageInfo
   product: string
   version: string
   api_version: string
