@@ -29,5 +29,7 @@ tracing.workspace = true
 workspace-core.workspace = true
 
 [dev-dependencies]
+rsa = { version = "0.9", features = ["sha2"] }
+rand = "0.8"
 tempfile.workspace = true
 tower.workspace = true

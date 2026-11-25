@@ -13,6 +13,11 @@ use thiserror::Error;
 use uuid::Uuid;
 use workspace_core::config::SsoConfig;
 
+#[path = "sso_exchange.rs"]
+mod exchange;
+
+pub use exchange::{LoginResult, SessionTokens};
+
 const ISSUER: &str = "https://auth.alxprgs.tech";
 const DISCOVERY_URL: &str = "https://auth.alxprgs.tech/.well-known/openid-configuration";
 const AUTHORIZATION_URL: &str = "https://auth.alxprgs.tech/oauth/authorize";
@@ -88,6 +93,7 @@ pub struct AuthorizationRequest {
 pub struct VerifiedIdentity {
     pub issuer: String,
     pub subject: String,
+    pub expires_at_unix: i64,
 }
 
 pub struct SsoClient {
@@ -245,6 +251,17 @@ impl SsoClient {
         raw_token: &str,
         expected_nonce: &str,
     ) -> Result<VerifiedIdentity, SsoError> {
+        self.verify_login_token(raw_token, expected_nonce, None)
+    }
+
+    fn verify_login_token(
+        &self,
+        raw_token: &str,
+        expected_nonce: &str,
+        access_token: Option<&str>,
+    ) -> Result<VerifiedIdentity, SsoError> {
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+
         if raw_token.len() > 16_384 || expected_nonce.is_empty() {
             return Err(SsoError::InvalidToken);
         }
@@ -271,6 +288,30 @@ impl SsoClient {
             return Err(SsoError::InvalidToken);
         }
 
+        let now = exchange::unix_now()?;
+        let issued_at = claims.issue_time().timestamp();
+
+        if issued_at > now + 30
+            || issued_at < now - 660
+            || claims
+                .authorized_party()
+                .is_some_and(|party| party.as_str() != self.config.client_id)
+        {
+            return Err(SsoError::InvalidToken);
+        }
+
+        if let Some(expected) = claims.access_token_hash() {
+            let access_token = access_token.ok_or(SsoError::InvalidToken)?;
+
+            let hash = ring::digest::digest(&ring::digest::SHA256, access_token.as_bytes());
+
+            let actual = URL_SAFE_NO_PAD.encode(&hash.as_ref()[..16]);
+
+            if actual != expected.as_str() {
+                return Err(SsoError::InvalidToken);
+            }
+        }
+
         let subject = claims.subject().as_str();
 
         if Uuid::parse_str(subject).map_or(true, |uuid| uuid.is_nil()) {
@@ -280,6 +321,7 @@ impl SsoClient {
         Ok(VerifiedIdentity {
             issuer: self.config.issuer.clone(),
             subject: subject.to_owned(),
+            expires_at_unix: claims.expiration().timestamp(),
         })
     }
 }
@@ -359,5 +401,132 @@ mod tests {
             client.verify_id_token("not-a-token", "test-nonce"),
             Err(SsoError::InvalidToken)
         ));
+    }
+}
+
+#[cfg(test)]
+mod signed_token_tests {
+    use super::*;
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    use rsa::{
+        RsaPrivateKey,
+        pkcs1v15::SigningKey,
+        sha2::Sha256,
+        signature::{SignatureEncoding, Signer},
+        traits::PublicKeyParts,
+    };
+    use serde_json::{Value, json};
+
+    fn sign(key: &SigningKey<Sha256>, claims: &Value) -> String {
+        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","typ":"JWT","kid":"test-key"}"#);
+
+        let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(claims).unwrap());
+
+        let message = format!("{header}.{payload}");
+
+        let signature = key.sign(message.as_bytes());
+        let signature = URL_SAFE_NO_PAD.encode(signature.to_bytes());
+
+        format!("{message}.{signature}")
+    }
+
+    #[test]
+    fn verifies_signed_tokens_and_rejects_invalid_claims() {
+        let private = RsaPrivateKey::new(&mut rand::rngs::OsRng, 2048).unwrap();
+
+        let jwks = json!({
+            "keys": [{
+                "kty": "RSA",
+                "kid": "test-key",
+                "use": "sig",
+                "alg": "RS256",
+                "n": URL_SAFE_NO_PAD.encode(
+                    private.n().to_bytes_be()
+                ),
+                "e": URL_SAFE_NO_PAD.encode(
+                    private.e().to_bytes_be()
+                )
+            }]
+        });
+
+        let signing_key = SigningKey::<Sha256>::new(private);
+
+        let client = SsoClient {
+            config: SsoConfig {
+                issuer: ISSUER.to_owned(),
+                client_id: "test-client".to_owned(),
+                redirect_uri: "https://workspace.example.com/auth/callback".to_owned(),
+            },
+            jwks: serde_json::from_value(jwks).unwrap(),
+        };
+
+        let now = exchange::unix_now().unwrap();
+
+        let claims = json!({
+            "iss": ISSUER,
+            "aud": "test-client",
+            "sub": "550e8400-e29b-41d4-a716-446655440000",
+            "iat": now,
+            "exp": now + 300,
+            "nonce": "test-nonce",
+            "token_use": "id_token"
+        });
+
+        let valid = sign(&signing_key, &claims);
+
+        let identity = client.verify_id_token(&valid, "test-nonce").unwrap();
+
+        assert_eq!(identity.subject, "550e8400-e29b-41d4-a716-446655440000");
+
+        assert!(client.verify_id_token(&valid, "wrong-nonce").is_err());
+
+        for (field, value) in [
+            ("iss", json!("https://other.example.com")),
+            ("aud", json!("another-client")),
+            ("exp", json!(now - 1)),
+            ("iat", json!(now + 600)),
+            ("token_use", json!("access_token")),
+            ("azp", json!("another-client")),
+        ] {
+            let mut invalid = claims.clone();
+            invalid[field] = value;
+
+            let token = sign(&signing_key, &invalid);
+
+            assert!(
+                client.verify_id_token(&token, "test-nonce").is_err(),
+                "accepted invalid claim: {field}"
+            );
+        }
+
+        let (message, signature) = valid.rsplit_once('.').unwrap();
+
+        let mut signature = URL_SAFE_NO_PAD.decode(signature).unwrap();
+
+        signature[0] ^= 1;
+
+        let corrupted = format!("{message}.{}", URL_SAFE_NO_PAD.encode(signature));
+
+        assert!(client.verify_id_token(&corrupted, "test-nonce").is_err());
+
+        let mut bound = claims.clone();
+
+        let digest = ring::digest::digest(&ring::digest::SHA256, b"test-access");
+
+        bound["at_hash"] = json!(URL_SAFE_NO_PAD.encode(&digest.as_ref()[..16]));
+
+        let token = sign(&signing_key, &bound);
+
+        assert!(
+            client
+                .verify_login_token(&token, "test-nonce", Some("test-access"))
+                .is_ok()
+        );
+
+        assert!(
+            client
+                .verify_login_token(&token, "test-nonce", Some("wrong-access"))
+                .is_err()
+        );
     }
 }

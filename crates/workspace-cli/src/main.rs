@@ -38,6 +38,9 @@ enum Command {
     /// Validate ALXPRGS SSO discovery and signing keys
     SsoCheck,
 
+    /// Validate authentication secrets without displaying them
+    SsoSecretsCheck,
+
     /// Diagnose the local installation
     Doctor,
 
@@ -108,6 +111,15 @@ fn run(cli: Cli) -> AppResult<ExitCode> {
                 .build()?;
 
             runtime.block_on(workspace_server::serve(config))?;
+
+            Ok(ExitCode::SUCCESS)
+        }
+
+        Command::SsoSecretsCheck => {
+            workspace_server::secrets::AuthSecrets::from_env()?;
+
+            println!("[OK] SSO client secret format");
+            println!("[OK] AES-256 encryption key format");
 
             Ok(ExitCode::SUCCESS)
         }

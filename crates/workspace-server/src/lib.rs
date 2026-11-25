@@ -8,6 +8,7 @@ mod web;
 
 pub mod auth_store;
 pub mod crypto;
+pub mod secrets;
 pub mod sso;
 pub mod storage;
 
