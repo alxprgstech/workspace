@@ -16,7 +16,7 @@ use workspace_core::config::SsoConfig;
 #[path = "sso_exchange.rs"]
 mod exchange;
 
-pub use exchange::{LoginResult, SessionTokens};
+pub use exchange::{LoginResult, RefreshedSession, SessionTokens, UserProfile};
 
 const ISSUER: &str = "https://auth.alxprgs.tech";
 const DISCOVERY_URL: &str = "https://auth.alxprgs.tech/.well-known/openid-configuration";
@@ -30,6 +30,9 @@ const MAX_RESPONSE_BYTES: usize = 65_536;
 
 #[derive(Debug, Error)]
 pub enum SsoError {
+    #[error("SSO rejected the refresh grant")]
+    RefreshRejected,
+
     #[error("invalid SSO configuration")]
     Configuration,
 
@@ -96,6 +99,7 @@ pub struct VerifiedIdentity {
     pub expires_at_unix: i64,
 }
 
+#[derive(Clone)]
 pub struct SsoClient {
     config: SsoConfig,
     jwks: CoreJsonWebKeySet,
@@ -260,9 +264,24 @@ impl SsoClient {
         expected_nonce: &str,
         access_token: Option<&str>,
     ) -> Result<VerifiedIdentity, SsoError> {
+        if expected_nonce.is_empty() {
+            return Err(SsoError::InvalidToken);
+        }
+
+        let nonce = Nonce::new(expected_nonce.to_owned());
+
+        self.verify_token(raw_token, &nonce, access_token)
+    }
+
+    fn verify_token<N: openidconnect::NonceVerifier>(
+        &self,
+        raw_token: &str,
+        nonce: N,
+        access_token: Option<&str>,
+    ) -> Result<VerifiedIdentity, SsoError> {
         use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 
-        if raw_token.len() > 16_384 || expected_nonce.is_empty() {
+        if raw_token.len() > 16_384 {
             return Err(SsoError::InvalidToken);
         }
 
@@ -278,10 +297,8 @@ impl SsoClient {
         )
         .set_allowed_algs([CoreJwsSigningAlgorithm::RsaSsaPkcs1V15Sha256]);
 
-        let nonce = Nonce::new(expected_nonce.to_owned());
-
         let claims = token
-            .claims(&verifier, &nonce)
+            .claims(&verifier, nonce)
             .map_err(|_| SsoError::InvalidToken)?;
 
         if claims.additional_claims().token_use != "id_token" || claims.audiences().len() != 1 {
@@ -467,6 +484,7 @@ mod signed_token_tests {
             "aud": "test-client",
             "sub": "550e8400-e29b-41d4-a716-446655440000",
             "iat": now,
+            "auth_time": now - 60,
             "exp": now + 300,
             "nonce": "test-nonce",
             "token_use": "id_token"
@@ -499,6 +517,52 @@ mod signed_token_tests {
             );
         }
 
+        let mut refreshed = claims.clone();
+        refreshed.as_object_mut().unwrap().remove("nonce");
+
+        let token = sign(&signing_key, &refreshed);
+
+        let subject = claims["sub"].as_str().unwrap();
+
+        assert!(
+            client
+                .verify_refresh_id_token(&token, "test-access", subject, &valid,)
+                .is_ok()
+        );
+
+        // Login still requires its original nonce.
+        assert!(client.verify_id_token(&token, "test-nonce",).is_err());
+
+        // Refresh must preserve the user's identity.
+        assert!(
+            client
+                .verify_refresh_id_token(
+                    &token,
+                    "test-access",
+                    "123e4567-e89b-12d3-a456-426614174000",
+                    &valid,
+                )
+                .is_err()
+        );
+
+        // Refresh must not reset the authentication time.
+        refreshed["auth_time"] = json!(now);
+
+        let token = sign(&signing_key, &refreshed);
+
+        assert!(
+            client
+                .verify_refresh_id_token(&token, "test-access", subject, &valid,)
+                .is_err()
+        );
+
+        // ALXPRGS SSO omits nonce in refreshed ID tokens.
+        assert!(
+            client
+                .verify_refresh_id_token(&valid, "test-access", subject, &valid,)
+                .is_err()
+        );
+
         let (message, signature) = valid.rsplit_once('.').unwrap();
 
         let mut signature = URL_SAFE_NO_PAD.decode(signature).unwrap();
@@ -528,5 +592,57 @@ mod signed_token_tests {
                 .verify_login_token(&token, "test-nonce", Some("wrong-access"))
                 .is_err()
         );
+    }
+}
+
+fn token_auth_time(raw: &str) -> Result<i64, SsoError> {
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+
+    if raw.len() > 16_384 {
+        return Err(SsoError::InvalidToken);
+    }
+
+    let payload = raw.split('.').nth(1).ok_or(SsoError::InvalidToken)?;
+
+    let decoded = URL_SAFE_NO_PAD
+        .decode(payload)
+        .map_err(|_| SsoError::InvalidToken)?;
+
+    let claims: serde_json::Value =
+        serde_json::from_slice(&decoded).map_err(|_| SsoError::InvalidToken)?;
+
+    claims["auth_time"]
+        .as_i64()
+        .filter(|value| *value > 0)
+        .ok_or(SsoError::InvalidToken)
+}
+
+impl SsoClient {
+    fn verify_refresh_id_token(
+        &self,
+        raw: &str,
+        access_token: &str,
+        expected_subject: &str,
+        previous_id_token: &str,
+    ) -> Result<VerifiedIdentity, SsoError> {
+        let identity = self.verify_token(
+            raw,
+            |nonce: Option<&Nonce>| {
+                if nonce.is_none() {
+                    Ok(())
+                } else {
+                    Err("unexpected refresh nonce".to_owned())
+                }
+            },
+            Some(access_token),
+        )?;
+
+        if identity.subject != expected_subject
+            || token_auth_time(raw)? != token_auth_time(previous_id_token)?
+        {
+            return Err(SsoError::InvalidToken);
+        }
+
+        Ok(identity)
     }
 }

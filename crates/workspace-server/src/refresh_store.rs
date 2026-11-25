@@ -19,11 +19,16 @@ pub struct RefreshLease {
     started_at: i64,
     expires_at: i64,
     refresh_token: String,
+    previous_id_token: String,
 }
 
 impl RefreshLease {
     pub fn refresh_token(&self) -> &str {
         &self.refresh_token
+    }
+
+    pub fn previous_id_token(&self) -> &str {
+        &self.previous_id_token
     }
 
     pub fn subject(&self) -> &str {
@@ -142,11 +147,13 @@ impl AuthStore {
             return Ok(RefreshDecision::Pending);
         }
 
-        if record.access_expires_at > now + REFRESH_WINDOW_SECONDS {
+        if record.access_expires_at >= record.expires_at
+            || record.access_expires_at > now + REFRESH_WINDOW_SECONDS
+        {
             return Ok(RefreshDecision::NotNeeded);
         }
 
-        let plaintext = self.cipher.open(
+        let plaintext = match self.cipher.open(
             &record.encrypted,
             &generation_aad(
                 config,
@@ -155,15 +162,46 @@ impl AuthStore {
                 record.expires_at,
                 record.generation,
             ),
-        )?;
+        ) {
+            Ok(plaintext) => plaintext,
+            Err(_) => {
+                // A corrupted session can never be refreshed again.
+                tx.execute(
+                    "DELETE FROM web_sessions
+                     WHERE handle_hash = ?1",
+                    params![&handle_hash[..]],
+                )?;
 
-        let tokens: SessionTokens =
-            serde_json::from_slice(&plaintext).map_err(|_| AuthStoreError::InvalidPayload)?;
+                tx.commit()?;
+
+                return Ok(RefreshDecision::Missing);
+            }
+        };
+
+        let Ok(tokens) = serde_json::from_slice::<SessionTokens>(&plaintext) else {
+            tx.execute(
+                "DELETE FROM web_sessions
+                 WHERE handle_hash = ?1",
+                params![&handle_hash[..]],
+            )?;
+
+            tx.commit()?;
+
+            return Ok(RefreshDecision::Missing);
+        };
 
         if tokens.access_expires_at_unix != record.access_expires_at
             || tokens.refresh_token.is_empty()
         {
-            return Err(AuthStoreError::InvalidPayload);
+            tx.execute(
+                "DELETE FROM web_sessions
+                 WHERE handle_hash = ?1",
+                params![&handle_hash[..]],
+            )?;
+
+            tx.commit()?;
+
+            return Ok(RefreshDecision::Missing);
         }
 
         let changed = tx.execute(
@@ -190,14 +228,20 @@ impl AuthStore {
             started_at: now,
             expires_at: record.expires_at,
             refresh_token: tokens.refresh_token,
+            previous_id_token: tokens.id_token,
         })))
     }
 
     pub fn finish_refresh(
         &self,
         lease: &RefreshLease,
-        mut tokens: SessionTokens,
+        refreshed: RefreshedSession,
     ) -> Result<bool, AuthStoreError> {
+        let RefreshedSession {
+            mut tokens,
+            profile,
+        } = refreshed;
+
         let mut connection = storage::open(&self.data_dir)?;
 
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -271,9 +315,34 @@ impl AuthStore {
             ],
         )?;
 
+        if changed != 1 {
+            tx.commit()?;
+
+            return Ok(false);
+        }
+
+        // The SSO profile may change, the local role never does.
+        tx.execute(
+            "UPDATE users
+             SET username = COALESCE(?1, username),
+                 email = COALESCE(?2, email),
+                 email_verified = COALESCE(?3, email_verified),
+                 updated_at_unix = unixepoch()
+             WHERE issuer = ?4
+               AND subject = ?5
+               AND is_enabled = 1",
+            params![
+                profile.username,
+                profile.email,
+                profile.email_verified,
+                &lease.config.issuer,
+                &lease.subject,
+            ],
+        )?;
+
         tx.commit()?;
 
-        Ok(changed == 1)
+        Ok(true)
     }
 
     pub fn abort_refresh(&self, lease: &RefreshLease) -> Result<bool, AuthStoreError> {
@@ -288,6 +357,36 @@ impl AuthStore {
                AND refresh_started_at_unix = ?3
                AND user_id = ?4
                AND client_id = ?5",
+            params![
+                &lease.handle_hash[..],
+                lease.generation,
+                lease.started_at,
+                &lease.user_id,
+                &lease.config.client_id,
+            ],
+        )?;
+
+        Ok(changed == 1)
+    }
+}
+
+impl AuthStore {
+    /// Only valid when no refresh request has been submitted.
+    pub fn release_unsubmitted_refresh(
+        &self,
+        lease: &RefreshLease,
+    ) -> Result<bool, AuthStoreError> {
+        let connection = storage::open(&self.data_dir)?;
+
+        let changed = connection.execute(
+            "UPDATE web_sessions
+             SET refresh_started_at_unix = NULL
+             WHERE handle_hash = ?1
+               AND generation = ?2
+               AND refresh_started_at_unix = ?3
+               AND user_id = ?4
+               AND client_id = ?5
+               AND revoked_at_unix IS NULL",
             params![
                 &lease.handle_hash[..],
                 lease.generation,

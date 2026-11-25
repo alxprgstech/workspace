@@ -345,7 +345,8 @@ mod auth_http_tests {
             secrets::AuthSecrets::from_values("test-client-secret-123456", &STANDARD.encode(KEY))
                 .unwrap();
 
-        let auth = auth_http::AuthState::new(&sso, dir.path(), secrets).unwrap();
+        let auth = auth_http::AuthState::new_with_sso_revocation(&sso, dir.path(), secrets, false)
+            .unwrap();
 
         let router = router(&config, storage, Some(Arc::new(auth)));
 
@@ -450,13 +451,44 @@ mod auth_http_tests {
 
         for uri in [
             "/auth/callback",
-            "/auth/callback?code=test&state=test",
             "/auth/callback?code=a&code=b&state=test",
             "/auth/callback?error=denied&code=a&state=test",
             "/auth/callback?code=a&state=x&state=y",
         ] {
             assert_eq!(get(&router, uri).await.status(), StatusCode::BAD_REQUEST,);
         }
+    }
+
+    #[tokio::test]
+    async fn callback_without_flow_redirects_to_clean_url() {
+        let (_dir, router, _sso) = setup();
+
+        let response = get(&router, "/auth/callback?code=test&state=test").await;
+
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+        let location = response.headers()[header::LOCATION].to_str().unwrap();
+
+        assert_eq!(location, "/?auth_error=session_expired");
+        assert!(!location.contains("code="));
+        assert!(!location.contains("state="));
+    }
+
+    #[tokio::test]
+    async fn authorization_attempts_are_rate_limited() {
+        let (_dir, router, _sso) = setup();
+
+        for _ in 0..20 {
+            assert_eq!(
+                get(&router, "/auth/login").await.status(),
+                StatusCode::SEE_OTHER
+            );
+        }
+
+        assert_eq!(
+            get(&router, "/auth/login").await.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+        );
     }
 
     #[tokio::test]
@@ -576,5 +608,58 @@ mod auth_http_tests {
         .await;
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED,);
+    }
+
+    #[tokio::test]
+    async fn pending_refresh_does_not_log_user_out() {
+        let (dir, router, sso) = setup();
+
+        let credentials = create_session(dir.path(), &sso);
+
+        let connection = storage::open(dir.path()).unwrap();
+
+        connection
+            .execute(
+                "UPDATE web_sessions
+             SET refresh_started_at_unix = unixepoch()",
+                [],
+            )
+            .unwrap();
+
+        drop(connection);
+
+        let path = dir.path().to_path_buf();
+
+        let completion = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+
+            tokio::task::spawn_blocking(move || {
+                let connection = storage::open(&path).unwrap();
+
+                connection
+                    .execute(
+                        "UPDATE web_sessions
+                     SET refresh_started_at_unix = NULL",
+                        [],
+                    )
+                    .unwrap();
+            })
+            .await
+            .unwrap();
+        });
+
+        let response = request(
+            &router,
+            Request::builder()
+                .uri("/auth/me")
+                .header(header::COOKIE, session_cookie(&credentials))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        completion.await.unwrap();
     }
 }

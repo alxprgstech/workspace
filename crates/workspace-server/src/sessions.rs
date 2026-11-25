@@ -1,6 +1,6 @@
 use super::*;
 use crate::{
-    sso::{LoginResult, SessionTokens},
+    sso::{LoginResult, RefreshedSession, SessionTokens},
     users::{self, UserRecord},
 };
 
@@ -195,7 +195,7 @@ impl AuthStore {
             return Ok(None);
         };
 
-        let plaintext = self.cipher.open(
+        let plaintext = match self.cipher.open(
             &encrypted,
             &generation_aad(
                 config,
@@ -204,13 +204,38 @@ impl AuthStore {
                 info.expires_at_unix,
                 generation,
             ),
-        )?;
+        ) {
+            Ok(plaintext) => plaintext,
+            Err(_) => {
+                // A damaged session can never become valid again.
+                let _ = connection.execute(
+                    "DELETE FROM web_sessions
+                     WHERE handle_hash = ?1",
+                    params![&handle_hash[..]],
+                );
 
-        let tokens: SessionTokens =
-            serde_json::from_slice(&plaintext).map_err(|_| AuthStoreError::InvalidPayload)?;
+                return Ok(None);
+            }
+        };
+
+        let Ok(tokens) = serde_json::from_slice::<SessionTokens>(&plaintext) else {
+            let _ = connection.execute(
+                "DELETE FROM web_sessions
+                 WHERE handle_hash = ?1",
+                params![&handle_hash[..]],
+            );
+
+            return Ok(None);
+        };
 
         if tokens.access_expires_at_unix != info.access_expires_at_unix {
-            return Err(AuthStoreError::InvalidPayload);
+            let _ = connection.execute(
+                "DELETE FROM web_sessions
+                 WHERE handle_hash = ?1",
+                params![&handle_hash[..]],
+            );
+
+            return Ok(None);
         }
 
         Ok(Some(info))
@@ -221,35 +246,70 @@ impl AuthStore {
         config: &SsoConfig,
         handle: &str,
         csrf_token: &str,
-    ) -> Result<bool, AuthStoreError> {
+    ) -> Result<Option<SessionTokens>, AuthStoreError> {
         sso::validate_config(config).map_err(|_| AuthStoreError::InvalidFlow)?;
 
         if !valid_handle(handle) || !valid_handle(csrf_token) {
-            return Ok(false);
+            return Ok(None);
         }
 
         let handle_hash = hash_handle(handle);
         let csrf_hash = hash_handle(csrf_token);
 
-        let connection = storage::open(&self.data_dir)?;
+        let mut connection = storage::open(&self.data_dir)?;
 
-        let changed = connection.execute(
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        let record = tx
+            .query_row(
+                "SELECT user_id, expires_at_unix, encrypted_tokens, generation
+                 FROM web_sessions
+                 WHERE handle_hash = ?1
+                   AND client_id = ?2
+                   AND csrf_hash = ?3
+                   AND user_id IN (
+                       SELECT id FROM users WHERE issuer = ?4
+                   )",
+                params![
+                    &handle_hash[..],
+                    &config.client_id,
+                    &csrf_hash[..],
+                    &config.issuer,
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+
+        let Some((user_id, expires_at, encrypted, generation)) = record else {
+            return Ok(None);
+        };
+
+        let tokens = self
+            .cipher
+            .open(
+                &encrypted,
+                &generation_aad(config, &handle_hash, &user_id, expires_at, generation),
+            )
+            .ok()
+            .and_then(|plaintext| serde_json::from_slice::<SessionTokens>(&plaintext).ok())
+            .filter(|tokens| !tokens.refresh_token.is_empty());
+
+        tx.execute(
             "DELETE FROM web_sessions
-             WHERE handle_hash = ?1
-               AND client_id = ?2
-               AND csrf_hash = ?3
-               AND user_id IN (
-                   SELECT id FROM users WHERE issuer = ?4
-               )",
-            params![
-                &handle_hash[..],
-                &config.client_id,
-                &csrf_hash[..],
-                &config.issuer,
-            ],
+             WHERE handle_hash = ?1",
+            params![&handle_hash[..]],
         )?;
 
-        Ok(changed == 1)
+        tx.commit()?;
+
+        Ok(tokens)
     }
 }
 
@@ -403,15 +463,17 @@ mod tests {
         let wrong = random_handle().unwrap();
 
         assert!(
-            !store
+            store
                 .revoke_session(&config, &credentials.handle, &wrong,)
                 .unwrap()
+                .is_none()
         );
 
         assert!(
             store
                 .revoke_session(&config, &credentials.handle, &credentials.csrf_token,)
                 .unwrap()
+                .is_some()
         );
 
         assert!(
@@ -422,9 +484,10 @@ mod tests {
         );
 
         assert!(
-            !store
+            store
                 .revoke_session(&config, &credentials.handle, &credentials.csrf_token,)
                 .unwrap()
+                .is_none()
         );
     }
 
@@ -494,11 +557,23 @@ mod tests {
 
         let wrong_key = AuthStore::new(dir.path(), &[43; 32]).unwrap();
 
+        // A session that cannot be decrypted is discarded, not retried.
         assert!(
             wrong_key
                 .get_session(&config, &credentials.handle, None,)
-                .is_err()
+                .unwrap()
+                .is_none()
         );
+
+        let connection = storage::open(dir.path()).unwrap();
+
+        let remaining: i64 = connection
+            .query_row("SELECT count(*) FROM web_sessions", [], |row| row.get(0))
+            .unwrap();
+
+        assert_eq!(remaining, 0);
+
+        let credentials = store.create_session(&config, &login()).unwrap().unwrap();
 
         let connection = storage::open(dir.path()).unwrap();
 
@@ -546,14 +621,21 @@ mod tests {
         }
     }
 
-    fn rotated_tokens() -> SessionTokens {
+    fn rotated_tokens() -> RefreshedSession {
         let mut tokens = login().tokens;
 
         tokens.access_token = "rotated-access-token".to_owned();
         tokens.refresh_token = "rotated-refresh-token".to_owned();
         tokens.id_token = "rotated-id-token".to_owned();
 
-        tokens
+        RefreshedSession {
+            tokens,
+            profile: crate::sso::UserProfile {
+                username: Some("rotated-user".to_owned()),
+                email: Some("rotated@example.com".to_owned()),
+                email_verified: Some(true),
+            },
+        }
     }
 
     #[test]
@@ -672,6 +754,60 @@ mod tests {
     }
 
     #[test]
+    fn unsubmitted_refresh_can_be_released_safely() {
+        let (dir, store, config) = setup();
+
+        let credentials = near_expiry_session(dir.path(), &store, &config);
+
+        let lease = acquire_refresh(&store, &config, &credentials);
+
+        // Releasing before any exchange leaves the session usable.
+        assert!(store.release_unsubmitted_refresh(&lease).unwrap());
+
+        let info = store
+            .get_session(&config, &credentials.handle, None)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(info.expires_at_unix, credentials.expires_at_unix);
+
+        // The released lease can never complete a refresh.
+        assert!(!store.finish_refresh(&lease, rotated_tokens(),).unwrap());
+
+        // A release never clears another in-flight attempt.
+        let connection = storage::open(dir.path()).unwrap();
+
+        connection
+            .execute(
+                "UPDATE web_sessions
+                 SET refresh_started_at_unix = unixepoch() + 1",
+                [],
+            )
+            .unwrap();
+
+        drop(connection);
+
+        assert!(!store.release_unsubmitted_refresh(&lease).unwrap());
+
+        // The session can retry once nothing is in flight anymore.
+        let connection = storage::open(dir.path()).unwrap();
+
+        connection
+            .execute(
+                "UPDATE web_sessions
+                 SET refresh_started_at_unix = NULL",
+                [],
+            )
+            .unwrap();
+
+        drop(connection);
+
+        let retry = acquire_refresh(&store, &config, &credentials);
+
+        assert!(store.finish_refresh(&retry, rotated_tokens(),).unwrap());
+    }
+
+    #[test]
     fn abandoned_refresh_is_never_reacquired() {
         let (dir, store, config) = setup();
 
@@ -734,6 +870,7 @@ mod tests {
             store
                 .revoke_session(&config, &credentials.handle, &credentials.csrf_token,)
                 .unwrap()
+                .is_some()
         );
 
         assert!(!store.finish_refresh(&lease, rotated_tokens(),).unwrap());
@@ -760,5 +897,105 @@ mod tests {
                 .unwrap(),
             RefreshDecision::Acquired(_)
         ));
+    }
+
+    #[test]
+    fn session_survives_store_restart() {
+        let (dir, store, config) = setup();
+
+        users::grant_access(dir.path(), &config, SUBJECT, "admin").unwrap();
+
+        let credentials = store.create_session(&config, &login()).unwrap().unwrap();
+
+        // Simulate a Workspace restart with the same encryption key.
+        let reopened = AuthStore::new(dir.path(), &KEY).unwrap();
+
+        let info = reopened
+            .get_session(&config, &credentials.handle, None)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(info.user.subject, SUBJECT);
+        assert_eq!(info.expires_at_unix, credentials.expires_at_unix);
+    }
+
+    #[test]
+    fn corrupted_session_is_discarded() {
+        let (dir, store, config) = setup();
+
+        users::grant_access(dir.path(), &config, SUBJECT, "user").unwrap();
+
+        let credentials = store.create_session(&config, &login()).unwrap().unwrap();
+
+        let connection = storage::open(dir.path()).unwrap();
+
+        connection
+            .execute(
+                "UPDATE web_sessions
+                 SET encrypted_tokens = X'00'",
+                [],
+            )
+            .unwrap();
+
+        drop(connection);
+
+        assert!(
+            store
+                .get_session(&config, &credentials.handle, None,)
+                .unwrap()
+                .is_none()
+        );
+
+        let connection = storage::open(dir.path()).unwrap();
+
+        let remaining: i64 = connection
+            .query_row("SELECT count(*) FROM web_sessions", [], |row| row.get(0))
+            .unwrap();
+
+        assert_eq!(remaining, 0);
+
+        assert!(matches!(
+            store
+                .begin_refresh(&config, &credentials.handle, None,)
+                .unwrap(),
+            RefreshDecision::Missing
+        ));
+    }
+
+    #[test]
+    fn rotation_updates_profile_without_changing_role() {
+        let (dir, store, config) = setup();
+
+        let credentials = near_expiry_session(dir.path(), &store, &config);
+
+        let lease = acquire_refresh(&store, &config, &credentials);
+
+        assert!(store.finish_refresh(&lease, rotated_tokens(),).unwrap());
+
+        let info = store
+            .get_session(&config, &credentials.handle, None)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(info.user.username.as_deref(), Some("rotated-user"));
+        // The local role is never taken from the SSO profile.
+        assert_eq!(info.user.role, "admin");
+        assert_eq!(info.expires_at_unix, credentials.expires_at_unix);
+    }
+
+    #[test]
+    fn revoked_session_exposes_tokens_for_sso_revocation() {
+        let (dir, store, config) = setup();
+
+        users::grant_access(dir.path(), &config, SUBJECT, "user").unwrap();
+
+        let credentials = store.create_session(&config, &login()).unwrap().unwrap();
+
+        let tokens = store
+            .revoke_session(&config, &credentials.handle, &credentials.csrf_token)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(tokens.refresh_token, "test-refresh-token");
     }
 }

@@ -39,6 +39,18 @@ pub struct LoginResult {
     pub tokens: SessionTokens,
 }
 
+#[derive(Debug, Clone)]
+pub struct UserProfile {
+    pub username: Option<String>,
+    pub email: Option<String>,
+    pub email_verified: Option<bool>,
+}
+
+pub struct RefreshedSession {
+    pub tokens: SessionTokens,
+    pub profile: UserProfile,
+}
+
 pub(super) fn unix_now() -> Result<i64, SsoError> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -73,13 +85,17 @@ fn validate_token_response(response: &TokenResponse) -> Result<(), SsoError> {
     Ok(())
 }
 
-async fn read_response<T: DeserializeOwned>(
-    mut response: reqwest::Response,
-) -> Result<T, SsoError> {
+async fn read_response<T: DeserializeOwned>(response: reqwest::Response) -> Result<T, SsoError> {
     if response.status() != reqwest::StatusCode::OK {
         return Err(SsoError::HttpStatus(response.status().as_u16()));
     }
 
+    read_json_body(response).await
+}
+
+async fn read_json_body<T: DeserializeOwned>(
+    mut response: reqwest::Response,
+) -> Result<T, SsoError> {
     let mut body = Vec::new();
 
     while let Some(chunk) = response.chunk().await.map_err(|_| SsoError::Transport)? {
@@ -233,5 +249,155 @@ mod tests {
         token.refresh_token.clear();
 
         assert!(validate_token_response(&token).is_err());
+    }
+}
+
+#[derive(Deserialize)]
+struct OAuthFailure {
+    error: String,
+}
+
+impl SsoClient {
+    pub async fn refresh_tokens(
+        &self,
+        client_secret: &ClientSecret,
+        refresh_token: &str,
+        expected_subject: &str,
+        previous_id_token: &str,
+    ) -> Result<RefreshedSession, SsoError> {
+        if refresh_token.is_empty() || refresh_token.len() > 16_384 {
+            return Err(SsoError::InvalidResponse);
+        }
+
+        let started_at = unix_now()?;
+
+        let http = reqwest::Client::builder()
+            .https_only(true)
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(15))
+            .build()
+            .map_err(|_| SsoError::Transport)?;
+
+        let response = http
+            .post(TOKEN_URL)
+            .basic_auth(&self.config.client_id, Some(client_secret.secret()))
+            .header("Accept", "application/json")
+            .form(&[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", refresh_token),
+            ])
+            .send()
+            .await
+            .map_err(|_| SsoError::Transport)?;
+
+        let status = response.status();
+
+        if status == reqwest::StatusCode::BAD_REQUEST {
+            let failure: OAuthFailure = read_json_body(response).await?;
+
+            if failure.error == "invalid_grant" {
+                return Err(SsoError::RefreshRejected);
+            }
+
+            return Err(SsoError::HttpStatus(status.as_u16()));
+        }
+
+        let response: TokenResponse = read_response(response).await?;
+
+        validate_token_response(&response)?;
+
+        if response.refresh_token == refresh_token {
+            return Err(SsoError::InvalidResponse);
+        }
+
+        let identity = self.verify_refresh_id_token(
+            &response.id_token,
+            &response.access_token,
+            expected_subject,
+            previous_id_token,
+        )?;
+
+        let profile = http
+            .get(USERINFO_URL)
+            .bearer_auth(&response.access_token)
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .map_err(|_| SsoError::Transport)?;
+
+        let profile: UserInfo = read_response(profile).await?;
+
+        if profile.sub != expected_subject
+            || profile
+                .preferred_username
+                .as_ref()
+                .is_some_and(|value| value.len() > 512)
+            || profile
+                .email
+                .as_ref()
+                .is_some_and(|value| value.len() > 512)
+        {
+            return Err(SsoError::InvalidToken);
+        }
+
+        let expires_at = (started_at + response.expires_in).min(identity.expires_at_unix);
+
+        if expires_at <= unix_now()? {
+            return Err(SsoError::InvalidToken);
+        }
+
+        Ok(RefreshedSession {
+            tokens: SessionTokens {
+                access_token: response.access_token,
+                refresh_token: response.refresh_token,
+                id_token: response.id_token,
+                access_expires_at_unix: expires_at,
+            },
+            profile: UserProfile {
+                username: profile.preferred_username,
+                email: profile.email,
+                email_verified: profile.email_verified,
+            },
+        })
+    }
+
+    /// Best-effort RFC 7009 revocation of the presented refresh token.
+    pub async fn revoke_refresh_token(
+        &self,
+        client_secret: &ClientSecret,
+        refresh_token: &str,
+    ) -> Result<(), SsoError> {
+        if refresh_token.is_empty() || refresh_token.len() > 16_384 {
+            return Err(SsoError::InvalidResponse);
+        }
+
+        let http = reqwest::Client::builder()
+            .https_only(true)
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
+            .connect_timeout(Duration::from_secs(4))
+            .timeout(Duration::from_secs(8))
+            .build()
+            .map_err(|_| SsoError::Transport)?;
+
+        let response = http
+            .post(REVOCATION_URL)
+            .basic_auth(&self.config.client_id, Some(client_secret.secret()))
+            .header("Accept", "application/json")
+            .form(&[
+                ("token", refresh_token),
+                ("token_type_hint", "refresh_token"),
+            ])
+            .send()
+            .await
+            .map_err(|_| SsoError::Transport)?;
+
+        if response.status() != reqwest::StatusCode::OK {
+            return Err(SsoError::HttpStatus(response.status().as_u16()));
+        }
+
+        Ok(())
     }
 }
