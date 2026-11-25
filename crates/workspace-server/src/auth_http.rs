@@ -743,11 +743,20 @@ pub async fn require_session(
 }
 
 pub async fn security_headers(request: Request, next: Next) -> Response {
+    let consent_page = request.method() == Method::GET && request.uri().path() == "/oauth/consent";
+
     let mut response = next.run(request).await;
 
     for (name, value) in [
         ("cache-control", "no-store"),
-        ("referrer-policy", "no-referrer"),
+        (
+            "referrer-policy",
+            if consent_page {
+                "same-origin"
+            } else {
+                "no-referrer"
+            },
+        ),
         ("x-content-type-options", "nosniff"),
         ("x-frame-options", "DENY"),
     ] {

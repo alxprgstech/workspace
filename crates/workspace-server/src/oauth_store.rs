@@ -345,16 +345,16 @@ impl OAuthStore {
         redirect_uri: &str,
         verifier: &str,
     ) -> Result<TokenPair, OAuthError> {
+        let mut connection = storage::open(&self.data_dir)?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        authenticate_client(&tx, client_id, secret)?;
+
         if !valid_token(code, "mcp_code_") {
             return Err(OAuthError::InvalidGrant);
         }
 
         let challenge = pkce_challenge(verifier).ok_or(OAuthError::InvalidGrant)?;
-
-        let mut connection = storage::open(&self.data_dir)?;
-        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-
-        authenticate_client(&tx, client_id, secret)?;
 
         let current_time = now(&tx)?;
         let hash = crypto::hash_handle(code);
@@ -428,14 +428,14 @@ impl OAuthStore {
         secret: &str,
         refresh_token: &str,
     ) -> Result<TokenPair, OAuthError> {
-        if !valid_token(refresh_token, "mcp_rt_") {
-            return Err(OAuthError::InvalidGrant);
-        }
-
         let mut connection = storage::open(&self.data_dir)?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
         authenticate_client(&tx, client_id, secret)?;
+
+        if !valid_token(refresh_token, "mcp_rt_") {
+            return Err(OAuthError::InvalidGrant);
+        }
 
         let current_time = now(&tx)?;
         let hash = crypto::hash_handle(refresh_token);
