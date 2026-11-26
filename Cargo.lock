@@ -3425,9 +3425,10 @@ dependencies = [
 
 [[package]]
 name = "workspace-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -3438,7 +3439,7 @@ dependencies = [
 
 [[package]]
 name = "workspace-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3448,14 +3449,14 @@ dependencies = [
 
 [[package]]
 name = "workspace-egress"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "tokio",
 ]
 
 [[package]]
 name = "workspace-helper"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cap-std",
  "flate2",
@@ -3469,8 +3470,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "workspace-os"
+version = "0.2.0"
+dependencies = [
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "workspace-runtime"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3482,7 +3490,7 @@ dependencies = [
 
 [[package]]
 name = "workspace-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -3509,7 +3517,9 @@ dependencies = [
  "tracing",
  "uuid",
  "workspace-core",
+ "workspace-os",
  "workspace-runtime",
+ "zip",
 ]
 
 [[package]]

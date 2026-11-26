@@ -33,3 +33,11 @@ rustc-ice-*.txt
 /web/dist/
 /web/.vite/
 /web/*.tsbuildinfo
+
+# Release packages and local update state
+/dist/
+/release-out/
+
+# Local signing material must never be committed
+*.pk8
+/release-signing-key.pk8

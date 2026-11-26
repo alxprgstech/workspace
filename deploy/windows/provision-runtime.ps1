@@ -5,19 +5,24 @@
 # preparation that the service itself is not allowed to do:
 #
 #   * creates the quota storage layout owned by the runtime user;
-#   * installs the static Linux helper (trusted, no shell execution);
+#   * installs the static Linux helper and egress proxy (trusted, no shell);
 #   * installs the narrowly scoped quota helper and its sudoers rule;
 #   * verifies the result with ``workspace runtime status``.
 #
 # It never touches other WSL distributions, production services or global WSL
-# configuration.
+# configuration. The binary and system paths can be overridden to provision an
+# isolated test environment.
 
 [CmdletBinding()]
 param(
     [string]$Distro = "ALXPRGS-Workspace",
     [string]$RuntimeUser = "workspace",
     [string]$DataRoot = "/srv/alxprgs-workspace/data",
+    [string]$BinRoot = "/srv/alxprgs-workspace/bin",
+    [string]$QuotaHelperPath = "/usr/sbin/alxprgs-quota",
+    [string]$SudoersPath = "/etc/sudoers.d/alxprgs-workspace-quota",
     [string]$HelperSource = "",
+    [string]$EgressSource = "",
     [string]$WorkspaceBinary = "",
     [switch]$SkipVerify
 )
@@ -31,12 +36,20 @@ if (-not (Test-Path $wsl)) {
     throw "wsl.exe is not available"
 }
 
+$target = "x86_64-unknown-linux-musl"
+
 if ([string]::IsNullOrWhiteSpace($HelperSource)) {
-    $HelperSource = Join-Path $repoRoot "target\x86_64-unknown-linux-musl\release\workspace-helper"
+    $HelperSource = Join-Path $repoRoot "target\$target\release\workspace-helper"
 }
 
-if (-not (Test-Path $HelperSource)) {
-    throw "helper binary not found at $HelperSource; build it with 'cargo build --release -p workspace-helper --target x86_64-unknown-linux-musl'"
+if ([string]::IsNullOrWhiteSpace($EgressSource)) {
+    $EgressSource = Join-Path $repoRoot "target\$target\release\workspace-egress"
+}
+
+foreach ($binary in @($HelperSource, $EgressSource)) {
+    if (-not (Test-Path $binary)) {
+        throw "binary not found at $binary; build it with 'sh scripts/build-linux-musl.sh' inside a Linux/WSL builder"
+    }
 }
 
 $quotaHelper = Join-Path $PSScriptRoot "alxprgs-quota"
@@ -58,44 +71,49 @@ function Invoke-Wsl {
     }
 }
 
+function Copy-IntoRuntime {
+    param(
+        [Parameter(Mandatory)][string]$Source,
+        [Parameter(Mandatory)][string]$Destination,
+        [Parameter(Mandatory)][string]$Temporary
+    )
+
+    cmd /c "`"$wsl`" -d $Distro -u root --exec /usr/bin/tee $Temporary < `"$Source`" > NUL"
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "cannot copy $Source into the runtime"
+    }
+
+    Invoke-Wsl -User "root" -Arguments @(
+        "/usr/bin/install", "-o", "root", "-g", "root", "-m", "0755",
+        $Temporary, $Destination
+    )
+    Invoke-Wsl -User "root" -Arguments @("/usr/bin/rm", "-f", $Temporary)
+}
+
 Write-Host "[1/6] Preparing directories as root"
 Invoke-Wsl -User "root" -Arguments @(
-    "/usr/bin/install", "-d", "-o", "1000", "-g", "1000", "-m", "0755",
-    "/srv/alxprgs-workspace/bin"
+    "/usr/bin/install", "-d", "-o", "1000", "-g", "1000", "-m", "0755", $BinRoot
 )
 Invoke-Wsl -User "root" -Arguments @(
     "/usr/bin/install", "-d", "-o", "1000", "-g", "1000", "-m", "0750",
-    "$DataRoot", "$DataRoot/workspaces", "$DataRoot/artifacts", "$DataRoot/staging", "$DataRoot/logs"
+    $DataRoot, "$DataRoot/workspaces", "$DataRoot/artifacts", "$DataRoot/staging", "$DataRoot/logs"
 )
 
-$egressSource = Join-Path $repoRoot "target\x86_64-unknown-linux-musl\release\workspace-egress"
+Write-Host "[2/6] Installing the trusted helper and egress proxy"
+Copy-IntoRuntime -Source $HelperSource -Destination "$BinRoot/workspace-helper" -Temporary "/tmp/alxprgs-helper"
+Copy-IntoRuntime -Source $EgressSource -Destination "$BinRoot/workspace-egress" -Temporary "/tmp/alxprgs-egress"
 
-if (-not (Test-Path $egressSource)) {
-    throw "egress proxy not found at $egressSource; build it with 'cargo build --release -p workspace-egress --target x86_64-unknown-linux-musl'"
-}
-
-Write-Host "[2/6] Installing the trusted filesystem helper"
-cmd /c "`"$wsl`" -d $Distro -u $RuntimeUser --exec /usr/bin/tee /srv/alxprgs-workspace/bin/workspace-helper < `"$HelperSource`" > NUL"
-
-if ($LASTEXITCODE -ne 0) {
-    throw "cannot copy the helper binary"
-}
-
-Invoke-Wsl -User $RuntimeUser -Arguments @(
-    "/usr/bin/chmod", "0755", "/srv/alxprgs-workspace/bin/workspace-helper"
-Write-Host "[2/6] Installing the trusted egress proxy"
-cmd /c "`"$wsl`" -d $Distro -u $RuntimeUser --exec /usr/bin/tee /srv/alxprgs-workspace/bin/workspace-egress < `"$egressSource`" > NUL"
-
-if ($LASTEXITCODE -ne 0) {
-    throw "cannot copy the egress proxy"
-}
-
-& $wsl -d $Distro -u $RuntimeUser --exec @(
-    "/usr/bin/chmod", "0755", "/srv/alxprgs-workspace/bin/workspace-egress"
+# The binaries run as the unprivileged runtime user.
+Invoke-Wsl -User "root" -Arguments @(
+    "/usr/bin/chown", "$RuntimeUser`:$RuntimeUser",
+    "$BinRoot/workspace-helper", "$BinRoot/workspace-egress"
 )
+Invoke-Wsl -User "root" -Arguments @(
+    "/usr/bin/chmod", "0755", "$BinRoot/workspace-helper", "$BinRoot/workspace-egress"
 )
 
-Write-Host "[3/6] Installing the quota helper"
+Write-Host "[3/6] Installing the quota helper to $QuotaHelperPath"
 $temporary = [System.IO.Path]::GetTempFileName()
 try {
     $content = Get-Content -Raw -LiteralPath $quotaHelper
@@ -104,12 +122,12 @@ try {
     cmd /c "`"$wsl`" -d $Distro -u root --exec /usr/bin/tee /tmp/alxprgs-quota < `"$temporary`" > NUL"
 
     if ($LASTEXITCODE -ne 0) {
-        throw "cannot copy /usr/sbin/alxprgs-quota"
+        throw "cannot copy the quota helper"
     }
 
     Invoke-Wsl -User "root" -Arguments @(
         "/usr/bin/install", "-o", "root", "-g", "root", "-m", "0755",
-        "/tmp/alxprgs-quota", "/usr/sbin/alxprgs-quota"
+        "/tmp/alxprgs-quota", $QuotaHelperPath
     )
     Invoke-Wsl -User "root" -Arguments @("/usr/bin/rm", "-f", "/tmp/alxprgs-quota")
 }
@@ -117,10 +135,10 @@ finally {
     Remove-Item -LiteralPath $temporary -ErrorAction SilentlyContinue
 }
 
-Write-Host "[4/6] Installing the sudoers rule"
+Write-Host "[4/6] Installing the sudoers rule to $SudoersPath"
 $sudoers = @"
 Defaults:$RuntimeUser !requiretty
-$RuntimeUser ALL=(root) NOPASSWD: /usr/sbin/alxprgs-quota
+$RuntimeUser ALL=(root) NOPASSWD: $QuotaHelperPath
 "@
 
 $temporary = [System.IO.Path]::GetTempFileName()
@@ -135,7 +153,7 @@ try {
 
     Invoke-Wsl -User "root" -Arguments @(
         "/usr/bin/install", "-o", "root", "-g", "root", "-m", "0440",
-        "/tmp/alxprgs-sudoers", "/etc/sudoers.d/alxprgs-workspace-quota"
+        "/tmp/alxprgs-sudoers", $SudoersPath
     )
     Invoke-Wsl -User "root" -Arguments @("/usr/bin/rm", "-f", "/tmp/alxprgs-sudoers")
 }
@@ -143,11 +161,11 @@ finally {
     Remove-Item -LiteralPath $temporary -ErrorAction SilentlyContinue
 }
 
-Invoke-Wsl -User "root" -Arguments @("/usr/sbin/visudo", "-c", "-f", "/etc/sudoers.d/alxprgs-workspace-quota")
+Invoke-Wsl -User "root" -Arguments @("/usr/sbin/visudo", "-c", "-f", $SudoersPath)
 
 Write-Host "[5/6] Verifying the installed files"
-Invoke-Wsl -User "root" -Arguments @("/usr/bin/ls", "-l", "/usr/sbin/alxprgs-quota", "/etc/sudoers.d/alxprgs-workspace-quota")
-Invoke-Wsl -User $RuntimeUser -Arguments @("/usr/bin/ls", "-l", "/srv/alxprgs-workspace/bin/workspace-helper")
+Invoke-Wsl -User "root" -Arguments @("/usr/bin/ls", "-l", $QuotaHelperPath, $SudoersPath)
+Invoke-Wsl -User $RuntimeUser -Arguments @("/usr/bin/ls", "-l", "$BinRoot/workspace-helper", "$BinRoot/workspace-egress")
 
 Write-Host "[6/6] Done"
 Write-Host ""

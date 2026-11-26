@@ -45,6 +45,8 @@ level = "info"
 # socket = "unix:///run/user/1000/docker.sock"
 # data_root = "/srv/alxprgs-workspace/data"
 # helper_path = "/srv/alxprgs-workspace/bin/workspace-helper"
+# quota_helper_path = "/usr/sbin/alxprgs-quota"
+# sudoers_path = "/etc/sudoers.d/alxprgs-workspace-quota"
 # startup_timeout_seconds = 120
 # command_timeout_seconds = 60
 # workspace_storage_mib = 8192
@@ -72,3 +74,19 @@ level = "info"
 # audience = "https://workspace.example.com/chatgpt/mcp"
 # resource = "https://workspace.example.com/chatgpt/mcp"
 # required_scopes = ["workspace.read"]
+
+# Optional update settings. The defaults work without this section: the updater
+# reads a verified package from <install_dir>/updates/package and uses the
+# Ed25519 public key embedded in the binary.
+#
+# [update]
+# source = "local"                       # or "github"
+# package_dir = "C:\\ALXPRGS\\package"   # directory or zip
+# install_dir = "C:\\Users\\you\\AppData\\Local\\ALXPRGS\\Workspace"
+# public_key_path = "C:\\ALXPRGS\\release-public-key.txt"
+# repository = "alxprgstech/workspace"   # github source only
+# api_token_env = "WORKSPACE_UPDATE_TOKEN"
+# drain_timeout_seconds = 300
+# health_timeout_seconds = 120
+# reserve_free_mib = 512
+# restart = true

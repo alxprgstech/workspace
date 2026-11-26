@@ -26,14 +26,15 @@ pub mod runtime_bridge;
 pub mod secrets;
 pub mod sso;
 pub mod storage;
+pub mod update;
 pub mod users;
 pub mod workspaces;
 
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::{io, sync::Arc, time::Duration};
+use std::{io, path::PathBuf, sync::Arc, time::Duration};
 use tokio::net::TcpListener;
-use workspace_core::{PRODUCT_NAME, VERSION, config::Config};
+use workspace_core::{BUILD_TIME, GIT_SHA, PRODUCT_NAME, VERSION, config::Config};
 use workspace_runtime::status::RuntimeMonitor;
 
 /// How often the supervisor re-proves isolation while the server runs.
@@ -42,6 +43,10 @@ const ACCEPTANCE_REFRESH: Duration = Duration::from_secs(300);
 #[derive(Serialize)]
 struct HealthResponse {
     status: &'static str,
+    product: &'static str,
+    version: &'static str,
+    build_sha: &'static str,
+    schema_version: u32,
 }
 
 #[derive(Serialize)]
@@ -224,8 +229,14 @@ fn public_base(config: &Config) -> String {
     format!("http://{}", config.server.listen)
 }
 
-async fn health() -> Json<HealthResponse> {
-    Json(HealthResponse { status: "ok" })
+async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
+    Json(HealthResponse {
+        status: "ok",
+        product: PRODUCT_NAME,
+        version: VERSION,
+        build_sha: GIT_SHA,
+        schema_version: state.storage.schema_version,
+    })
 }
 
 async fn ready(State(state): State<AppState>) -> (StatusCode, Json<ReadinessResponse>) {
@@ -262,6 +273,8 @@ async fn server_info(State(state): State<AppState>) -> Json<Value> {
     Json(json!({
         "product": PRODUCT_NAME,
         "version": VERSION,
+        "build_sha": GIT_SHA,
+        "build_time": BUILD_TIME,
         "api_version": "v1",
         "instance_id": state.storage.instance_id.clone(),
         "platform": std::env::consts::OS,
@@ -287,7 +300,7 @@ fn router(
 
     let state = AppState::new(config, storage, Arc::clone(&monitor));
 
-    router_with_runtime(config, state, auth)
+    router_with_runtime(config, state, auth, None)
 }
 
 /// Router bound to a monitor shared with the background supervisor.
@@ -295,12 +308,14 @@ fn router_with_runtime(
     config: &Config,
     state: AppState,
     auth: Option<Arc<auth_http::AuthState>>,
+    update: Option<Arc<update::http::UpdateHttpState>>,
 ) -> Router {
     let mcp_services = state.mcp_services();
     let upload_limit = state.max_import_bytes as usize;
 
     // Public download endpoint: authorisation is the opaque token itself.
     let public: Router = Router::new()
+        .route("/health", get(health))
         .route("/artifacts/{token}", get(http_files::download))
         .with_state(state.clone());
 
@@ -367,6 +382,13 @@ fn router_with_runtime(
         )
         .with_state(state);
 
+    // Administrative updates: the route is mounted on the authenticated
+    // router, and every handler verifies the administrator role again.
+    let protected = match update {
+        Some(update_state) => protected.merge(update::http::router(update_state)),
+        None => protected,
+    };
+
     let protected = match auth.as_ref() {
         Some(auth_state) => protected.route_layer(axum::middleware::from_fn_with_state(
             Arc::clone(auth_state),
@@ -375,10 +397,7 @@ fn router_with_runtime(
         None => protected,
     };
 
-    let router = Router::new()
-        .route("/health", get(health))
-        .merge(public)
-        .merge(protected);
+    let router = Router::new().merge(public).merge(protected);
 
     let router = match auth.as_ref() {
         Some(auth_state) => router.merge(auth_http::router(Arc::clone(auth_state))),
@@ -641,6 +660,14 @@ async fn runtime_reconcile(
     Ok(())
 }
 pub async fn serve(config: Config) -> io::Result<()> {
+    serve_with_config(config, PathBuf::from("config.toml")).await
+}
+
+/// Start the server and remember where its configuration lives.
+///
+/// The update controller needs the configuration path to spawn the detached
+/// updater with exactly the same configuration the running server uses.
+pub async fn serve_with_config(config: Config, config_path: PathBuf) -> io::Result<()> {
     if !valid_local_mcp(&config) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -659,7 +686,8 @@ pub async fn serve(config: Config) -> io::Result<()> {
         .sso
         .as_ref()
         .map(|sso| {
-            let secrets = secrets::AuthSecrets::from_env().map_err(io::Error::other)?;
+            let secrets =
+                secrets::AuthSecrets::load(&config.storage.data_dir).map_err(io::Error::other)?;
 
             auth_http::AuthState::new(sso, &config.storage.data_dir, secrets).map(Arc::new)
         })
@@ -692,23 +720,35 @@ pub async fn serve(config: Config) -> io::Result<()> {
     #[cfg(unix)]
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
+    // The administration API can request a controlled restart after it has
+    // started the detached updater.
+    let shutdown_notify = Arc::new(tokio::sync::Notify::new());
+    let notified = Arc::clone(&shutdown_notify);
+
     let shutdown = async move {
-        #[cfg(unix)]
-        {
-            tokio::select! {
-                result = tokio::signal::ctrl_c() => {
-                    if let Err(error) = result {
+        tokio::select! {
+            _ = async {
+                #[cfg(unix)]
+                {
+                    tokio::select! {
+                        result = tokio::signal::ctrl_c() => {
+                            if let Err(error) = result {
+                                tracing::error!(%error, "Signal handler failed");
+                            }
+                        }
+                        _ = terminate.recv() => {}
+                    }
+                }
+
+                #[cfg(not(unix))]
+                {
+                    if let Err(error) = tokio::signal::ctrl_c().await {
                         tracing::error!(%error, "Signal handler failed");
                     }
                 }
-                _ = terminate.recv() => {}
-            }
-        }
-
-        #[cfg(not(unix))]
-        {
-            if let Err(error) = tokio::signal::ctrl_c().await {
-                tracing::error!(%error, "Signal handler failed");
+            } => {}
+            _ = notified.notified() => {
+                tracing::info!("Controlled restart requested by the update controller");
             }
         }
 
@@ -725,6 +765,34 @@ pub async fn serve(config: Config) -> io::Result<()> {
         config.runtime.as_ref(),
         &storage.instance_id,
     ));
+
+    let config = Arc::new(config);
+
+    // Cooperative shutdown used by the updater: a file next to the pid file is
+    // an unambiguous, local, non-spoofable request to stop this installation.
+    let install_dir = config.update.install_dir.clone().or_else(|| {
+        std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
+    });
+
+    if let Some(install_dir) = install_dir {
+        let request = install_dir.join("state").join("shutdown.request");
+        let notify = Arc::clone(&shutdown_notify);
+
+        tokio::spawn(async move {
+            loop {
+                if request.is_file() {
+                    let _ = std::fs::remove_file(&request);
+                    tracing::info!("Cooperative shutdown requested");
+                    notify.notify_waiters();
+                    break;
+                }
+
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        });
+    }
 
     let state = AppState::new(&config, storage, Arc::clone(&runtime));
 
@@ -761,9 +829,14 @@ pub async fn serve(config: Config) -> io::Result<()> {
         "Execution runtime supervisor started"
     );
 
+    let update_state = Arc::new(update::http::UpdateHttpState::new(
+        Arc::clone(&config),
+        config_path,
+    ));
+
     axum::serve(
         listener,
-        router_with_runtime(&config, state, auth)
+        router_with_runtime(&config, state, auth, Some(update_state))
             .into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
     .with_graceful_shutdown(shutdown)

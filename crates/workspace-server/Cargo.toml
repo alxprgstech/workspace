@@ -31,9 +31,12 @@ tower = "0.5"
 tokio-util = { version = "0.7", features = ["io"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 async-trait = "0.1"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "http2"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "http2", "json"] }
 workspace-core.workspace = true
 workspace-runtime.workspace = true
+workspace-os.workspace = true
+zip = { version = "9", default-features = false, features = ["deflate"] }
+tempfile.workspace = true
 rmcp = { version = "3.11.0", features = ["server", "transport-streamable-http-server"] }
 
 [dev-dependencies]
