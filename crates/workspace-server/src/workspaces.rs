@@ -7,7 +7,7 @@
 
 use crate::storage;
 use async_trait::async_trait;
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use std::{
     path::{Path, PathBuf},
@@ -167,48 +167,36 @@ impl Store {
     pub fn insert(&self, workspace: &Workspace) -> Result<(), WorkspaceError> {
         let connection = self.connection()?;
 
-        connection
-            .execute(
-                "INSERT INTO workspaces (
-                    id, owner_id, name, execution_mode, state, capabilities, image,
-                    network_mode, cpu_millis, memory_mib, pids, disk_mib, files,
-                    max_job_seconds, project_id, container_name, created_at_unix,
-                    updated_at_unix, last_activity_unix, ttl_seconds, expires_at_unix,
-                    pinned, error
-                 ) VALUES (
-                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                    ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23
-                 )",
-                params![
-                    workspace.id,
-                    workspace.owner_id,
-                    workspace.name,
-                    workspace.execution_mode.as_str(),
-                    workspace.state.as_str(),
-                    serde_json::to_string(&workspace.capabilities)
-                        .map_err(|error| WorkspaceError::Database(error.to_string()))?,
-                    workspace.image,
-                    workspace.network_mode,
-                    workspace.limits.cpu_millis,
-                    workspace.limits.memory_mib as i64,
-                    workspace.limits.pids,
-                    workspace.limits.disk_mib as i64,
-                    workspace.limits.files as i64,
-                    workspace.limits.max_job_seconds as i64,
-                    workspace.project_id,
-                    workspace.container_name,
-                    workspace.created_at_unix,
-                    workspace.updated_at_unix,
-                    workspace.last_activity_unix,
-                    workspace.ttl_seconds as i64,
-                    workspace.expires_at_unix,
-                    i64::from(workspace.pinned),
-                    workspace.error,
-                ],
-            )
+        insert_in(&connection, workspace)
+    }
+
+    /// Enforce the owner limit, allocate a project identifier and insert the
+    /// record as one atomic decision.
+    ///
+    /// `IMMEDIATE` takes SQLite's write lock before the count, so two concurrent
+    /// creations cannot both observe a free slot or the same project id.
+    pub fn reserve(
+        &self,
+        workspace: &mut Workspace,
+        owner_limit: u32,
+    ) -> Result<(), WorkspaceError> {
+        let mut connection = self.connection()?;
+
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_sqlite)?;
 
-        Ok(())
+        let owned = count_owned_in(&transaction, &workspace.owner_id)?;
+
+        if owned >= owner_limit {
+            return Err(WorkspaceError::LimitReached);
+        }
+
+        workspace.project_id = next_project_id_in(&transaction)?;
+
+        insert_in(&transaction, workspace)?;
+
+        transaction.commit().map_err(map_sqlite)
     }
 
     pub fn get(&self, id: &str) -> Result<Option<Workspace>, WorkspaceError> {
@@ -274,39 +262,14 @@ impl Store {
     pub fn count_owned(&self, owner: &str) -> Result<u32, WorkspaceError> {
         let connection = self.connection()?;
 
-        let count: i64 = connection
-            .query_row(
-                "SELECT count(*) FROM workspaces WHERE owner_id = ?1 AND state != 'deleting'",
-                params![owner],
-                |row| row.get(0),
-            )
-            .map_err(map_sqlite)?;
-
-        Ok(count as u32)
+        count_owned_in(&connection, owner)
     }
 
     /// Next free project identifier for this instance.
     pub fn next_project_id(&self) -> Result<u32, WorkspaceError> {
         let connection = self.connection()?;
 
-        let maximum: Option<i64> = connection
-            .query_row("SELECT max(project_id) FROM workspaces", [], |row| {
-                row.get(0)
-            })
-            .map_err(map_sqlite)?;
-
-        let next = match maximum {
-            Some(value) => (value as u32).saturating_add(1),
-            None => workspace_runtime::quota::FIRST_WORKSPACE_PROJECT_ID,
-        };
-
-        if next > workspace_runtime::quota::MAX_PROJECT_ID {
-            return Err(WorkspaceError::Storage(
-                "no project identifiers left on this instance".into(),
-            ));
-        }
-
-        Ok(next)
+        next_project_id_in(&connection)
     }
 
     pub fn set_state(
@@ -459,6 +422,84 @@ fn map_sqlite(error: rusqlite::Error) -> WorkspaceError {
     WorkspaceError::Database(error.to_string())
 }
 
+fn count_owned_in(connection: &Connection, owner: &str) -> Result<u32, WorkspaceError> {
+    let count: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM workspaces WHERE owner_id = ?1 AND state != 'deleting'",
+            params![owner],
+            |row| row.get(0),
+        )
+        .map_err(map_sqlite)?;
+
+    Ok(count as u32)
+}
+
+fn next_project_id_in(connection: &Connection) -> Result<u32, WorkspaceError> {
+    let maximum: Option<i64> = connection
+        .query_row("SELECT max(project_id) FROM workspaces", [], |row| {
+            row.get(0)
+        })
+        .map_err(map_sqlite)?;
+
+    let next = match maximum {
+        Some(value) => (value as u32).saturating_add(1),
+        None => workspace_runtime::quota::FIRST_WORKSPACE_PROJECT_ID,
+    };
+
+    if next > workspace_runtime::quota::MAX_PROJECT_ID {
+        return Err(WorkspaceError::Storage(
+            "no project identifiers left on this instance".into(),
+        ));
+    }
+
+    Ok(next)
+}
+
+fn insert_in(connection: &Connection, workspace: &Workspace) -> Result<(), WorkspaceError> {
+    connection
+        .execute(
+            "INSERT INTO workspaces (
+                id, owner_id, name, execution_mode, state, capabilities, image,
+                network_mode, cpu_millis, memory_mib, pids, disk_mib, files,
+                max_job_seconds, project_id, container_name, created_at_unix,
+                updated_at_unix, last_activity_unix, ttl_seconds, expires_at_unix,
+                pinned, error
+             ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23
+             )",
+            params![
+                workspace.id,
+                workspace.owner_id,
+                workspace.name,
+                workspace.execution_mode.as_str(),
+                workspace.state.as_str(),
+                serde_json::to_string(&workspace.capabilities)
+                    .map_err(|error| WorkspaceError::Database(error.to_string()))?,
+                workspace.image,
+                workspace.network_mode,
+                workspace.limits.cpu_millis,
+                workspace.limits.memory_mib as i64,
+                workspace.limits.pids,
+                workspace.limits.disk_mib as i64,
+                workspace.limits.files as i64,
+                workspace.limits.max_job_seconds as i64,
+                workspace.project_id,
+                workspace.container_name,
+                workspace.created_at_unix,
+                workspace.updated_at_unix,
+                workspace.last_activity_unix,
+                workspace.ttl_seconds as i64,
+                workspace.expires_at_unix,
+                i64::from(workspace.pinned),
+                workspace.error,
+            ],
+        )
+        .map_err(map_sqlite)?;
+
+    Ok(())
+}
+
 fn row_to_workspace(row: &rusqlite::Row<'_>) -> rusqlite::Result<Workspace> {
     let capabilities: String = row.get(5)?;
     let mode: String = row.get(3)?;
@@ -563,10 +604,6 @@ impl Manager {
             None => ExecutionMode::Ephemeral,
         };
 
-        if self.store.count_owned(owner)? >= MAX_WORKSPACES_PER_OWNER {
-            return Err(WorkspaceError::LimitReached);
-        }
-
         let modules = workspace_core::capabilities::resolve(&request.capabilities)
             .map_err(|error| WorkspaceError::Capability(error.message()))?;
 
@@ -596,7 +633,7 @@ impl Manager {
         let now = unix_now();
         let id = Uuid::new_v4().to_string();
 
-        let workspace = Workspace {
+        let mut workspace = Workspace {
             id: id.clone(),
             owner_id: owner.to_owned(),
             name: request.name.trim().to_owned(),
@@ -606,7 +643,7 @@ impl Manager {
             image: self.settings.base_image.clone(),
             network_mode: self.settings.network_mode.clone(),
             limits,
-            project_id: self.store.next_project_id()?,
+            project_id: 0,
             container_name: None,
             created_at_unix: now,
             updated_at_unix: now,
@@ -617,8 +654,11 @@ impl Manager {
             error: None,
         };
 
-        // Write-ahead: the record exists before any external resource.
-        self.store.insert(&workspace)?;
+        // Write-ahead: the record exists before any external resource. The
+        // owner limit, the project identifier and the insert are one
+        // transaction, so concurrent creations cannot overshoot either.
+        self.store
+            .reserve(&mut workspace, MAX_WORKSPACES_PER_OWNER)?;
 
         self.store
             .audit(owner, "workspace.reserve", Some(&id), "ok", None)?;
@@ -1395,5 +1435,144 @@ mod tests {
             files_path("/data", "550e8400-e29b-41d4-a716-446655440000"),
             "/data/workspaces/550e8400-e29b-41d4-a716-446655440000/files"
         );
+    }
+
+    fn store_fixture() -> (tempfile::TempDir, Store) {
+        let directory = tempfile::tempdir().unwrap();
+
+        crate::storage::initialize(directory.path()).unwrap();
+
+        let connection = crate::storage::open(directory.path()).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO users (id, issuer, subject, role, is_enabled, created_at_unix, updated_at_unix)
+                 VALUES ('owner-1', 'https://auth.example.com', 'subject-1', 'admin', 1, 1, 1);
+                 INSERT INTO users (id, issuer, subject, role, is_enabled, created_at_unix, updated_at_unix)
+                 VALUES ('owner-2', 'https://auth.example.com', 'subject-2', 'user', 1, 1, 1);",
+            )
+            .unwrap();
+        drop(connection);
+
+        let store = Store::new(directory.path());
+
+        (directory, store)
+    }
+
+    fn reservation(owner: &str) -> Workspace {
+        Workspace {
+            id: Uuid::new_v4().to_string(),
+            owner_id: owner.to_owned(),
+            name: "probe".into(),
+            execution_mode: ExecutionMode::Ephemeral,
+            state: WorkspaceState::Preparing,
+            capabilities: vec!["base".into()],
+            image: "debian@sha256:00".into(),
+            network_mode: "none".into(),
+            limits: Limits {
+                cpu_millis: 1000,
+                memory_mib: 512,
+                pids: 64,
+                disk_mib: 1024,
+                files: 1000,
+                max_job_seconds: 60,
+            },
+            project_id: 0,
+            container_name: None,
+            created_at_unix: 0,
+            updated_at_unix: 0,
+            last_activity_unix: 0,
+            ttl_seconds: 3600,
+            expires_at_unix: 3600,
+            pinned: false,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn concurrent_reservations_never_exceed_the_owner_limit() {
+        let (_directory, store) = store_fixture();
+
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let store = store.clone();
+
+                std::thread::spawn(move || {
+                    let mut workspace = reservation("owner-1");
+
+                    store
+                        .reserve(&mut workspace, MAX_WORKSPACES_PER_OWNER)
+                        .map(|()| workspace.project_id)
+                })
+            })
+            .collect();
+
+        let mut reserved = Vec::new();
+        let mut refused = 0;
+
+        for handle in handles {
+            match handle.join().expect("thread") {
+                Ok(project_id) => reserved.push(project_id),
+                Err(WorkspaceError::LimitReached) => refused += 1,
+                Err(error) => panic!("unexpected reservation error: {error}"),
+            }
+        }
+
+        assert_eq!(reserved.len(), MAX_WORKSPACES_PER_OWNER as usize);
+        assert_eq!(refused, 8 - MAX_WORKSPACES_PER_OWNER as usize);
+
+        reserved.sort_unstable();
+        reserved.dedup();
+        assert_eq!(
+            reserved.len(),
+            MAX_WORKSPACES_PER_OWNER as usize,
+            "project ids must be unique"
+        );
+
+        assert_eq!(
+            store.count_owned("owner-1").unwrap(),
+            MAX_WORKSPACES_PER_OWNER
+        );
+    }
+
+    #[test]
+    fn a_failed_reservation_leaves_no_partial_record() {
+        let (_directory, store) = store_fixture();
+
+        let mut first = reservation("owner-1");
+        store.reserve(&mut first, MAX_WORKSPACES_PER_OWNER).unwrap();
+
+        // Reusing the primary key fails after the project id was chosen; the
+        // whole transaction must roll back, so neither the row nor the
+        // counter moves.
+        let mut duplicate = first.clone();
+        duplicate.name = "duplicate".into();
+
+        assert!(
+            store
+                .reserve(&mut duplicate, MAX_WORKSPACES_PER_OWNER)
+                .is_err()
+        );
+
+        assert_eq!(store.count_owned("owner-1").unwrap(), 1);
+        assert_eq!(store.get(&first.id).unwrap().unwrap().name, "probe");
+    }
+
+    #[test]
+    fn the_owner_limit_is_checked_before_a_project_id_is_allocated() {
+        let (_directory, store) = store_fixture();
+
+        for _ in 0..MAX_WORKSPACES_PER_OWNER {
+            let mut workspace = reservation("owner-2");
+            store
+                .reserve(&mut workspace, MAX_WORKSPACES_PER_OWNER)
+                .unwrap();
+        }
+
+        let mut extra = reservation("owner-2");
+        assert!(matches!(
+            store.reserve(&mut extra, MAX_WORKSPACES_PER_OWNER),
+            Err(WorkspaceError::LimitReached)
+        ));
+        assert_eq!(extra.project_id, 0);
     }
 }

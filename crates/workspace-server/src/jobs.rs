@@ -6,7 +6,7 @@
 //! bounded, so a runaway command cannot fill the database or the disk.
 
 use async_trait::async_trait;
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -52,6 +52,9 @@ pub enum JobError {
     #[error("the workspace already has an active job")]
     WorkspaceBusy,
 
+    #[error("the idempotency key was already used with different parameters")]
+    IdempotencyConflict,
+
     #[error("the execution runtime is not ready: {0}")]
     RuntimeUnavailable(String),
 
@@ -69,6 +72,7 @@ impl JobError {
             Self::NotFound => "job_not_found",
             Self::Forbidden => "forbidden",
             Self::WorkspaceBusy => "workspace_busy",
+            Self::IdempotencyConflict => "idempotency_conflict",
             Self::RuntimeUnavailable(_) => "runtime_not_ready",
             Self::Database(_) => "database_error",
             Self::Workspace(error) => error.code(),
@@ -80,7 +84,7 @@ impl JobError {
             Self::Invalid(_) => 400,
             Self::NotFound => 404,
             Self::Forbidden => 403,
-            Self::WorkspaceBusy => 409,
+            Self::WorkspaceBusy | Self::IdempotencyConflict => 409,
             Self::RuntimeUnavailable(_) => 503,
             Self::Database(_) => 500,
             Self::Workspace(error) => error.status(),
@@ -120,6 +124,101 @@ struct JobRecord {
     owner_id: String,
 }
 
+/// Result of storing a submission.
+#[derive(Debug, Clone)]
+pub enum InsertOutcome {
+    /// A new job row was written; the caller owns starting it.
+    Created(Job),
+    /// The idempotency key already identified this job; it must not restart.
+    Existing(Job),
+}
+
+fn validate_idempotency_key(key: &str) -> Result<(), JobError> {
+    if key.is_empty() || key.len() > 128 || key.chars().any(char::is_control) {
+        return Err(JobError::Invalid("invalid idempotency key"));
+    }
+
+    Ok(())
+}
+
+/// Look up the earlier submission for this key and prove it is the same request.
+fn existing_submission(
+    connection: &Connection,
+    owner: &str,
+    workspace_id: &str,
+    key: &str,
+    request: &ExecRequest,
+    timeout_seconds: u64,
+) -> Result<Option<String>, JobError> {
+    let row: Option<(String, String, String, String, String, i64)> = connection
+        .query_row(
+            "SELECT id, owner_id, argv, cwd, env, timeout_seconds FROM jobs
+             WHERE workspace_id = ?1 AND idempotency_key = ?2",
+            params![workspace_id, key],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| JobError::Database(error.to_string()))?;
+
+    let Some((id, stored_owner, argv, cwd, env, stored_timeout)) = row else {
+        return Ok(None);
+    };
+
+    if stored_owner != owner {
+        return Err(JobError::Forbidden);
+    }
+
+    if !same_submission(&argv, &cwd, &env, stored_timeout, request, timeout_seconds)? {
+        return Err(JobError::IdempotencyConflict);
+    }
+
+    Ok(Some(id))
+}
+
+fn same_submission(
+    stored_argv: &str,
+    stored_cwd: &str,
+    stored_env: &str,
+    stored_timeout: i64,
+    request: &ExecRequest,
+    timeout_seconds: u64,
+) -> Result<bool, JobError> {
+    let argv: Vec<String> =
+        serde_json::from_str(stored_argv).map_err(|error| JobError::Database(error.to_string()))?;
+
+    let env: Vec<(String, String)> =
+        serde_json::from_str(stored_env).map_err(|error| JobError::Database(error.to_string()))?;
+
+    Ok(argv == request.argv
+        && stored_cwd == request.cwd
+        && env == request.env
+        && stored_timeout == timeout_seconds as i64)
+}
+
+fn record_in(connection: &Connection, id: &str) -> Result<Option<JobRecord>, JobError> {
+    connection
+        .query_row(
+            "SELECT id, workspace_id, state, argv, cwd, env, exit_code,
+                    created_at_unix, started_at_unix, finished_at_unix,
+                    timeout_seconds, error, stdout_bytes, stderr_bytes,
+                    stdout_truncated, stderr_truncated, owner_id, cancel_requested
+             FROM jobs WHERE id = ?1",
+            params![id],
+            row_to_record,
+        )
+        .optional()
+        .map_err(|error| JobError::Database(error.to_string()))
+}
+
 /// Durable job storage.
 #[derive(Debug, Clone)]
 pub struct JobStore {
@@ -143,33 +242,42 @@ impl JobStore {
         workspace_id: &str,
         request: &ExecRequest,
         timeout_seconds: u64,
-    ) -> Result<Job, JobError> {
-        let connection = self.connection()?;
-        let id = Uuid::new_v4().to_string();
+    ) -> Result<InsertOutcome, JobError> {
+        let mut connection = self.connection()?;
+
+        // `IMMEDIATE` takes the write lock before the duplicate check, so the
+        // check and the insert are one atomic decision even with concurrent
+        // submissions of the same key.
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| JobError::Database(error.to_string()))?;
 
         if let Some(key) = request.idempotency_key.as_deref() {
-            if key.is_empty() || key.len() > 128 || key.chars().any(char::is_control) {
-                return Err(JobError::Invalid("invalid idempotency key"));
-            }
+            validate_idempotency_key(key)?;
 
-            let existing: Option<String> = connection
-                .query_row(
-                    "SELECT id FROM jobs WHERE workspace_id = ?1 AND idempotency_key = ?2",
-                    params![workspace_id, key],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(|error| JobError::Database(error.to_string()))?;
-
-            if let Some(existing) = existing {
-                return self
-                    .record(&existing)?
+            if let Some(existing) = existing_submission(
+                &transaction,
+                owner,
+                workspace_id,
+                key,
+                request,
+                timeout_seconds,
+            )? {
+                let job = record_in(&transaction, &existing)?
                     .map(|record| record.job)
-                    .ok_or(JobError::NotFound);
+                    .ok_or(JobError::NotFound)?;
+
+                transaction
+                    .commit()
+                    .map_err(|error| JobError::Database(error.to_string()))?;
+
+                return Ok(InsertOutcome::Existing(job));
             }
         }
 
-        connection
+        let id = Uuid::new_v4().to_string();
+
+        transaction
             .execute(
                 "INSERT INTO jobs (
                     id, workspace_id, owner_id, state, argv, cwd, env,
@@ -190,26 +298,53 @@ impl JobStore {
             )
             .map_err(|error| JobError::Database(error.to_string()))?;
 
+        transaction
+            .commit()
+            .map_err(|error| JobError::Database(error.to_string()))?;
+
         self.record(&id)?
-            .map(|record| record.job)
+            .map(|record| InsertOutcome::Created(record.job))
             .ok_or(JobError::NotFound)
+    }
+
+    /// Return the job already stored for this idempotency key, if any.
+    ///
+    /// A key reused with different parameters is a client error, never a second
+    /// execution.
+    pub fn existing_submission(
+        &self,
+        owner: &str,
+        workspace_id: &str,
+        request: &ExecRequest,
+        timeout_seconds: u64,
+    ) -> Result<Option<Job>, JobError> {
+        let Some(key) = request.idempotency_key.as_deref() else {
+            return Ok(None);
+        };
+
+        validate_idempotency_key(key)?;
+
+        let connection = self.connection()?;
+
+        let Some(existing) = existing_submission(
+            &connection,
+            owner,
+            workspace_id,
+            key,
+            request,
+            timeout_seconds,
+        )?
+        else {
+            return Ok(None);
+        };
+
+        record_in(&connection, &existing).map(|record| record.map(|record| record.job))
     }
 
     fn record(&self, id: &str) -> Result<Option<JobRecord>, JobError> {
         let connection = self.connection()?;
 
-        connection
-            .query_row(
-                "SELECT id, workspace_id, state, argv, cwd, env, exit_code,
-                        created_at_unix, started_at_unix, finished_at_unix,
-                        timeout_seconds, error, stdout_bytes, stderr_bytes,
-                        stdout_truncated, stderr_truncated, owner_id, cancel_requested
-                 FROM jobs WHERE id = ?1",
-                params![id],
-                row_to_record,
-            )
-            .optional()
-            .map_err(|error| JobError::Database(error.to_string()))
+        record_in(&connection, id)
     }
 
     pub fn get(&self, id: &str) -> Result<Option<Job>, JobError> {
@@ -544,7 +679,14 @@ impl Executor {
         job::validate_cwd(&request.cwd).map_err(JobError::Invalid)?;
         job::validate_env(&request.env).map_err(JobError::Invalid)?;
 
-        let status = self.monitor.status().await;
+        let mut status = self.monitor.status().await;
+
+        // A stopped WSL2 distribution or a restarted rootless engine is a
+        // normal idle state, not an outage. Retry once under the startup
+        // timeout before answering `runtime_not_ready`.
+        if !status.execution_ready && self.monitor.recover().await {
+            status = self.monitor.refresh().await;
+        }
 
         if !status.execution_ready {
             return Err(JobError::RuntimeUnavailable(
@@ -572,10 +714,6 @@ impl Executor {
             return Err(JobError::Invalid("allowlist networking is not configured"));
         }
 
-        if self.store.active_for_workspace(workspace_id)? {
-            return Err(JobError::WorkspaceBusy);
-        }
-
         let timeout = request
             .timeout_seconds
             .unwrap_or(workspace.limits.max_job_seconds)
@@ -587,7 +725,24 @@ impl Executor {
                     .min(self.settings.max_timeout_seconds),
             );
 
-        let job = self.store.insert(owner, workspace_id, &request, timeout)?;
+        // A retry of an accepted submission returns the original job and never
+        // starts it again. This is checked before the busy guard on purpose: a
+        // retry of a running job must observe that job, not `workspace_busy`.
+        if let Some(job) = self
+            .store
+            .existing_submission(owner, workspace_id, &request, timeout)?
+        {
+            return Ok(job);
+        }
+
+        if self.store.active_for_workspace(workspace_id)? {
+            return Err(JobError::WorkspaceBusy);
+        }
+
+        let job = match self.store.insert(owner, workspace_id, &request, timeout)? {
+            InsertOutcome::Existing(job) => return Ok(job),
+            InsertOutcome::Created(job) => job,
+        };
 
         // Queued jobs already count as activity, so the TTL follows the job.
         let _ = self.manager.touch(workspace_id);
@@ -1150,5 +1305,189 @@ mod tests {
 
         assert_eq!(stored, b"small");
         assert!(!truncated);
+    }
+
+    fn test_store() -> (tempfile::TempDir, JobStore) {
+        let dir = tempfile::tempdir().unwrap();
+
+        crate::storage::initialize(dir.path()).unwrap();
+
+        let connection =
+            rusqlite::Connection::open(crate::storage::database_path(dir.path())).unwrap();
+
+        connection
+            .execute(
+                "INSERT INTO users (id, issuer, subject, created_at_unix, updated_at_unix)
+                 VALUES ('owner', 'https://issuer.example', 'subject', 0, 0)",
+                [],
+            )
+            .unwrap();
+
+        connection
+            .execute(
+                "INSERT INTO workspaces (
+                    id, owner_id, name, execution_mode, state, capabilities, image,
+                    network_mode, cpu_millis, memory_mib, pids, disk_mib, files,
+                    max_job_seconds, project_id, created_at_unix, updated_at_unix,
+                    last_activity_unix, ttl_seconds, expires_at_unix
+                 ) VALUES (
+                    'ws', 'owner', 'test', 'ephemeral', 'created', '[\"base\"]', 'image',
+                    'none', 100, 128, 32, 10, 100, 60, 1020, 0, 0, 0, 60, 3600
+                 )",
+                [],
+            )
+            .unwrap();
+
+        let store = JobStore::new(dir.path());
+
+        (dir, store)
+    }
+
+    fn request(key: Option<&str>) -> ExecRequest {
+        ExecRequest {
+            argv: vec!["sh".to_owned(), "-c".to_owned(), "echo once".to_owned()],
+            cwd: String::new(),
+            env: Vec::new(),
+            timeout_seconds: Some(30),
+            idempotency_key: key.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn a_repeated_key_returns_the_original_job_instead_of_a_new_one() {
+        let (_dir, store) = test_store();
+        let request = request(Some("key-1"));
+
+        let job = match store.insert("owner", "ws", &request, 30).unwrap() {
+            InsertOutcome::Created(job) => job,
+            InsertOutcome::Existing(_) => panic!("first insert must create a job"),
+        };
+
+        match store.insert("owner", "ws", &request, 30).unwrap() {
+            InsertOutcome::Created(job) => panic!("duplicate insert created {}", job.id),
+            InsertOutcome::Existing(existing) => assert_eq!(existing.id, job.id),
+        }
+
+        let via_lookup = store
+            .existing_submission("owner", "ws", &request, 30)
+            .unwrap()
+            .expect("the key must resolve to the stored job");
+
+        assert_eq!(via_lookup.id, job.id);
+    }
+
+    #[test]
+    fn a_repeated_key_with_different_parameters_is_a_conflict() {
+        let (_dir, store) = test_store();
+
+        let created = store
+            .insert("owner", "ws", &request(Some("key-2")), 30)
+            .unwrap();
+
+        let mut changed = request(Some("key-2"));
+        changed.argv = vec!["sh".to_owned(), "-c".to_owned(), "echo twice".to_owned()];
+
+        assert!(matches!(
+            store.insert("owner", "ws", &changed, 30),
+            Err(JobError::IdempotencyConflict)
+        ));
+
+        assert!(matches!(
+            store.existing_submission("owner", "ws", &changed, 30),
+            Err(JobError::IdempotencyConflict)
+        ));
+
+        let job = match created {
+            InsertOutcome::Created(job) => job,
+            InsertOutcome::Existing(_) => panic!("expected a created job"),
+        };
+
+        let unchanged = store
+            .existing_submission("owner", "ws", &request(Some("key-2")), 30)
+            .unwrap()
+            .expect("matching request must resolve");
+        assert_eq!(unchanged.id, job.id);
+    }
+
+    #[test]
+    fn a_different_owner_cannot_reuse_the_key() {
+        let (_dir, store) = test_store();
+
+        store
+            .insert("owner", "ws", &request(Some("key-3")), 30)
+            .unwrap();
+
+        assert!(matches!(
+            store.insert("intruder", "ws", &request(Some("key-3")), 30),
+            Err(JobError::Forbidden)
+        ));
+    }
+
+    #[test]
+    fn concurrent_duplicates_create_exactly_one_job() {
+        let (_dir, store) = test_store();
+
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let store = store.clone();
+
+                std::thread::spawn(move || store.insert("owner", "ws", &request(Some("race")), 30))
+            })
+            .collect();
+
+        let mut created = 0;
+        let mut existing = 0;
+        let mut ids = Vec::new();
+
+        for handle in handles {
+            match handle.join().expect("thread").expect("insert") {
+                InsertOutcome::Created(job) => {
+                    created += 1;
+                    ids.push(job.id);
+                }
+                InsertOutcome::Existing(job) => {
+                    existing += 1;
+                    ids.push(job.id);
+                }
+            }
+        }
+
+        assert_eq!(created, 1, "exactly one submission may create a job");
+        assert_eq!(existing, 3);
+        assert!(ids.windows(2).all(|pair| pair[0] == pair[1]), "{ids:?}");
+    }
+
+    #[test]
+    fn rejection_of_a_completed_job_does_not_create_another() {
+        let (_dir, store) = test_store();
+
+        let job = match store
+            .insert("owner", "ws", &request(Some("done")), 30)
+            .unwrap()
+        {
+            InsertOutcome::Created(job) => job,
+            InsertOutcome::Existing(_) => panic!("expected a created job"),
+        };
+
+        store
+            .finish(
+                &job.id,
+                JobState::Succeeded,
+                Some(0),
+                None,
+                b"once",
+                b"",
+                false,
+                false,
+            )
+            .unwrap();
+
+        let replay = store
+            .existing_submission("owner", "ws", &request(Some("done")), 30)
+            .unwrap()
+            .expect("a completed job must still answer its key");
+
+        assert_eq!(replay.id, job.id);
+        assert_eq!(replay.state, JobState::Succeeded);
     }
 }
