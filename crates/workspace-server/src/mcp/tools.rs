@@ -75,13 +75,13 @@ pub fn capabilities_catalog(schema_version: u32, runtime: &RuntimeStatus) -> Val
             },
             {
                 "id": "workspace_manager",
-                "status": "in_progress",
-                "description": "Workspace lifecycle management is being completed.",
+                "status": "ready",
+                "description": "Workspace lifecycle: create, list, inspect, update, stop, start and delete, with quotas and TTL.",
             },
             {
                 "id": "job_execution",
-                "status": "in_progress",
-                "description": "Job execution inside isolated containers is being completed.",
+                "status": if runtime.execution_ready { "ready" } else { "not_ready" },
+                "description": "Job execution inside isolated containers. Requires a ready runtime; see runtime_blocking.",
             },
         ],
         "modules": modules,
@@ -130,5 +130,11 @@ mod tests {
 
         assert_eq!(catalog["services"][3]["id"], "docker_runtime");
         assert_eq!(catalog["services"][3]["status"], "not_ready");
+
+        // These services must never advertise an unfinished implementation.
+        assert_eq!(catalog["services"][4]["id"], "workspace_manager");
+        assert_eq!(catalog["services"][4]["status"], "ready");
+        assert_eq!(catalog["services"][5]["id"], "job_execution");
+        assert_eq!(catalog["services"][5]["status"], "not_ready");
     }
 }

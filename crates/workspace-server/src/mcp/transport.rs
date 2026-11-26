@@ -258,19 +258,36 @@ impl ServerHandler for GatewayServer {
         let result =
             dispatch::call(&self.services, &caller, request.name.as_ref(), &arguments).await;
 
-        let (text, is_error) = match result {
-            Ok(value) => (value.to_string(), false),
-            Err(error) => (error.to_json().to_string(), true),
+        let (payload, is_error) = match result {
+            Ok(value) => (value, false),
+            Err(error) => (error.to_json(), true),
         };
 
-        let content = vec![ContentBlock::text(text)];
-
-        Ok(CallToolResponse::Complete(if is_error {
-            CallToolResult::error(content)
-        } else {
-            CallToolResult::success(content)
-        }))
+        Ok(CallToolResponse::Complete(tool_result(payload, is_error)))
     }
+}
+
+/// Build a tool result carrying both the human-readable text and, for object
+/// payloads, the same JSON as `structuredContent`.
+///
+/// Clients that parse structured output were receiving no object at all, which
+/// surfaced as an empty result in the ChatGPT integration even though the tool
+/// had produced a full payload. Text stays authoritative for older clients.
+fn tool_result(payload: serde_json::Value, is_error: bool) -> CallToolResult {
+    let text = payload.to_string();
+    let content = vec![ContentBlock::text(text)];
+
+    let mut result = if is_error {
+        CallToolResult::error(content)
+    } else {
+        CallToolResult::success(content)
+    };
+
+    if !is_error && payload.is_object() {
+        result.structured_content = Some(payload);
+    }
+
+    result
 }
 
 /// Extract the verified caller identity from the HTTP request parts.
@@ -542,6 +559,42 @@ mod tests {
 
         headers.insert(header::AUTHORIZATION, "Bearer two tokens".parse().unwrap());
         assert!(bearer(&headers).is_none());
+    }
+
+    #[test]
+    fn object_payloads_are_also_returned_as_structured_content() {
+        let payload = serde_json::json!({
+            "path": "/hello.txt",
+            "size": 5,
+            "content": "hello",
+            "encoding": "utf-8",
+        });
+
+        let result = tool_result(payload.clone(), false);
+
+        assert_eq!(result.structured_content, Some(payload.clone()));
+        assert!(!result.is_error.unwrap_or(false));
+        assert_eq!(
+            result.content.len(),
+            1,
+            "the text form must stay available for older clients"
+        );
+        assert!(result.content[0].as_text().unwrap().text.contains("hello"));
+    }
+
+    #[test]
+    fn errors_are_text_only_and_never_structured() {
+        let result = tool_result(serde_json::json!({"error": "file_not_found"}), true);
+
+        assert!(result.structured_content.is_none());
+        assert_eq!(result.is_error, Some(true));
+    }
+
+    #[test]
+    fn non_object_payloads_stay_text_only() {
+        let result = tool_result(serde_json::json!(["a", "b"]), false);
+
+        assert!(result.structured_content.is_none());
     }
 
     #[test]

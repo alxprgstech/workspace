@@ -14,6 +14,7 @@ use workspace_runtime::status::RuntimeMonitor;
 use workspace_runtime::{Helper, RuntimeSettings};
 
 use crate::workspaces::{Manager, WorkspaceError, valid_id};
+use workspace_core::workspace::WorkspaceState;
 
 /// Largest text chunk returned by one read.
 pub const MAX_READ_BYTES: u64 = 1024 * 1024;
@@ -39,6 +40,12 @@ pub enum FilesError {
     #[error("file changed concurrently; re-read it first")]
     Conflict,
 
+    #[error("file already exists")]
+    AlreadyExists,
+
+    #[error("a file operation limit was exceeded")]
+    LimitExceeded,
+
     #[error("file does not exist")]
     Missing,
 
@@ -47,6 +54,9 @@ pub enum FilesError {
 
     #[error("the execution runtime is not ready: {0}")]
     RuntimeUnavailable(String),
+
+    #[error("the workspace is not ready for file operations (state: {0})")]
+    NotReady(&'static str),
 
     #[error("workspace error: {0}")]
     Workspace(#[from] WorkspaceError),
@@ -60,9 +70,12 @@ impl FilesError {
             Self::Forbidden => "forbidden",
             Self::TooLarge => "file_too_large",
             Self::Conflict => "file_conflict",
+            Self::AlreadyExists => "file_exists",
+            Self::LimitExceeded => "limit_exceeded",
             Self::Missing => "file_not_found",
             Self::Storage(_) => "storage_error",
             Self::RuntimeUnavailable(_) => "runtime_not_ready",
+            Self::NotReady(_) => "workspace_not_ready",
             Self::Workspace(error) => error.code(),
         }
     }
@@ -73,9 +86,11 @@ impl FilesError {
             Self::NotFound | Self::Missing => 404,
             Self::Forbidden => 403,
             Self::TooLarge => 413,
-            Self::Conflict => 409,
+            Self::Conflict | Self::AlreadyExists => 409,
+            Self::LimitExceeded => 413,
             Self::Storage(_) => 500,
             Self::RuntimeUnavailable(_) => 503,
+            Self::NotReady(_) => 409,
             Self::Workspace(error) => error.status(),
         }
     }
@@ -122,26 +137,41 @@ pub struct ExtractOutcome {
     pub bytes: u64,
 }
 
+/// Whether the workspace passed preparation, so its storage exists.
+///
+/// `Stopped` keeps the storage on disk, so files remain readable and writable
+/// without a container; every transitional or failed state does not.
+fn operations_ready(state: WorkspaceState) -> bool {
+    matches!(
+        state,
+        WorkspaceState::Created
+            | WorkspaceState::Running
+            | WorkspaceState::Idle
+            | WorkspaceState::Stopped
+    )
+}
+
 fn map_helper(error: workspace_runtime::RuntimeError) -> FilesError {
     use workspace_runtime::RuntimeError;
 
     match error {
-        RuntimeError::Helper { code, message: _ } if code == helper::code::NOT_FOUND => {
-            FilesError::Missing
-        }
-        RuntimeError::Helper { code, message } if code == helper::code::VERSION_MISMATCH => {
-            let _ = message;
-            FilesError::Conflict
-        }
-        RuntimeError::Helper { code, message } if code == helper::code::TOO_LARGE => {
-            let _ = message;
-            FilesError::TooLarge
-        }
-        RuntimeError::Helper { code, message } if code == helper::code::PATH_ESCAPE => {
-            let _ = (code, message);
-            FilesError::Invalid("path escapes the workspace")
-        }
-        RuntimeError::Helper { message, .. } => FilesError::Storage(message),
+        RuntimeError::Helper { code, message } => match code.as_str() {
+            helper::code::NOT_FOUND => FilesError::Missing,
+            helper::code::EXISTS => FilesError::AlreadyExists,
+            helper::code::PATH_ESCAPE => FilesError::Invalid("path escapes the workspace"),
+            helper::code::PATH_INVALID => FilesError::Invalid("invalid path"),
+            helper::code::NOT_A_FILE => FilesError::Invalid("the path is not a regular file"),
+            helper::code::NOT_A_DIRECTORY => FilesError::Invalid("the path is not a directory"),
+            helper::code::TOO_LARGE => FilesError::TooLarge,
+            helper::code::LIMIT => FilesError::LimitExceeded,
+            helper::code::ARCHIVE => FilesError::Invalid("invalid archive"),
+            helper::code::UNSUPPORTED => FilesError::Invalid("unsupported operation"),
+            helper::code::INVALID_REQUEST => FilesError::Invalid("invalid file request"),
+            helper::code::VERSION_MISMATCH => FilesError::Conflict,
+            // A permission or I/O failure is a server-side problem: reporting
+            // it as such keeps client errors distinguishable.
+            _ => FilesError::Storage(message),
+        },
         RuntimeError::NotConfigured | RuntimeError::Timeout(_) => {
             FilesError::RuntimeUnavailable(error.to_string())
         }
@@ -210,6 +240,10 @@ impl Files {
     /// Verify ownership before any file operation.
     async fn ensure_owned(&self, owner: &str, workspace_id: &str) -> Result<(), FilesError> {
         let workspace = self.manager.get_owned(owner, workspace_id).await?;
+
+        if !operations_ready(workspace.state) {
+            return Err(FilesError::NotReady(workspace.state.as_str()));
+        }
 
         // Significant activity: reading and editing files extends the TTL.
         let _ = self.manager.touch(&workspace.id);
@@ -707,6 +741,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn file_operations_require_prepared_storage() {
+        // Storage exists only after preparation completed, so a workspace in a
+        // transitional or terminal-failure state must answer `workspace_not_ready`
+        // instead of a misleading `file_not_found`.
+        for state in [
+            WorkspaceState::Preparing,
+            WorkspaceState::Starting,
+            WorkspaceState::Stopping,
+            WorkspaceState::Deleting,
+            WorkspaceState::Failed,
+            WorkspaceState::Expired,
+        ] {
+            assert!(!operations_ready(state), "{state:?}");
+        }
+
+        for state in [
+            WorkspaceState::Created,
+            WorkspaceState::Running,
+            WorkspaceState::Idle,
+            WorkspaceState::Stopped,
+        ] {
+            assert!(operations_ready(state), "{state:?}");
+        }
+    }
+
+    #[test]
+    fn not_ready_is_a_client_error_not_a_storage_failure() {
+        let error = FilesError::NotReady("preparing");
+
+        assert_eq!(error.code(), "workspace_not_ready");
+        assert_eq!(error.status(), 409);
+        assert!(error.to_string().contains("preparing"));
+    }
+
+    #[test]
     fn staging_identifiers_are_server_generated_uuids() {
         let staging = uuid::Uuid::new_v4().to_string();
 
@@ -719,5 +788,46 @@ mod tests {
         assert_eq!(FilesError::TooLarge.code(), "file_too_large");
         assert_eq!(FilesError::Conflict.code(), "file_conflict");
         assert_eq!(FilesError::Missing.status(), 404);
+        assert_eq!(FilesError::AlreadyExists.code(), "file_exists");
+        assert_eq!(FilesError::AlreadyExists.status(), 409);
+    }
+
+    fn helper_error(code: &str) -> workspace_runtime::RuntimeError {
+        workspace_runtime::RuntimeError::Helper {
+            code: code.to_owned(),
+            message: "detail".into(),
+        }
+    }
+
+    #[test]
+    fn client_mistakes_are_not_reported_as_storage_failures() {
+        // Absolute paths and duplicate `create` requests were classified as
+        // `storage_error` (500). They are caller errors and must stay 4xx.
+        let cases = [
+            (helper::code::PATH_INVALID, "invalid_request", 400),
+            (helper::code::EXISTS, "file_exists", 409),
+            (helper::code::NOT_A_FILE, "invalid_request", 400),
+            (helper::code::NOT_A_DIRECTORY, "invalid_request", 400),
+            (helper::code::LIMIT, "limit_exceeded", 413),
+            (helper::code::ARCHIVE, "invalid_request", 400),
+            (helper::code::UNSUPPORTED, "invalid_request", 400),
+        ];
+
+        for (helper_code, expected_code, expected_status) in cases {
+            let mapped = map_helper(helper_error(helper_code));
+
+            assert_eq!(mapped.code(), expected_code, "{helper_code}");
+            assert_eq!(mapped.status(), expected_status, "{helper_code}");
+        }
+    }
+
+    #[test]
+    fn genuine_server_failures_stay_storage_errors() {
+        for code in [helper::code::IO, helper::code::PERMISSION, "unknown"] {
+            let mapped = map_helper(helper_error(code));
+
+            assert_eq!(mapped.code(), "storage_error", "{code}");
+            assert_eq!(mapped.status(), 500, "{code}");
+        }
     }
 }
