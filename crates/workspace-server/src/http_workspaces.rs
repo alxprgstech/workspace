@@ -62,7 +62,13 @@ pub async fn create(
         Err(response) => return response,
     };
 
-    let runtime = state.runtime.status().await;
+    let mut runtime = state.runtime.status().await;
+
+    // Wake a cold engine before refusing: a stopped WSL2 distribution is an
+    // idle state, not a runtime failure.
+    if !runtime.infrastructure_ready && state.runtime.recover().await {
+        runtime = state.runtime.refresh().await;
+    }
 
     if !runtime.infrastructure_ready {
         return (

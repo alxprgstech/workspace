@@ -262,6 +262,25 @@ async fn workspace_create(
     };
 
     let manager = manager(services)?;
+
+    // A cold WSL2 engine is a normal idle state: try a bounded recovery before
+    // refusing the request, then report the real blocking reasons.
+    let mut runtime = services.runtime.status().await;
+
+    if !runtime.infrastructure_ready && services.runtime.recover().await {
+        runtime = services.runtime.refresh().await;
+    }
+
+    if !runtime.infrastructure_ready {
+        return Err(ToolError::new(
+            "runtime_not_ready",
+            format!(
+                "the execution runtime is not ready: {}",
+                runtime.blocking.join("; ")
+            ),
+        ));
+    }
+
     let workspace = manager
         .reserve(caller.user_id, &request)
         .await

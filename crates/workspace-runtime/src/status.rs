@@ -78,6 +78,14 @@ pub struct RuntimeStatus {
     pub platform: String,
     pub infrastructure_ready: bool,
     pub execution_ready: bool,
+    /// Coarse classification for clients: `ready`, `degraded`, `unavailable`
+    /// or `unconfigured`.
+    ///
+    /// `degraded` means the engine answers but isolation is not currently
+    /// proven (acceptance is missing, failed or stale). `unavailable` means the
+    /// engine does not answer at all. The two need different operator actions,
+    /// so they are never collapsed into one boolean client-side.
+    pub readiness: &'static str,
     pub engine: Option<EngineInfo>,
     pub storage: Option<FilesystemStatus>,
     pub helper: Option<HelperInfo>,
@@ -90,6 +98,22 @@ pub struct RuntimeStatus {
     pub checked_at_unix: i64,
 }
 
+fn readiness_label(
+    configured: bool,
+    infrastructure_ready: bool,
+    execution_ready: bool,
+) -> &'static str {
+    if !configured {
+        "unconfigured"
+    } else if execution_ready {
+        "ready"
+    } else if infrastructure_ready {
+        "degraded"
+    } else {
+        "unavailable"
+    }
+}
+
 impl RuntimeStatus {
     /// Status for a deployment that does not configure execution at all.
     pub fn unconfigured(reason: &str) -> Self {
@@ -99,6 +123,7 @@ impl RuntimeStatus {
             platform: std::env::consts::OS.to_owned(),
             infrastructure_ready: false,
             execution_ready: false,
+            readiness: "unconfigured",
             engine: None,
             storage: None,
             helper: None,
@@ -266,6 +291,35 @@ impl RuntimeMonitor {
         *self.acceptance.lock().await = None;
     }
 
+    /// Retry a transiently unavailable engine once, bounded by the startup
+    /// timeout.
+    ///
+    /// A stopped WSL2 distribution and its rootless engine are a *normal* idle
+    /// state: the next command wakes the distribution and the engine takes a
+    /// few seconds. Callers that are about to reject work because
+    /// `execution_ready` is false use this to distinguish that cold start from
+    /// a real failure instead of surfacing `runtime_not_ready` spuriously.
+    ///
+    /// The acceptance result is deliberately kept: an engine restart does not
+    /// invalidate the isolation proof, and re-running it is expensive.
+    pub async fn recover(&self) -> bool {
+        let Some(docker) = self.docker.as_ref() else {
+            return false;
+        };
+
+        // The cache may still describe the outage, so it must not answer the
+        // re-probe below.
+        *self.status_cache.lock().await = None;
+
+        if docker.wait_until_ready().await.is_err() {
+            return false;
+        }
+
+        *self.status_cache.lock().await = None;
+
+        self.status().await.execution_ready
+    }
+
     /// Re-probe without consulting the cache.
     pub async fn refresh(&self) -> RuntimeStatus {
         let Some(settings) = self.settings.as_ref() else {
@@ -330,6 +384,11 @@ impl RuntimeMonitor {
             platform: std::env::consts::OS.to_owned(),
             infrastructure_ready: probe.infrastructure_ready,
             execution_ready: probe.infrastructure_ready && acceptance_ok,
+            readiness: readiness_label(
+                true,
+                probe.infrastructure_ready,
+                probe.infrastructure_ready && acceptance_ok,
+            ),
             engine: probe.engine,
             storage: probe.storage,
             helper: probe.helper,
@@ -1225,7 +1284,39 @@ mod tests {
         assert!(!status.configured);
         assert!(!status.infrastructure_ready);
         assert!(!status.execution_ready);
+        assert_eq!(status.readiness, "unconfigured");
         assert!(!status.blocking.is_empty());
+    }
+
+    #[test]
+    fn readiness_separates_a_cold_engine_from_a_missing_acceptance() {
+        // A stopped WSL2 distribution: the engine does not answer.
+        assert_eq!(readiness_label(true, false, false), "unavailable");
+
+        // The engine answers but isolation is not proven (stale, failed or
+        // never-run acceptance). This is `degraded`, not `unavailable`.
+        assert_eq!(readiness_label(true, true, false), "degraded");
+
+        // Everything proven.
+        assert_eq!(readiness_label(true, true, true), "ready");
+
+        // No runtime configured at all.
+        assert_eq!(readiness_label(false, false, false), "unconfigured");
+    }
+
+    #[test]
+    fn a_degraded_status_still_reports_the_engine_check() {
+        let report = AcceptanceReport {
+            passed: false,
+            finished_at_unix: 0,
+            duration_ms: 1,
+            checks: vec![StatusCheck::new("a", true, false, "broken")],
+        };
+
+        // The classification must never hide the reason: blocking stays
+        // populated for a degraded runtime.
+        assert_eq!(report.blocking(), vec!["a: broken".to_owned()]);
+        assert_eq!(readiness_label(true, true, false), "degraded");
     }
 
     #[test]
