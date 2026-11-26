@@ -1,4 +1,241 @@
-# ALXPRGS Workspace — отчёт о завершении
+# ALXPRGS Workspace — приёмка обновления и релизов 0.2.0
+
+> **Статус на 26.11.2026, 20:30 MSK: задачи #17, #18 и #19 реализованы и
+> проверены на изолированном стенде. Production намеренно НЕ обновлялся и
+> продолжает работать на 0.1.0 / schema 9; обновление выполняется только после
+> отдельного разрешения владельца.** Публикация production-релиза не
+> выполнялась.
+
+## 1. Что сдано
+
+| Issue | Результат | Основные доказательства |
+| --- | --- | --- |
+| #17 — безопасное обновление и откат | Готово | единый updater для CLI и Web UI; journal + lock; preflight; backup; миграция 9→11; замена exe и WSL-компонентов; автоматический и ручной откат; recovery после прерывания |
+| #18 — воспроизводимые пакеты и релизы | Готово | подписанный пакет `0.2.0` для Windows x64 + static-pie musl helper/egress; release workflow реально запущен (TEST-подпись, без публикации) |
+| #19 — раздел обновлений в Web UI | Готово | страница `Updates`, RU/EN, light/dark, mobile, live-прогресс, reconnect, подтверждения active jobs и restore БД, скриншоты |
+
+Работа выполнена прямо в `main`; созданы подписанные коммиты:
+`54ac3e1` (движок и CLI), `5cd5de2` (Web UI), `d3ddf23` (сборка/релиз/доки),
+`bc56f17` и `ea2416b` (исправления, найденные при реальном запуске workflow).
+
+## 2. Финальный артефакт
+
+- Файл: `dist/workspace-0.2.0-windows-x64.zip`
+- Версия: **0.2.0**, канал `stable`
+- Коммит: `ea2416bc08d6cd8c3241e5ef4b63a9dde40ecac6` (чистое дерево)
+- SHA-256 пакета: `ba151fd27008d4c1b81527d5b131d03b741fc5db8df64846eeb1b418fa575efc`
+- SHA-256 манифеста: `602b0eb43b3262cd2ed18160a3a5770c98146e59c7742c31b60144aab5050f37`
+- Подпись Ed25519 проверена встроенным публичным ключом
+  `deploy/release-public-key.txt`.
+- Контрольная сумма: `dist/workspace-0.2.0-windows-x64.zip.sha256`;
+  сводка: `dist/release.json`.
+- Состав: `workspace.exe`, `linux/workspace-helper`, `linux/workspace-egress`,
+  5 скриптов `deploy/windows/`, `UPDATE.md`, `RELEASES.md`, манифест и подпись
+  (10 файлов). Все linux-бинарники — `static-pie`, без `INTERP`, проверено
+  `readelf` в WSL.
+
+Артефакт собран из чистого коммита и затем **реально установлен** на
+изолированный стенд: `/health` вернул `build_sha=ea2416b…`, `installed.json`
+записал тот же SHA. Это доказывает совпадение манифеста, бинарника и коммита.
+
+## 3. Что реализовано
+
+- **Единый движок** `workspace-server::update` для CLI и HTTP API: проверка
+  пакета, совместимости схемы/платформы/updater-format, подписи и хэшей каждого
+  файла; доверенный ключ встроен в бинарник.
+- **Транзакция**: drain → резервная копия (SQLite `VACUUM INTO` на работающей
+  БД, exe, config, WSL-компоненты) → остановка сервера → замена WSL-компонентов
+  → миграция → замена exe → запуск → проверка health (версия, build SHA, schema).
+- **Отказоустойчивость**: journal `state/update/journal.json` (+`.prev`),
+  lock с PID, recovery прерванной операции, автоматический откат при ошибке
+  health, сохранение post-update БД, safety copy при ручном откате.
+- **Windows-замена**: detached updater ждёт EOF launcher-а, чтобы отпустился
+  образ; сервер остаётся доступен для live-прогресса во время drain/backup,
+  затем updater сам запрашивает контролируемую остановку.
+- **Секреты**: `WORKSPACE_SSO_CLIENT_SECRET` и `WORKSPACE_AUTH_KEY` сохраняются
+  через DPAPI в `state/secrets.dat`; после обновления сервер стартует без
+  повторного ввода.
+- **CLI**: `workspace --version`, `workspace update --check`,
+  `workspace update --status`, `workspace update [--package PATH]`,
+  `workspace update --rollback`, `workspace update --bootstrap`; release-команды
+  `release keygen|sign|package|verify`.
+- **Web UI**: раздел «Обновления» только для администратора; установленная и
+  доступная версии, build SHA, changelog, совместимость, последняя проверка,
+  журнал этапов и прогресс, reconnect после перезапуска, подтверждение активных
+  задач, подтверждение восстановления БД, безопасный откат.
+- **Release**: `scripts/build-release.ps1` (Windows + Docker musl, allowlist,
+  deterministic ZIP, подпись, самопроверка), `scripts/build-linux-musl.sh`,
+  `.github/workflows/release.yml` (tags/manual, Windows/Linux/package/publish).
+
+## 4. Проверка CLI (реальные запуски, exit code 0)
+
+```text
+workspace --version
+ALXPRGS Workspace 0.2.0
+build: ea2416bc08d6cd8c3241e5ef4b63a9dde40ecac6
+
+workspace update --check --package dist/workspace-0.2.0-windows-x64.zip
+Installed: 0.2.0 (ea2416b…)
+Schema: 11
+Available: 0.2.0 (ea2416b…) channel stable runtime wsl2/none
+Compatibility: schema 9..=11
+Status: UP_TO_DATE
+
+workspace update --status
+Installed: 0.2.0 (ea2416b…), schema 11
+Active jobs: 0
+Update journal: rolled_back (100%)
+Message: installation recovered at version 0.2.0
+Rollback available: 0.2.1 -> 0.2.0
+```
+
+> `workspace --version` без `--config` показывает **detected default
+> installation** (на этой машине — production 0.1.0 / schema 9), а не
+> лабораторный экземпляр. Для стенда используйте
+> `workspace update --status --install-dir <lab>`.
+
+## 5. Изолированный E2E (не mock)
+
+Стенд: `%LOCALAPPDATA%\ALXPRGS\Workspace-Lab`, порт 8799, WSL-пути
+`/srv/alxprgs-workspace-lab/*`; production не затрагивался.
+
+| Сценарий | Результат |
+| --- | --- |
+| Центральное обновление 0.2.0 → 0.2.1 | `succeeded`, все 8 этапов completed |
+| Миграция schema 9 → 11 | instance ID, пользователи, настройки и workspace сохранены |
+| Замена WSL helper/egress/quota/sudoers | хэши изменились на 0.2.1; после отката вернулись 0.2.0 |
+| Остановка сервера | graceful shutdown watcher: 0.44 с |
+| Повторный старт без env | DPAPI-секреты загружены, SSO `enabled` |
+| Ручной откат 0.2.1 → 0.2.0 | `rolled_back`, exe/БД/WSL восстановлены, сервер запущен |
+| Прерывание updater на `install_runtime` | journal `interrupted (40%)`, lock освобождён, recovery-rollback `rolled_back`, сообщение `installation recovered at version 0.2.0` |
+| Health-failure (порт занят) | `start failed` + автоматический `rollback completed`; сервер 0.2.0 здоров |
+| Изменение БД после обновления | `database_restore_requires_ack=true`; UI требует checkbox; safety copy содержит sentinel, восстановленная БД — нет |
+| Legacy 0.1.0 → 0.2.0 (Lab B) | bootstrap с schema 9→11 и сохранением строк; откат на 0.1.0 |
+| Повторная установка финального чистого пакета | `0.2.0 -> 0.2.0`, health `ea2416b…` |
+
+Production не обновлялся; его health и публичный HTTPS проверены отдельно
+(см. §8).
+
+## 6. Web UI — сквозные проверки
+
+CDP-автоматизация в реальном Chrome (HTTPS-стенд с локальным сертификатом,
+`http://localhost:8443` → 8799):
+
+- `admin,screens,check`: 11/11 — страница и навигация только для админа,
+  установленная версия, 4 комбинации RU/EN × light/dark, mobile, проверка
+  обновления, отсутствие неожиданных console errors.
+- `apply`: **6/6** — предупреждение об активной задаче с checkbox, конкурентный
+  запрос `409`, **live-прогресс** («Резервное копирование · 20%», этапы),
+  reconnect-баннер, новая версия после перезапуска, без ошибок.
+- `rollback`: **4/4** — при изменённой БД требуется подтверждение, прогресс,
+  возврат на 0.2.0, без ошибок.
+- Non-admin: пункт навигации скрыт, прямой API — `403`.
+
+Скриншоты: `docs/screenshots/updates/` —
+`updates-ru-dark.png`, `updates-ru-light.png`, `updates-en-dark.png`,
+`updates-en-light.png`, `updates-mobile-ru-dark.png`, `updates-progress-ru-dark.png`,
+`updates-reconnect-ru-dark.png`, `updates-succeeded-ru-dark.png`,
+`updates-rollback-confirm-ru-dark.png`, `updates-rolled-back-ru-dark.png`,
+`updates-denied-user.png`.
+
+## 7. Release workflow — реальный запуск
+
+Workflow `.github/workflows/release.yml` запускался через `workflow_dispatch`
+на `ea2416b`, с TEST-подписью и **без публикации**:
+<https://github.com/alxprgstech/workspace/actions/runs/45862728172>
+
+- Windows x64: success; Linux musl: success; Signed release package: success;
+  Publish: skipped (by input).
+- Артефакт `workspace-0.2.0-windows-x64-TEST.zip`, SHA-256
+  `ac4a7543c3b038ebd67d83a7e42743550ff6dc317cc72f5b557c62e423e60923`;
+  манифест содержит `git_sha=ea2416b…-test` — эфемерная подпись и TEST-имя
+  исключают путаницу с production-релизом.
+- Итерации честно зафиксированы: первый запуск выявил, что `release package`
+  проверял TEST-пакет встроенным production-ключом (исправлено в `bc56f17`);
+  второй — ошибку приоритета PowerShell в имени TEST-пакета (исправлено в
+  `ea2416b`).
+- Реальная публикация GitHub Release **не выполнялась**: для неё нужен
+  `RELEASE_SIGNING_KEY_PKCS8_BASE64` и отдельное разрешение владельца.
+
+## 8. Quality gates (финальный коммит)
+
+| Проверка | Результат |
+| --- | --- |
+| `cargo fmt --all -- --check` | exit 0 |
+| `cargo test --workspace --all-features --locked` | **329 passed, 0 failed**, 6 ignored |
+| `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings` | exit 0 |
+| `git diff --check` | exit 0 |
+| `npm ci` | 0 vulnerabilities |
+| `npm run typecheck` | exit 0 |
+| `npm run build` | exit 0 |
+| `npm test` | 15 passed, 0 failed |
+| `release verify --package dist/workspace-0.2.0-windows-x64.zip` | OK |
+| Production `/health` (127.0.0.1:8765) | 200, 0.1.0, schema 9 |
+| Публичный `https://workspace.alxprgs.tech/health` | 200 |
+
+## 9. Ограничения и честные замечания
+
+1. **Production не обновлён** — это осознанное требование. Готовый пакет
+   `0.2.0` и bootstrap-команда переданы владельцу; обновление выполняется
+   только с его разрешением и после резервной копии.
+2. **GitHub-подпись коммитов**: в неинтерактивной сессии агента 1Password
+   SSH-agent не смог подписать (`failed to fill whole buffer`), поэтому коммиты
+   подписаны локальным ключом `debian-server`; криптографическая подпись
+   валидна, но GitHub может показать «Unverified», пока этот публичный ключ не
+   добавлен в аккаунт.
+3. **Live-прогресс**: этапы drain/backup видны в UI, пока сервер работает;
+   после контролируемой остановки страница показывает reconnect, а завершённые
+   этапы — после старта. Отдельного progress-сервера на время простоя нет.
+4. **CI TEST-сборка** использует эфемерный ключ и не устанавливается на
+   production; проверка встроенным ключом для неё ожидаемо отклоняет пакет.
+5. **WSL-стенд** имеет `storage.mounted` и `runtime.acceptance` в состоянии
+   NOT READY (лабораторный data-root не смонтирован); это ограничение стенда,
+   а не результата обновления. Полный runtime-E2E с контейнерами не входил в
+   этот прогон.
+6. Linux-компоненты собраны и проверены (`static-pie`, успешный CI job), но
+   полный сервер на Linux не запускался — целевая платформа 0.2.0 — Windows x64.
+7. Нагрузочное/длительное тестирование и проверка обновления с реальными
+   активными job-ами (кроме искусственной draining-записи) не проводились.
+
+## 10. Команды для владельца (не выполнены)
+
+Первый bootstrap на production (после резервной копии и с явными секретами):
+
+```powershell
+$env:WORKSPACE_SSO_CLIENT_SECRET = '<из хранилища>'
+$env:WORKSPACE_AUTH_KEY = '<из хранилища>'
+powershell -ExecutionPolicy Bypass -File deploy\windows\bootstrap-update.ps1 `
+  -Package 'dist\workspace-0.2.0-windows-x64.zip'
+```
+
+Последующие обновления:
+
+```powershell
+workspace update --check
+workspace update --package 'dist\workspace-0.2.0-windows-x64.zip'
+workspace update --rollback --yes --allow-data-restore
+```
+
+Bootstrap проверяет подпись, делает backup, мигрирует schema 9→11 и
+перезапускает сервер; при ошибке health автоматически откатывается.
+
+## 11. Закрытие issue
+
+- **#17** — закрывается: все команды и сценарии обновления/отката проверены,
+  включая прерывание и health-failure.
+- **#18** — закрывается: пакет собран, подписан, проверен и установлен; release
+  workflow реально отработал (TEST, без публикации).
+- **#19** — закрывается: UI-сценарии и скриншоты приложены; non-admin доступ
+  закрыт на сервере.
+
+---
+
+## Приложение A. Предыдущая приёмка MVP (историческая)
+
+> Ниже сохранён предыдущий отчёт. Он описывает состояние **до** обновления
+> 0.2.0; его утверждения о production относятся к прошлому этапу и не
+> отменяют текущий статус: production сейчас 0.1.0 / schema 9 и намеренно не
+> обновлялся.
 
 > **Статус: MVP развёрнут и публично доступен.** Действующий экземпляр обновлён
 > 26.11.2026 (схема 4 → 8, instance ID сохранён), публичный
