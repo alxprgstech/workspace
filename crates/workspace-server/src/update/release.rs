@@ -320,10 +320,35 @@ pub fn verify(
         None => TrustAnchor::embedded()?,
     };
 
+    verify_with_trust(package, &trust)
+}
+
+/// Verify a package against the public half of the key that signed it.
+///
+/// `release package` uses this for its self-check: a test build signed with an
+/// ephemeral key must still be internally consistent, while the deployment
+/// trust check remains the embedded key.
+pub fn verify_with_signing_key(
+    package: &Path,
+    key_path: &Path,
+) -> Result<super::manifest::VerifiedPackage, ReleaseError> {
+    let document = fs::read(key_path)?;
+    let key_pair = Ed25519KeyPair::from_pkcs8(&document)
+        .map_err(|_| ReleaseError::Crypto("cannot read the signing key".into()))?;
+    let public = STANDARD.encode(key_pair.public_key().as_ref());
+    let trust = TrustAnchor::from_base64(&public, "release signing key".into())?;
+
+    verify_with_trust(package, &trust)
+}
+
+fn verify_with_trust(
+    package: &Path,
+    trust: &TrustAnchor,
+) -> Result<super::manifest::VerifiedPackage, ReleaseError> {
     if package.is_dir() {
         return Ok(verify_package(
             package,
-            &trust,
+            trust,
             format!("local: {}", package.display()),
         )?);
     }
@@ -333,7 +358,7 @@ pub fn verify(
     Ok(super::manifest::extract_zip(
         package,
         staging.path(),
-        &trust,
+        trust,
         format!("archive: {}", package.display()),
     )?)
 }

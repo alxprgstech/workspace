@@ -925,7 +925,10 @@ fn run_release(command: ReleaseCommand) -> AppResult<ExitCode> {
 
             let manifest = update::release::build_package(&files, &output, &options, &key)?;
 
-            let verified = update::release::verify(&output, None)?;
+            // Verify against the key that just signed the package. The
+            // deployment trust check (embedded key) is performed separately by
+            // the build script and by `release verify`.
+            let verified = update::release::verify_with_signing_key(&output, &key)?;
             let summary = update::release::summarize(&output, &verified)?;
 
             println!("[OK] Release package: {}", output.display());
