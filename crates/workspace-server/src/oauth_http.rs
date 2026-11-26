@@ -4,7 +4,7 @@ use crate::oauth_store::{
 };
 use axum::{
     Form,
-    extract::{DefaultBodyLimit, Query},
+    extract::{DefaultBodyLimit, Query, RawQuery},
     response::Html,
 };
 use base64::{
@@ -156,6 +156,7 @@ async fn consent_page(
     State(state): State<Arc<OAuthHttp>>,
     method: Method,
     headers: HeaderMap,
+    raw_query: RawQuery,
 ) -> Response {
     if method != Method::GET {
         return StatusCode::METHOD_NOT_ALLOWED.into_response();
@@ -193,59 +194,23 @@ async fn consent_page(
     };
 
     let username = info.user.username.as_deref().unwrap_or(&info.user.subject);
+    let language = consent_language(raw_query.0.as_deref(), &headers);
+    let tag = consent_tag(
+        state.auth.secrets.encryption_key(),
+        &session_handle,
+        &handle,
+        &csrf,
+    );
 
-    let page = format!(
-        r#"<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Authorize Workspace access</title>
-<style>
-html {{color-scheme:light dark}}
-body {{font:16px system-ui,sans-serif;max-width:480px;margin:12vh auto;padding:24px}}
-main {{border:1px solid #8885;border-radius:16px;padding:28px}}
-h1 {{font-size:24px;margin-top:0}}
-p {{line-height:1.5}}
-button {{padding:12px 22px;border-radius:8px;cursor:pointer;margin:6px}}
-.approve {{background:#2563eb;color:white;border:0}}
-small {{opacity:.7;overflow-wrap:anywhere}}
-</style>
-</head>
-<body>
-<main>
-<small>ALXPRGS WORKSPACE</small>
-<h1>Authorize application</h1>
-<p><strong>{client}</strong> requests access to Workspace.</p>
-<p>Signed in as <strong>{username}</strong>.</p>
-<p>Permissions requested:</p>
-<ul>{scopes}</ul>
-<p><small>Resource: {resource}</small></p>
-<form method="post" action="/oauth/consent">
-<input type="hidden" name="csrf" value="{csrf}">
-<input type="hidden" name="request_handle" value="{handle}">
-<input type="hidden" name="session_tag" value="{tag}">
-<button class="approve" name="decision" value="approve">Allow access</button>
-<button name="decision" value="deny">Deny</button>
-</form>
-</main>
-</body>
-</html>"#,
-        client = escape(&pending.client_name),
-        username = escape(username),
-        scopes = crate::oauth_store::browser::requested_scopes(&pending.request)
-            .iter()
-            .map(|scope| format!("<li><code>{}</code></li>", escape(scope)))
-            .collect::<String>(),
-        resource = escape(state.store.resource()),
-        csrf = escape(&csrf),
-        handle = escape(&handle),
-        tag = consent_tag(
-            state.auth.secrets.encryption_key(),
-            &session_handle,
-            &handle,
-            &csrf,
-        ),
+    let page = render_consent_page(
+        language,
+        &pending.client_name,
+        username,
+        &crate::oauth_store::browser::requested_scopes(&pending.request),
+        state.store.resource(),
+        &csrf,
+        &handle,
+        &tag,
     );
 
     let mut response = Html(page).into_response();
@@ -277,6 +242,321 @@ small {{opacity:.7;overflow-wrap:anywhere}}
         .insert(header::CONTENT_SECURITY_POLICY, value);
 
     response
+}
+
+/// Official ALXPRGS mark, inlined because the consent page's CSP allows no
+/// external images. The file is the same asset the SPA serves from `/brand`.
+const BRAND_LOGO: &str = include_str!("../../../web/public/brand/logo-mark.svg");
+
+/// Server-rendered consent page. Placeholders are replaced after HTML escaping;
+/// `format!` is deliberately not used so the inline CSS needs no brace escaping.
+const CONSENT_TEMPLATE: &str = r#"<!doctype html>
+<html lang="%%LANG%%">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ALXPRGS Workspace — %%TITLE%%</title>
+<style>
+:root{color-scheme:dark;--canvas:#090a0c;--surface:#0f1115;--surface-2:#14171d;--border:#2a303a;--text:#f5f7fa;--secondary:#b6bec9;--tertiary:#929caa;--brand:#3b82f6;--brand-hover:#5594f8;--on-brand:#090a0c;--focus:#60a5fa;--info-surface:#11213a}
+@media (prefers-color-scheme: light){:root{color-scheme:light;--canvas:#f7f8fa;--surface:#fff;--surface-2:#f1f3f5;--border:#cbd2da;--text:#111318;--secondary:#4b5563;--tertiary:#606b78;--brand:#2563eb;--brand-hover:#1d4ed8;--on-brand:#fff;--focus:#2563eb;--info-surface:#eaf1ff}}
+*,*::before,*::after{box-sizing:border-box}
+body{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px;background:radial-gradient(520px 320px at 15% 0%,color-mix(in srgb,var(--brand) 14%,transparent),transparent 70%),var(--canvas);color:var(--text);font:14px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif;-webkit-font-smoothing:antialiased}
+.card{width:min(560px,100%);padding:28px;border:1px solid var(--border);border-radius:18px;background:var(--surface);box-shadow:0 20px 60px rgb(0 0 0 / .25)}
+.brand{display:flex;align-items:center;gap:12px;margin-bottom:18px}
+.brand svg{width:38px;height:38px}
+.brand small{color:var(--tertiary);font-size:11px;font-weight:600;letter-spacing:.08em}
+h1{margin:0 0 8px;font-size:24px;line-height:32px;letter-spacing:-.01em}
+.lead{margin:0 0 6px;color:var(--secondary)}
+.signed{margin:0 0 18px;color:var(--tertiary);font-size:13px}
+h2{margin:18px 0 10px;font-size:15px;line-height:22px}
+.hint{margin:0 0 10px;color:var(--tertiary);font-size:12.5px}
+ul.scopes{list-style:none;margin:0;padding:0;border:1px solid var(--border);border-radius:10px;overflow:hidden;background:var(--surface-2)}
+ul.scopes li{display:flex;gap:10px;align-items:baseline;padding:10px 12px;border-bottom:1px solid var(--border);flex-wrap:wrap}
+ul.scopes li:last-child{border-bottom:0}
+ul.scopes code{font-family:"Cascadia Code",Consolas,monospace;font-size:12px;color:var(--text);background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:1px 6px}
+ul.scopes span{color:var(--secondary);font-size:12.5px}
+.resource{margin:14px 0 0;color:var(--tertiary);font-size:12px;overflow-wrap:anywhere}
+.resource code{font-family:"Cascadia Code",Consolas,monospace}
+form{margin:0}
+.actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:20px}
+button{min-height:44px;padding:0 18px;border-radius:8px;font:inherit;font-weight:500;cursor:pointer;transition:background-color 160ms cubic-bezier(.2,.8,.2,1),border-color 160ms cubic-bezier(.2,.8,.2,1)}
+button:focus-visible,a:focus-visible{outline:2px solid var(--focus);outline-offset:2px}
+.allow{background:var(--brand);border:1px solid var(--brand);color:var(--on-brand);font-weight:600}
+.allow:hover{background:var(--brand-hover);border-color:var(--brand-hover)}
+.deny{background:transparent;border:1px solid var(--border);color:var(--text)}
+.deny:hover{background:var(--surface-2)}
+.languages{display:flex;gap:14px;margin-top:18px;font-size:12px}
+.languages a{color:var(--secondary);text-decoration:none}
+.languages a[aria-current="true"]{color:var(--text);font-weight:600}
+.languages a:hover{color:var(--text)}
+.note{margin:16px 0 0;color:var(--tertiary);font-size:12px}
+@media (max-width:480px){body{padding:14px}.card{padding:20px}.actions button{width:100%}}
+@media (prefers-reduced-motion: reduce){button{transition:none}}
+</style>
+</head>
+<body>
+<main class="card">
+<div class="brand">%%LOGO%%<small>%%BRAND%%</small></div>
+<h1>%%TITLE%%</h1>
+<p class="lead">%%LEAD%%</p>
+<p class="signed">%%SIGNED_IN%%</p>
+<h2>%%PERMISSIONS%%</h2>
+<p class="hint">%%SCOPES_HINT%%</p>
+<ul class="scopes">%%SCOPES%%</ul>
+<p class="resource">%%RESOURCE_LABEL%%: <code>%%RESOURCE%%</code></p>
+<form method="post" action="/oauth/consent">
+<input type="hidden" name="csrf" value="%%CSRF%%">
+<input type="hidden" name="request_handle" value="%%HANDLE%%">
+<input type="hidden" name="session_tag" value="%%TAG%%">
+<div class="actions">
+<button class="allow" name="decision" value="approve">%%ALLOW%%</button>
+<button class="deny" name="decision" value="deny">%%DENY%%</button>
+</div>
+</form>
+<p class="note">%%NOTE%%</p>
+%%LANGUAGE_SWITCH%%
+</main>
+</body>
+</html>"#;
+
+struct ConsentCopy {
+    title: &'static str,
+    lead: &'static str,
+    signed_in: &'static str,
+    permissions: &'static str,
+    scopes_hint: &'static str,
+    resource: &'static str,
+    allow: &'static str,
+    deny: &'static str,
+    note: &'static str,
+}
+
+const CONSENT_EN: ConsentCopy = ConsentCopy {
+    title: "Authorize access",
+    lead: "%CLIENT% requests access to ALXPRGS Workspace.",
+    signed_in: "Signed in as %USERNAME%.",
+    permissions: "Requested permissions",
+    scopes_hint: "The connector receives only the permissions listed below.",
+    resource: "Resource",
+    allow: "Allow access",
+    deny: "Deny",
+    note: "Workspace keeps only an encrypted server-side session. Access can be revoked later.",
+};
+
+const CONSENT_RU: ConsentCopy = ConsentCopy {
+    title: "Разрешить доступ",
+    lead: "%CLIENT% запрашивает доступ к ALXPRGS Workspace.",
+    signed_in: "Вы вошли как %USERNAME%.",
+    permissions: "Запрашиваемые разрешения",
+    scopes_hint: "Коннектор получит только перечисленные ниже разрешения.",
+    resource: "Ресурс",
+    allow: "Разрешить доступ",
+    deny: "Отклонить",
+    note: "Workspace хранит только зашифрованную серверную сессию. Доступ можно отозвать позже.",
+};
+
+fn consent_copy(language: &str) -> &'static ConsentCopy {
+    if language == "ru" {
+        &CONSENT_RU
+    } else {
+        &CONSENT_EN
+    }
+}
+
+/// Render the consent page. Kept separate from the handler so the escaping,
+/// localization and placeholder contract can be tested without a session.
+#[allow(clippy::too_many_arguments)]
+fn render_consent_page(
+    language: &str,
+    client: &str,
+    username: &str,
+    scopes: &[String],
+    resource: &str,
+    csrf: &str,
+    handle: &str,
+    tag: &str,
+) -> String {
+    let copy = consent_copy(language);
+
+    let scope_items = scopes
+        .iter()
+        .map(|scope| {
+            let description = scope_description(scope, language);
+
+            if description.is_empty() {
+                format!("<li><code>{}</code></li>", escape(scope))
+            } else {
+                format!(
+                    "<li><code>{}</code><span>{}</span></li>",
+                    escape(scope),
+                    escape(description)
+                )
+            }
+        })
+        .collect::<String>();
+
+    let language_switch = format!(
+        r#"<nav class="languages" aria-label="{label}"><a href="?lang=ru"{ru}>Русский</a><a href="?lang=en"{en}>English</a></nav>"#,
+        label = if language == "ru" {
+            "Язык страницы"
+        } else {
+            "Page language"
+        },
+        ru = current_attribute(language == "ru"),
+        en = current_attribute(language == "en"),
+    );
+
+    CONSENT_TEMPLATE
+        .replace("%%LANG%%", language)
+        .replace("%%TITLE%%", copy.title)
+        .replace("%%LANGUAGE_SWITCH%%", &language_switch)
+        .replace("%%LOGO%%", BRAND_LOGO)
+        .replace("%%BRAND%%", "ALXPRGS WORKSPACE")
+        .replace(
+            "%%LEAD%%",
+            &copy
+                .lead
+                .replace("%CLIENT%", &format!("<strong>{}</strong>", escape(client))),
+        )
+        .replace(
+            "%%SIGNED_IN%%",
+            &copy.signed_in.replace(
+                "%USERNAME%",
+                &format!("<strong>{}</strong>", escape(username)),
+            ),
+        )
+        .replace("%%PERMISSIONS%%", copy.permissions)
+        .replace("%%SCOPES_HINT%%", copy.scopes_hint)
+        .replace("%%SCOPES%%", &scope_items)
+        .replace("%%RESOURCE_LABEL%%", copy.resource)
+        .replace("%%RESOURCE%%", &escape(resource))
+        .replace("%%ALLOW%%", copy.allow)
+        .replace("%%DENY%%", copy.deny)
+        .replace("%%NOTE%%", copy.note)
+        .replace("%%CSRF%%", &escape(csrf))
+        .replace("%%HANDLE%%", &escape(handle))
+        .replace("%%TAG%%", &escape(tag))
+}
+
+fn current_attribute(active: bool) -> &'static str {
+    if active { " aria-current=\"true\"" } else { "" }
+}
+
+/// Explicit `?lang=` wins; otherwise the browser's Accept-Language decides,
+/// with English as the safe fallback for unknown languages.
+fn consent_language(raw_query: Option<&str>, headers: &HeaderMap) -> &'static str {
+    if let Some(query) = raw_query {
+        for pair in query.split('&') {
+            let mut parts = pair.splitn(2, '=');
+
+            if parts.next() != Some("lang") {
+                continue;
+            }
+
+            match parts.next() {
+                Some("ru") => return "ru",
+                Some("en") => return "en",
+                _ => {}
+            }
+        }
+    }
+
+    if let Some(value) = headers
+        .get(header::ACCEPT_LANGUAGE)
+        .and_then(|value| value.to_str().ok())
+    {
+        for part in value.split(',') {
+            let tag = part
+                .split(';')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase();
+
+            if tag == "ru" || tag.starts_with("ru-") {
+                return "ru";
+            }
+
+            if tag == "en" || tag.starts_with("en-") {
+                return "en";
+            }
+        }
+    }
+
+    "en"
+}
+
+/// Human-readable descriptions for the known scopes. The exact scope code is
+/// always shown as well; an unknown scope simply has no description.
+fn scope_description(scope: &str, language: &str) -> &'static str {
+    let russian = language == "ru";
+
+    match scope {
+        "workspace:read" => {
+            if russian {
+                "Чтение метаданных рабочих пространств"
+            } else {
+                "Read workspace metadata"
+            }
+        }
+        "workspace:write" => {
+            if russian {
+                "Создание и изменение рабочих пространств"
+            } else {
+                "Create and change workspaces"
+            }
+        }
+        "workspace:delete" => {
+            if russian {
+                "Удаление рабочих пространств"
+            } else {
+                "Delete workspaces"
+            }
+        }
+        "execution:run" => {
+            if russian {
+                "Запуск команд и заданий"
+            } else {
+                "Run commands and jobs"
+            }
+        }
+        "files:read" => {
+            if russian {
+                "Чтение файлов"
+            } else {
+                "Read workspace files"
+            }
+        }
+        "files:write" => {
+            if russian {
+                "Запись и редактирование файлов"
+            } else {
+                "Write and edit files"
+            }
+        }
+        "files:import" => {
+            if russian {
+                "Импорт файлов и ссылок"
+            } else {
+                "Import files and URLs"
+            }
+        }
+        "artifacts:read" => {
+            if russian {
+                "Чтение и скачивание артефактов"
+            } else {
+                "Read and download artifacts"
+            }
+        }
+        "artifacts:publish" => {
+            if russian {
+                "Публикация артефактов"
+            } else {
+                "Publish artifacts"
+            }
+        }
+        _ => "",
+    }
 }
 
 #[derive(Deserialize)]
@@ -533,4 +813,101 @@ pub(crate) fn router(auth: Arc<AuthState>, store: Arc<OAuthStore>) -> Router {
         .route("/oauth/revoke", post(revoke))
         .layer(DefaultBodyLimit::max(16 * 1024))
         .with_state(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_language_wins_and_accept_language_is_a_fallback() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::ACCEPT_LANGUAGE,
+            "ru-RU,ru;q=0.9,en;q=0.8".parse().unwrap(),
+        );
+
+        assert_eq!(consent_language(Some("lang=en"), &headers), "en");
+        assert_eq!(consent_language(Some("lang=ru"), &headers), "ru");
+        assert_eq!(consent_language(Some("lang=de"), &headers), "ru");
+        assert_eq!(consent_language(Some("other=1"), &headers), "ru");
+
+        headers.insert(header::ACCEPT_LANGUAGE, "de-DE,de;q=0.9".parse().unwrap());
+
+        assert_eq!(consent_language(None, &headers), "en");
+        assert_eq!(consent_language(None, &HeaderMap::new()), "en");
+    }
+
+    #[test]
+    fn consent_copy_and_scope_descriptions_are_localized() {
+        assert_eq!(consent_copy("ru").allow, "Разрешить доступ");
+        assert_eq!(consent_copy("en").allow, "Allow access");
+        assert!(scope_description("execution:run", "ru").contains("Запуск"));
+        assert_eq!(
+            scope_description("execution:run", "en"),
+            "Run commands and jobs"
+        );
+        assert_eq!(scope_description("workspace:unknown", "en"), "");
+    }
+
+    #[test]
+    fn consent_template_is_self_contained_and_csp_safe() {
+        for marker in [
+            "%%LANG%%",
+            "%%TITLE%%",
+            "%%LEAD%%",
+            "%%SCOPES%%",
+            "%%CSRF%%",
+            "%%TAG%%",
+        ] {
+            assert!(CONSENT_TEMPLATE.contains(marker), "{marker}");
+        }
+
+        // The page's CSP allows inline styles only: no scripts, no remote
+        // images, and the official mark is inlined instead of referenced.
+        assert!(CONSENT_TEMPLATE.contains("<style>"));
+        assert!(!CONSENT_TEMPLATE.contains("<script"));
+        assert!(!CONSENT_TEMPLATE.contains("<img"));
+        assert!(BRAND_LOGO.contains("<svg"));
+    }
+
+    #[test]
+    fn rendered_consent_page_is_localized_escaped_and_complete() {
+        let scopes = vec!["execution:run".to_owned(), "workspace:read".to_owned()];
+
+        let russian = render_consent_page(
+            "ru",
+            "Demo <script>",
+            "оператор",
+            &scopes,
+            "https://workspace.example.test/chatgpt/mcp",
+            "csrf-token",
+            "request-handle",
+            "tag",
+        );
+
+        assert!(russian.contains(r#"<html lang="ru">"#));
+        assert!(russian.contains("Разрешить доступ"));
+        assert!(russian.contains("Запуск команд и заданий"));
+        assert!(russian.contains("Demo &lt;script&gt;"));
+        assert!(!russian.contains("<script>"));
+        assert!(!russian.contains("%%"));
+        assert!(russian.contains(r#"href="?lang=en""#));
+
+        let english = render_consent_page(
+            "en",
+            "Demo",
+            "operator",
+            &scopes,
+            "https://workspace.example.test/chatgpt/mcp",
+            "csrf-token",
+            "request-handle",
+            "tag",
+        );
+
+        assert!(english.contains(r#"<html lang="en">"#));
+        assert!(english.contains("Allow access"));
+        assert!(english.contains("Run commands and jobs"));
+        assert!(!english.contains("%%"));
+    }
 }
