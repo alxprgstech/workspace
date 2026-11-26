@@ -18,9 +18,10 @@ serde.workspace = true
 serde_json.workspace = true
 cap-std = "3"
 sha2 = "0.10"
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 tar = "0.4"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
 [dev-dependencies]
 tempfile.workspace = true
+

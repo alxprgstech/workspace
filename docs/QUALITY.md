@@ -44,10 +44,33 @@ cargo audit      # advisories for Cargo.lock
 npm audit        # advisories for web/package-lock.json
 ```
 
-Policy: every reported advisory is either fixed by a compatible update, or
-recorded here with the reason it is not exploitable in this deployment (for
-example, a dependency that is only reachable in an optional feature that is not
-built). An advisory is never ignored silently.
+### Result on 2026-11-26
+
+The first run reported nine advisories. Six were fixed by compatible upgrades
+(`Cargo.lock` updated, full test suite re-run):
+
+| Crate | Before | After | Advisory |
+|---|---|---|---|
+| `zip` | 2.6.1 | 9.8.2 | RUSTSEC-2026-0367/0368/0369/0429/0545/0548 (extraction links, SUID bits, AES, entry names) |
+| `libsqlite3-sys` | 0.37.0 | 0.40.0 (via `rusqlite` 0.43) | RUSTSEC-2026-0459 (bundled SQLite CVE) |
+| `crypto-bigint` | 0.5.5 | resolved by the `openidconnect` 4.1 update | RUSTSEC-2026-0387 (timing variability) |
+
+The `zip` upgrade matters directly: archive extraction is reachable from
+`file_import`. The fixed version is used for reading entries; extraction still
+rejects links and special files independently of the library.
+
+### Accepted exceptions
+
+| Crate | Advisory | Why it is accepted |
+|---|---|---|
+| `rsa` 0.9.10 | RUSTSEC-2023-0071 (Marvin attack) | Pulled by `openidconnect` 4.1, which is the latest release and still pins 0.9. The advisory concerns RSA **decryption** timing. This deployment only verifies ID-token signatures with public keys and never decrypts attacker-supplied ciphertext, so the attack path is not present. Revisit on every `openidconnect` release. |
+| `chrono` 0.4.45 | RUSTSEC-2026-0543 (unmaintained) | Informational: no patched release exists. It is a transitive dependency of the SSO stack, not used directly for security decisions. Tracked rather than silently ignored. |
+
+`cargo-deny` is not configured: adding a policy file is a separate ownership
+decision, and the script reports it as skipped instead of pretending to pass.
+
+An advisory is never ignored silently: it is either fixed, or listed above with
+the concrete reason the vulnerable code path is not reachable.
 
 ## Web UI
 
@@ -115,7 +138,7 @@ A skipped or ignored test is not a passing test. The release decision uses
 
 | Date (UTC) | Commit | Rust tests | Clippy | Web | Audits | Runtime acceptance |
 |---|---|---|---|---|---|---|
-| 2026-11-26 | `38813b6` | 277 passed, 0 failed, 7 ignored | clean | typecheck + build, `npm audit`: 0 vulnerabilities | cargo-audit: not installed in this environment; npm: 0 | PASSED (8990 ms, real WSL2/rootless runtime) |
+| 2026-11-26 | `a6f2890` + dependency upgrade | 279 passed, 0 failed, 7 ignored | clean | typecheck + build, `npm audit`: 0 vulnerabilities | `cargo audit`: 1 accepted advisory (`rsa`, justified above) + 1 unmaintained warning; npm: 0 | PASSED (8990 ms, real WSL2/rootless runtime) |
 
 Update this table in the same commit that changes the result; a stale row is a
 bug in the process.

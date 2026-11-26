@@ -20,8 +20,8 @@ authors = ["ALXPRGS"]
 [workspace.dependencies]
 ring = "0.17"
 base64 = "0.22"
-openidconnect = { version = "=4.0.1", default-features = false, features = ["reqwest", "rustls-tls"] }
-rusqlite = { version = "0.39", features = ["bundled"] }
+openidconnect = { version = "4.1", default-features = false, features = ["reqwest", "rustls-tls"] }
+rusqlite = { version = "0.43", features = ["bundled"] }
 uuid = { version = "1", features = ["v4"] }
 tempfile = "3"
 rust-embed = { version = "8", features = ["debug-embed"] }
@@ -45,3 +45,5 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
+
+

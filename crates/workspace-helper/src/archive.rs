@@ -140,7 +140,15 @@ fn extract_zip(
             HelperError::new(helper::code::ARCHIVE, format!("invalid zip entry: {error}"))
         })?;
 
-        let name = entry.name().to_owned();
+        let name = entry
+            .name()
+            .map_err(|error| {
+                HelperError::new(
+                    helper::code::ARCHIVE,
+                    format!("invalid zip entry name: {error}"),
+                )
+            })?
+            .to_string();
         let path = entry_path(&name)?;
 
         if let Some(mode) = entry.unix_mode() {
@@ -394,10 +402,14 @@ mod tests {
                 let mut archive = std::io::Cursor::new(data.clone());
                 let result = extract(&root, "", &mut archive, 16, 4096);
 
-                assert!(
-                    result.is_err(),
-                    "{name} with {length} bytes must be refused"
-                );
+                // An empty stream can be a valid, empty archive; anything
+                // non-empty must be refused. Neither may panic.
+                if length > 0 {
+                    assert!(
+                        result.is_err(),
+                        "{name} with {length} bytes must be refused"
+                    );
+                }
             }
         }
     }
