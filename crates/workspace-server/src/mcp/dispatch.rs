@@ -809,7 +809,7 @@ mod tests {
         for definition in catalog::definitions() {
             let name = definition.tool.name.as_ref();
 
-            let error = call(&services, &caller, &name, &Map::new())
+            let error = call(&services, &caller, name, &Map::new())
                 .await
                 .expect_err(&format!("{name} must refuse an empty scope set"));
 
@@ -831,7 +831,7 @@ mod tests {
 
         for definition in catalog::definitions() {
             let name = definition.tool.name.as_ref();
-            let result = call(&services, &caller, &name, &Map::new()).await;
+            let result = call(&services, &caller, name, &Map::new()).await;
 
             if matches!(name, "server_info" | "capabilities_list") {
                 assert!(result.is_ok(), "{name} must answer without services");
