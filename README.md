@@ -12,6 +12,8 @@ and ALXPRGS SSO.
 - [ChatGPT built-in environment](docs/CHATGPT_ENVIRONMENT.md) — dated inventory of
   the tools available in ChatGPT's own sandbox, compared with this Workspace, and
   the rules for choosing where a task runs.
+- [Interface and design system](docs/UI.md) — ALXPRGS Design Language v1 tokens,
+  RU/EN localization, themes, motion, accessibility and browser acceptance.
 - [Status report](docs/STATUS_REPORT.md) — the latest verified runtime state.
 - [Completion report](COMPLETION_REPORT.md) — deployment and acceptance record.
 
