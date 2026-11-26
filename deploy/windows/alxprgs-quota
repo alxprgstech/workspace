@@ -26,6 +26,47 @@ is_uint() {
     [[ "$1" =~ ^[0-9]{1,12}$ ]]
 }
 
+# Parse one `repquota -P` row into the stable seven-field report the service
+# consumes: <project> <used-bytes> <used-files> <soft-bytes> <hard-bytes>
+# <soft-files> <hard-files>.
+#
+# repquota prints an optional two-character status column ("--", "+-", ...)
+# between the identifier and the block columns. Its presence depends on the
+# e2fsprogs build and on whether a grace period is active, so the parser
+# detects that column instead of assuming a fixed offset. Every numeric field
+# must be an unsigned integer; anything else aborts instead of producing
+# plausible-looking zeroes.
+REPORT_AWK='
+function number(field) {
+    if (field !~ /^[0-9]+$/) {
+        exit 65
+    }
+    return field + 0
+}
+$1 == id || $1 == project {
+    if (NF < 7) {
+        exit 65
+    }
+    start = 2
+    if ($2 ~ /^[-+][-+]$/) {
+        start = 3
+    }
+    # The inode columns are always the last three fields. The grace column is
+    # blank while a quota is not exceeded, and awk then collapses it away, so
+    # the total field count varies between 7, 8 and 9 for the same layout.
+    if (NF < start + 5) {
+        exit 65
+    }
+    used_blocks = number($(start))
+    soft_blocks = number($(start + 1))
+    hard_blocks = number($(start + 2))
+    used_files = number($(NF - 2))
+    soft_files = number($(NF - 1))
+    hard_files = number($NF)
+    identifier = ($1 ~ /^#/) ? substr($1, 2) : $1
+    printf "%s %d %d %d %d %d %d\n", identifier, used_blocks * 1024, used_files, soft_blocks * 1024, hard_blocks * 1024, soft_files, hard_files
+}'
+
 command="${1:-}"
 shift || true
 
@@ -78,11 +119,10 @@ show)
 
     project="$1"
     is_uint "${project}" || fail "invalid project identifier"
+    (( project >= FIRST_PROJECT && project <= MAX_PROJECT )) || fail "project identifier out of range"
 
-    report="$(repquota -P "${DATA_ROOT}" 2>/dev/null | awk -v id="#${project}" '
-        $1 == id {
-            printf "%d %d %d %d %d %d %d\n", substr($1, 2), $3 * 1024, $7, $4 * 1024, $5 * 1024, $8, $9
-        }')"
+    report="$(repquota -P "${DATA_ROOT}" 2>/dev/null | awk -v id="#${project}" -v project="${project}" "${REPORT_AWK}")" || \
+        fail "cannot parse the quota report"
 
     if [[ -z "${report}" ]]; then
         echo "none"
@@ -99,6 +139,62 @@ clear)
     (( project >= FIRST_PROJECT && project <= MAX_PROJECT )) || fail "project identifier out of range"
 
     setquota -P "${project}" 0 0 0 0 "${DATA_ROOT}"
+    ;;
+
+--self-test)
+    # Fixture-driven check of the report parser. It reads no configuration,
+    # needs no privileges and changes nothing, so it is safe to run anywhere.
+    [[ $# -eq 0 ]] || fail "usage: --self-test"
+
+    selftest_case() {
+        local name="$1" project="$2" expected="$3" input="$4"
+        local actual
+
+        actual="$(printf '%s\n' "${input}" | awk -v id="#${project}" -v project="${project}" "${REPORT_AWK}")" \
+            || fail "self-test ${name}: the parser rejected a valid report"
+
+        [[ "${actual}" == "${expected}" ]] \
+            || fail "self-test ${name}: expected '${expected}', got '${actual}'"
+    }
+
+    selftest_case with-status 1020 "1020 0 0 0 2097152 200 200" \
+"Project quota on /srv/alxprgs-workspace/data (/dev/sdb)
+                        Blocks                               Inodes
+Project ID      Used   Soft   Hard  Grace      Used  Soft  Hard  Grace
+----------------------------------------------------------------------
+#1020           --      0      0   2048              0   200   200"
+
+    # An empty workspace: the id appears, usage is zero and the hard inode
+    # limit must be reported as the configured value, never as zero.
+    selftest_case empty-workspace 1021 "1021 0 0 0 2097152 200 200" \
+"Project ID      Used   Soft   Hard  Grace      Used  Soft  Hard  Grace
+----------------------------------------------------------------------
+#1021           --      0      0   2048              0   200   200"
+
+    # e2fsprogs without the status column: fields shift one position left.
+    selftest_case without-status 1022 "1022 1024 3 0 2097152 200 200" \
+"Project ID      Used   Soft   Hard  Grace      Used  Soft  Hard  Grace
+----------------------------------------------------------------------
+#1022            1      0   2048              3   200   200"
+
+    selftest_case other-project 1023 "" \
+"Project ID      Used   Soft   Hard  Grace      Used  Soft  Hard  Grace
+----------------------------------------------------------------------
+#1024           --      0      0   2048              0   200   200"
+
+    # A grace column that is actually populated ("7days") adds one field; the
+    # inode columns stay the last three.
+    selftest_case with-grace 1026 "1026 1024 3 0 2097152 200 200" \
+"Project ID      Used   Soft   Hard  Grace      Used  Soft  Hard  Grace
+----------------------------------------------------------------------
+#1026           --      1      0   2048  7days      3   200   200"
+
+    if printf '%s\n' '#1025 -- 0 not-a-number 2048 0 200 200' \
+        | awk -v id="#1025" -v project="1025" "${REPORT_AWK}" >/dev/null 2>&1; then
+        fail "self-test malformed: a non-numeric field was accepted"
+    fi
+
+    echo "alxprgs-quota: report parser self-test passed"
     ;;
 
 *)

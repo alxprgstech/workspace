@@ -134,6 +134,16 @@ pub async fn show(host: &Host, project_id: u32) -> Result<Option<QuotaUsage>, Ru
 
     let output = run_helper(host, "show", &[project_id.to_string()]).await?;
 
+    parse_report(project_id, &output)
+}
+
+/// Parse the stable seven-field report produced by the quota helper.
+///
+/// The helper normalises `repquota` output, so this parser only has to accept
+/// one layout and can reject everything else. The project identifier is
+/// verified: a report for a different project would silently attribute another
+/// workspace's usage to this one.
+fn parse_report(project_id: u32, output: &str) -> Result<Option<QuotaUsage>, RuntimeError> {
     if output.trim() == "none" {
         return Ok(None);
     }
@@ -151,6 +161,14 @@ pub async fn show(host: &Host, project_id: u32) -> Result<Option<QuotaUsage>, Ru
             .parse()
             .map_err(|_| RuntimeError::Protocol("unexpected quota report value".into()))
     };
+
+    let reported = value(0)? as u32;
+
+    if reported != project_id {
+        return Err(RuntimeError::Protocol(
+            "the quota report describes a different project".into(),
+        ));
+    }
 
     Ok(Some(QuotaUsage {
         project_id,
@@ -213,5 +231,36 @@ mod tests {
         usage.used_bytes = 0;
         usage.used_files = 100;
         assert!(usage.exceeded());
+    }
+
+    #[test]
+    fn an_empty_workspace_reports_zero_usage_and_real_limits() {
+        let parsed = parse_report(1021, "1021 0 0 0 2097152 200 200\n")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(parsed.used_files, 0);
+        assert_eq!(parsed.hard_files, 200);
+        assert_eq!(parsed.hard_bytes, 2_097_152);
+        assert!(!parsed.exceeded());
+    }
+
+    #[test]
+    fn a_report_for_another_project_is_rejected() {
+        // Regression: a shifted column used to surface the soft inode limit as
+        // `used_files` while `hard_files` silently became zero.
+        assert!(parse_report(1020, "1021 0 0 0 2097152 200 200").is_err());
+    }
+
+    #[test]
+    fn malformed_reports_are_rejected_instead_of_zero_filled() {
+        assert!(parse_report(1020, "1020 0 0 0 2097152 200").is_err());
+        assert!(parse_report(1020, "1020 0 zero 0 2097152 200 200").is_err());
+        assert!(parse_report(1020, "").is_err());
+    }
+
+    #[test]
+    fn a_missing_project_is_not_an_error() {
+        assert!(parse_report(1020, "none\n").unwrap().is_none());
     }
 }
