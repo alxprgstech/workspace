@@ -1,160 +1,97 @@
-import { useCallback, useEffect, useState } from 'react'
-import {
-  Activity,
-  AlertCircle,
-  Blocks,
-  CheckCircle2,
-  Cpu,
-  Database,
-  File as FileIcon,
-  Folder,
-  HardDrive,
-  LayoutDashboard,
-  Loader2,
-  LogOut,
-  MemoryStick,
-  Moon,
-  RefreshCw,
-  Settings,
-  ShieldAlert,
-  Sun,
-  Terminal,
-  UserRound,
-} from 'lucide-react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
+import { AlertCircle, ShieldCheck } from 'lucide-react'
 import {
   ApiError,
-  loadDashboard,
-  loadSession,
   listWorkspaces,
+  loadDashboard,
+  loadRuntime,
+  loadSession,
   logout,
   type DashboardData,
+  type RuntimeStatus,
   type SessionInfo,
   type Workspace,
-} from './api'
-import {
-  ArtifactsSection,
-  FilesSection,
-  JobsSection,
-  SettingsSection,
-  WorkspacesSection,
-} from './sections'
+} from './api.ts'
+import { I18nProvider, useI18n } from './i18n/provider.tsx'
+import type { MessageKey } from './i18n/index.ts'
+import { ToastProvider } from './components/ui.tsx'
+import { AppLayout } from './components/Layout.tsx'
+import { CommandPalette } from './components/CommandPalette.tsx'
+import { useTheme } from './theme/useTheme.ts'
+import { useRoute } from './router/useRoute.ts'
+import type { PageId } from './router/core.ts'
+import { LoginPage, type AuthPhase } from './pages/Login.tsx'
+import { DashboardPage } from './pages/Dashboard.tsx'
+import { WorkspacesPage } from './pages/Workspaces.tsx'
+import { JobsPage } from './pages/Jobs.tsx'
+import { FilesPage } from './pages/Files.tsx'
+import { ArtifactsPage } from './pages/Artifacts.tsx'
+import { SettingsPage } from './pages/Settings.tsx'
+import { dispatchRefresh } from './pages/shared.tsx'
 
-const sections = [
-  { id: 'dashboard', name: 'Dashboard', icon: LayoutDashboard },
-  { id: 'workspaces', name: 'Workspaces', icon: Folder },
-  { id: 'jobs', name: 'Jobs', icon: Terminal },
-  { id: 'files', name: 'Files', icon: FileIcon },
-  { id: 'artifacts', name: 'Artifacts', icon: Database },
-  { id: 'settings', name: 'Settings', icon: Settings },
-]
-
-type Phase = 'checking' | 'anonymous' | 'unavailable' | 'error' | 'authenticated'
-
-const authErrors: Record<string, string> = {
-  access_denied:
-    'Your ALXPRGS SSO identity was verified, but access to this ' +
-    'Workspace has not been approved. Contact the administrator.',
-  sso_unavailable:
-    'ALXPRGS SSO is temporarily unavailable. Try signing in again later.',
-  sso_denied: 'The sign-in request was declined by ALXPRGS SSO.',
-  login_failed: 'Signing in through ALXPRGS SSO failed. Try again.',
-  login_expired: 'The sign-in attempt expired. Start a new sign-in.',
-  session_expired: 'Your session expired. Sign in again.',
-  storage_error:
-    'Workspace could not complete the sign-in because of a local error.',
-  invalid_request: 'The sign-in response was invalid. Start a new sign-in.',
+const PAGE_TITLES: Record<PageId, MessageKey> = {
+  dashboard: 'nav.dashboard',
+  workspaces: 'nav.workspaces',
+  jobs: 'nav.jobs',
+  files: 'nav.files',
+  artifacts: 'nav.artifacts',
+  settings: 'nav.settings',
 }
 
-function Brand() {
-  return (
-    <div className="brand">
-      <div className="brand-icon">
-        <Blocks size={25} />
-      </div>
-      <div>
-        <strong>ALXPRGS</strong>
-        <span>Workspace</span>
-      </div>
-    </div>
-  )
-}
+function WorkspaceApp() {
+  const { t } = useI18n()
+  const theme = useTheme()
+  const [route, navigate] = useRoute()
 
-interface ThemeButtonProps {
-  dark: boolean
-  onToggle: () => void
-}
-
-function ThemeButton({ dark, onToggle }: ThemeButtonProps) {
-  return (
-    <button
-      className="icon-button"
-      aria-label="Toggle color theme"
-      onClick={onToggle}
-    >
-      {dark ? <Sun size={20} /> : <Moon size={20} />}
-    </button>
-  )
-}
-
-interface AuthPanelProps {
-  dark: boolean
-  onToggleTheme: () => void
-  children: React.ReactNode
-}
-
-function AuthPanel({ dark, onToggleTheme, children }: AuthPanelProps) {
-  return (
-    <div className="auth-shell">
-      <div className="auth-theme">
-        <ThemeButton dark={dark} onToggle={onToggleTheme} />
-      </div>
-
-      <main className="auth-card">
-        <Brand />
-        {children}
-      </main>
-    </div>
-  )
-}
-
-function App() {
-  const [dark, setDark] = useState(() => {
-    const stored = window.localStorage.getItem('workspace-theme')
-
-    return stored
-      ? stored === 'dark'
-      : window.matchMedia('(prefers-color-scheme: dark)').matches
-  })
-
-  const [phase, setPhase] = useState<Phase>('checking')
+  const [phase, setPhase] = useState<AuthPhase>('checking')
   const [session, setSession] = useState<SessionInfo | null>(null)
-  const [authNotice, setAuthNotice] = useState<string | null>(
-    () => new URLSearchParams(window.location.search).get('auth_error'),
-  )
-  const [check, setCheck] = useState(0)
+  const [authNotice, setAuthNotice] = useState<string | null>(null)
   const [fault, setFault] = useState<string | null>(null)
+  const [check, setCheck] = useState(0)
   const [loggingOut, setLoggingOut] = useState(false)
   const [signOutError, setSignOutError] = useState<string | null>(null)
+  const [commandsOpen, setCommandsOpen] = useState(false)
 
-  const [data, setData] = useState<DashboardData | null>(null)
-  const [error, setError] = useState<string | null>(null)
+  const [dashboard, setDashboard] = useState<DashboardData | null>(null)
+  const [runtime, setRuntime] = useState<RuntimeStatus | null>(null)
   const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
   const [revision, setRevision] = useState(0)
-  const [section, setSection] = useState('dashboard')
+
   const [workspaces, setWorkspaces] = useState<Workspace[]>([])
   const [workspaceError, setWorkspaceError] = useState<string | null>(null)
+  const [visited, setVisited] = useState<Set<PageId>>(() => new Set(['dashboard']))
 
   useEffect(() => {
-    document.documentElement.dataset.theme = dark ? 'dark' : 'light'
-    window.localStorage.setItem('workspace-theme', dark ? 'dark' : 'light')
-  }, [dark])
+    const params = new URLSearchParams(window.location.search)
+    const notice = params.get('auth_error')
 
-  // Never keep OAuth callback parameters in the address bar.
-  useEffect(() => {
-    if (window.location.search || window.location.hash) {
-      window.history.replaceState(null, '', window.location.pathname)
+    if (notice) {
+      setAuthNotice(notice)
+    }
+
+    if (window.location.search) {
+      window.history.replaceState(null, '', `${window.location.pathname}${window.location.hash}`)
     }
   }, [])
+
+  useEffect(() => {
+    setVisited(current => {
+      if (current.has(route.page)) {
+        return current
+      }
+
+      const next = new Set(current)
+
+      next.add(route.page)
+
+      return next
+    })
+  }, [route.page])
+
+  useEffect(() => {
+    document.title = `${t(PAGE_TITLES[route.page])} · ${t('app.title')}`
+  }, [route.page, t])
 
   useEffect(() => {
     const controller = new AbortController()
@@ -180,8 +117,6 @@ function App() {
             return
           }
 
-          // HTTP 503 means the session may still be refreshing.
-          // Never sign the user out because of a transient outage.
           if (reason instanceof ApiError && reason.status === 503) {
             if (attempt < 2) {
               await new Promise(resolve => setTimeout(resolve, 1500 * (attempt + 1)))
@@ -198,9 +133,7 @@ function App() {
             return
           }
 
-          setFault(
-            reason instanceof Error ? reason.message : String(reason),
-          )
+          setFault(reason instanceof Error ? reason.message : String(reason))
           setPhase('error')
 
           return
@@ -226,7 +159,7 @@ function App() {
     loadDashboard(controller.signal)
       .then(result => {
         if (!controller.signal.aborted) {
-          setData(result)
+          setDashboard(result)
         }
       })
       .catch((reason: unknown) => {
@@ -236,22 +169,15 @@ function App() {
 
         if (reason instanceof ApiError && reason.status === 401) {
           setSession(null)
-          setData(null)
+          setDashboard(null)
           setAuthNotice('session_expired')
           setPhase('anonymous')
 
           return
         }
 
-        setData(null)
-        setError(
-          reason instanceof ApiError && reason.status === 503
-            ? 'Workspace is temporarily unavailable. Your session was ' +
-              'kept; retry in a moment.'
-            : reason instanceof Error
-              ? reason.message
-              : String(reason),
-        )
+        setDashboard(null)
+        setError(reason instanceof Error ? reason.message : String(reason))
       })
       .finally(() => {
         if (!controller.signal.aborted) {
@@ -259,39 +185,20 @@ function App() {
         }
       })
 
+    loadRuntime(controller.signal)
+      .then(result => {
+        if (!controller.signal.aborted) {
+          setRuntime(result)
+        }
+      })
+      .catch(() => {
+        if (!controller.signal.aborted) {
+          setRuntime(null)
+        }
+      })
+
     return () => controller.abort()
   }, [phase, revision])
-
-  const signOut = useCallback(async () => {
-    setLoggingOut(true)
-    setSignOutError(null)
-
-    try {
-      await logout()
-
-      // Only a confirmed server-side sign-out ends the session locally.
-      setSession(null)
-      setData(null)
-      setError(null)
-      setAuthNotice(null)
-      setPhase('anonymous')
-    } catch (reason) {
-      // The outcome is unknown: the server may still hold a live session.
-      // Never present this as a successful sign-out.
-      setSignOutError(
-        reason instanceof ApiError && reason.status === 503
-          ? 'Workspace could not confirm the sign-out because the server is ' +
-            'temporarily unavailable. Your server session may still be active.'
-          : reason instanceof Error
-            ? `Workspace could not confirm the sign-out (${reason.message}). ` +
-              'Your server session may still be active.'
-            : 'Workspace could not confirm the sign-out. Your server session ' +
-              'may still be active.',
-      )
-    } finally {
-      setLoggingOut(false)
-    }
-  }, [])
 
   const refreshWorkspaces = useCallback(() => {
     listWorkspaces()
@@ -300,11 +207,9 @@ function App() {
         setWorkspaceError(null)
       })
       .catch((reason: unknown) => {
-        setWorkspaceError(
-          reason instanceof Error ? reason.message : 'Cannot load workspaces',
-        )
+        setWorkspaceError(reason instanceof Error ? reason.message : t('error.loadFailed'))
       })
-  }, [])
+  }, [t])
 
   useEffect(() => {
     if (phase === 'authenticated') {
@@ -312,353 +217,226 @@ function App() {
     }
   }, [phase, refreshWorkspaces])
 
-  const themeButton = (
-    <ThemeButton dark={dark} onToggle={() => setDark(value => !value)} />
+  useEffect(() => {
+    window.addEventListener('workspace:refresh', refreshWorkspaces)
+
+    return () => window.removeEventListener('workspace:refresh', refreshWorkspaces)
+  }, [refreshWorkspaces])
+
+  const refreshAll = useCallback(() => {
+    setRevision(value => value + 1)
+    refreshWorkspaces()
+    dispatchRefresh()
+  }, [refreshWorkspaces])
+
+  useEffect(() => {
+    const shortcut = (event: KeyboardEvent) => {
+      if (
+        event.key.toLowerCase() === 'k' &&
+        (event.ctrlKey || event.metaKey) &&
+        !event.altKey
+      ) {
+        event.preventDefault()
+        setCommandsOpen(value => !value)
+      }
+    }
+    const open = () => setCommandsOpen(true)
+
+    document.addEventListener('keydown', shortcut)
+    window.addEventListener('workspace:commands', open)
+
+    return () => {
+      document.removeEventListener('keydown', shortcut)
+      window.removeEventListener('workspace:commands', open)
+    }
+  }, [])
+
+  const signOut = useCallback(async () => {
+    setLoggingOut(true)
+    setSignOutError(null)
+
+    try {
+      await logout()
+
+      setSession(null)
+      setDashboard(null)
+      setRuntime(null)
+      setWorkspaces([])
+      setError(null)
+      setAuthNotice(null)
+      setPhase('anonymous')
+    } catch (reason) {
+      setSignOutError(
+        reason instanceof ApiError
+          ? `${reason.message} (HTTP ${reason.status})`
+          : reason instanceof Error
+            ? reason.message
+            : t('error.unexpected'),
+      )
+    } finally {
+      setLoggingOut(false)
+    }
+  }, [t])
+
+  const goToPage = useCallback(
+    (page: PageId) => {
+      navigate({ page })
+      document.getElementById('main')?.focus()
+    },
+    [navigate],
   )
+
+  const openWorkspace = useCallback(
+    (workspaceId?: string) => {
+      navigate(workspaceId ? { page: 'workspaces', workspaceId } : { page: 'workspaces' })
+    },
+    [navigate],
+  )
+
+  const setJobFilter = useCallback(
+    (workspaceId?: string) => {
+      navigate(workspaceId ? { page: 'jobs', jobWorkspaceId: workspaceId } : { page: 'jobs' })
+    },
+    [navigate],
+  )
+
+  const version = dashboard?.info.version ?? '0.1.0'
 
   if (phase !== 'authenticated' || !session) {
     return (
-      <AuthPanel dark={dark} onToggleTheme={() => setDark(value => !value)}>
-        {phase === 'checking' && (
-          <div className="auth-state" role="status">
-            <Loader2 size={26} className="spinning" />
-            <h1>Checking session</h1>
-            <p>Verifying your Workspace session.</p>
-          </div>
-        )}
-
-        {phase === 'anonymous' && (
-          <>
-            <h1>Sign in to Workspace</h1>
-            <p className="auth-lead">
-              Use your ALXPRGS account. No tokens are stored in the browser.
-            </p>
-
-            {authNotice && (
-              <div
-                className={`notice ${
-                  authNotice === 'access_denied' ? 'error' : 'warning'
-                }`}
-                role="alert"
-              >
-                <ShieldAlert size={20} />
-                <div>
-                  <strong>Sign-in failed</strong>
-                  <p>{authErrors[authNotice] ?? authErrors.invalid_request}</p>
-                </div>
-              </div>
-            )}
-
-            <a className="button primary auth-button" href="/auth/login">
-              <ShieldAlert size={19} />
-              Sign in with ALXPRGS SSO
-            </a>
-
-            <p className="auth-hint">
-              Sign-in happens on the ALXPRGS SSO server. Workspace keeps only
-              an encrypted server-side session.
-            </p>
-          </>
-        )}
-
-        {phase === 'unavailable' && (
-          <div className="auth-state" role="alert">
-            <AlertCircle size={26} />
-            <h1>Workspace is temporarily unavailable</h1>
-            <p>
-              Your session was not signed out. This usually means a token
-              refresh or a server restart is in progress.
-            </p>
-            <button
-              className="button primary"
-              onClick={() => setCheck(value => value + 1)}
-            >
-              Try again
-            </button>
-          </div>
-        )}
-
-        {phase === 'error' && (
-          <div className="auth-state" role="alert">
-            <AlertCircle size={26} />
-            <h1>Cannot check the session</h1>
-            <p>{fault ?? 'Unexpected error'}</p>
-            <button
-              className="button primary"
-              onClick={() => setCheck(value => value + 1)}
-            >
-              Try again
-            </button>
-          </div>
-        )}
-      </AuthPanel>
+      <LoginPage
+        phase={phase}
+        authNotice={authNotice}
+        fault={fault}
+        theme={theme}
+        onRetry={() => setCheck(value => value + 1)}
+      />
     )
   }
 
-  const resources = data?.info.resources
-
-  const metrics = resources ? [
-    {
-      label: 'CPU budget',
-      value: `${resources.cpu_millis / 1000} cores`,
-      icon: Cpu,
-    },
-    {
-      label: 'Memory budget',
-      value: `${resources.memory_mib / 1024} GiB`,
-      icon: MemoryStick,
-    },
-    {
-      label: 'Storage budget',
-      value: `${resources.storage_mib / 1024} GiB`,
-      icon: HardDrive,
-    },
-    {
-      label: 'Concurrent jobs',
-      value: String(resources.max_concurrent_jobs),
-      icon: Activity,
-    },
-  ] : []
-
-  const displayName = session.user.username ?? session.user.subject
-
-  const roleLabel = session.user.role === 'admin'
-    ? 'Administrator'
-    : 'User'
-
   return (
-    <div className="shell">
-      <aside className="sidebar">
-        <Brand />
+    <>
+      <a className="skip-link" href="#main">
+        {t('nav.label')}
+      </a>
+      <AppLayout
+        route={route}
+        navigate={goToPage}
+        theme={theme}
+        session={session}
+        version={version}
+        signingOut={loggingOut}
+        onSignOut={() => void signOut()}
+        onOpenCommands={() => setCommandsOpen(true)}
+      >
+        {signOutError && (
+          <div className="ui-alert ui-alert-danger" role="alert">
+            <span className="ui-alert-icon">
+              <AlertCircle size={18} aria-hidden="true" />
+            </span>
+            <div className="ui-alert-body">
+              <strong>{t('auth.signOutErrorTitle')}</strong>
+              <p className="ui-alert-text">{t('auth.signOutError')}</p>
+              <p className="ui-alert-text technical-detail">{signOutError}</p>
+              <button
+                type="button"
+                className="ui-button ui-secondary ui-compact"
+                disabled={loggingOut}
+                onClick={() => void signOut()}
+              >
+                <ShieldCheck size={15} aria-hidden="true" />
+                {t('auth.retrySignOut')}
+              </button>
+            </div>
+          </div>
+        )}
 
-        <div className="nav-heading">MANAGEMENT</div>
+        {workspaceError && (
+          <div className="ui-alert ui-alert-warning" role="alert">
+            <div className="ui-alert-body">
+              <strong>{t('error.cannotLoadWorkspaces')}</strong>
+              <p className="ui-alert-text">{workspaceError}</p>
+            </div>
+          </div>
+        )}
 
-        <nav aria-label="Main navigation">
-          {sections.map(entry => (
-            <button
-              key={entry.id}
-              className={`nav-item ${section === entry.id ? 'active' : ''}`}
-              aria-current={section === entry.id ? 'page' : undefined}
-              onClick={() => setSection(entry.id)}
-            >
-              <entry.icon size={19} />
-              <span>{entry.name}</span>
-            </button>
-          ))}
-        </nav>
-
-        <div className="sidebar-footer">
-          Self-hosted execution platform
+        <div className="page-host" hidden={route.page !== 'dashboard'}>
+          <DashboardPage
+            data={dashboard}
+            runtime={runtime}
+            loading={loading}
+            error={error}
+            onRefresh={refreshAll}
+          />
         </div>
-      </aside>
 
-      <main className="main">
-        <header className="topbar">
-          <div className="breadcrumb">Workspace / {sections.find(entry => entry.id === section)?.name}</div>
-
-          <div className="actions">
-            <div className="user-chip" title={session.user.issuer}>
-              <UserRound size={18} />
-              <div>
-                <strong>{displayName}</strong>
-                <span className={`role-badge ${session.user.role}`}>
-                  {roleLabel}
-                </span>
-              </div>
-            </div>
-
-            <button
-              className="icon-button"
-              aria-label="Sign out"
-              title="Sign out"
-              disabled={loggingOut}
-              onClick={() => void signOut()}
-            >
-              {loggingOut
-                ? <Loader2 size={19} className="spinning" />
-                : <LogOut size={19} />}
-            </button>
-
-            {themeButton}
-
-            <button
-              className="icon-button"
-              aria-label="Refresh dashboard"
-              disabled={loading}
-              onClick={() => setRevision(value => value + 1)}
-            >
-              <RefreshCw
-                size={19}
-                className={loading ? 'spinning' : ''}
-              />
-            </button>
+        {visited.has('workspaces') && (
+          <div className="page-host" hidden={route.page !== 'workspaces'}>
+            <WorkspacesPage
+              workspaces={workspaces}
+              active={route.page === 'workspaces'}
+              routeWorkspaceId={route.workspaceId}
+              onOpenWorkspace={openWorkspace}
+              refreshWorkspaces={refreshWorkspaces}
+            />
           </div>
-        </header>
+        )}
 
-        <section className="content">
-          <div className="page-heading">
-            <div>
-              <h1>{sections.find(entry => entry.id === section)?.name}</h1>
-              <p>
-                {section === 'dashboard' && 'Server overview and configured resource limits.'}
-                {section === 'workspaces' && 'Isolated execution workspaces, quotas and lifetimes.'}
-                {section === 'jobs' && 'Command execution and captured output.'}
-                {section === 'files' && 'Browse, edit and upload workspace files.'}
-                {section === 'artifacts' && 'Published immutable results and download links.'}
-                {section === 'settings' && 'Runtime diagnostics and capability catalog.'}
-              </p>
-            </div>
-
-            {data && (
-              <span className="status online">
-                <CheckCircle2 size={16} />
-                HTTP server online
-              </span>
-            )}
+        {visited.has('jobs') && (
+          <div className="page-host" hidden={route.page !== 'jobs'}>
+            <JobsPage
+              workspaces={workspaces}
+              active={route.page === 'jobs'}
+              routeWorkspaceId={route.jobWorkspaceId}
+              onFilterChange={setJobFilter}
+            />
           </div>
+        )}
 
-          {workspaceError && section !== 'dashboard' && (
-            <div className="notice error" role="alert">
-              <AlertCircle size={20} />
-              <div>
-                <strong>Cannot load workspaces</strong>
-                <p>{workspaceError}</p>
-              </div>
-            </div>
-          )}
-
-          {section === 'dashboard' && (<>
-          {signOutError && (
-            <div className="notice error" role="alert">
-              <ShieldAlert size={20} />
-              <div>
-                <strong>Sign-out was not confirmed</strong>
-                <p>{signOutError}</p>
-                <p className="notice-hint">
-                  You are still signed in on this page. Retry the sign-out, or
-                  close the browser if the server stays unreachable.
-                </p>
-                <button
-                  className="button primary"
-                  disabled={loggingOut}
-                  onClick={() => void signOut()}
-                >
-                  {loggingOut ? 'Signing out...' : 'Retry sign-out'}
-                </button>
-              </div>
-            </div>
-          )}
-
-          {error && (
-            <div className="notice error" role="alert">
-              <AlertCircle size={20} />
-              <div>
-                <strong>Cannot connect to Workspace</strong>
-                <p>{error}</p>
-              </div>
-            </div>
-          )}
-
-          {loading && !data && <p role="status">Loading server data...</p>}
-
-          {data && (
-            <>
-              {!data.readiness.runtime_ready && (
-                <div className="notice warning">
-                  <AlertCircle size={20} />
-                  <div>
-                    <strong>Execution runtime is not ready</strong>
-                    <p>{data.readiness.reason ?? 'Initialization pending'}</p>
-                  </div>
-                </div>
-              )}
-
-              <div className="metrics">
-                {metrics.map(metric => (
-                  <article className="card metric" key={metric.label}>
-                    <div className="metric-label">
-                      {metric.label}
-                      <metric.icon size={20} />
-                    </div>
-                    <strong>{metric.value}</strong>
-                    <small>Configured limit</small>
-                  </article>
-                ))}
-              </div>
-
-              <section className="card system">
-                <h2>System information</h2>
-                <dl>
-                  <dt>Product</dt>
-                  <dd>{data.info.product}</dd>
-                  <dt>Version</dt>
-                  <dd>{data.info.version}</dd>
-                  <dt>API version</dt>
-                  <dd>{data.info.api_version}</dd>
-                  <dt>Platform</dt>
-                  <dd>
-                    {data.info.platform} / {data.info.architecture}
-                  </dd>
-                  <dt>HTTP health</dt>
-                  <dd>{data.health.status}</dd>
-                  <dt>Execution runtime</dt>
-                  <dd>
-                    {data.readiness.runtime_ready ? 'Ready' : 'Not ready'}
-                  </dd>
-                  <dt>Instance ID</dt>
-                  <dd>{data.info.storage.instance_id}</dd>
-                  <dt>SQLite version</dt>
-                  <dd>{data.info.storage.sqlite_version}</dd>
-                  <dt>Database schema</dt>
-                  <dd>{data.info.storage.schema_version}</dd>
-                  <dt>Journal mode</dt>
-                  <dd>{data.info.storage.journal_mode.toUpperCase()}</dd>
-                  <dt>Instance created</dt>
-                  <dd>
-                    {new Date(
-                      data.info.storage.created_at_unix * 1000,
-                    ).toLocaleString()}
-                  </dd>
-                  <dt>Maximum active workspaces</dt>
-                  <dd>{data.info.resources.max_active_workspaces}</dd>
-                </dl>
-              </section>
-            </>
-          )}
-          </>)}
-
-          {section === 'workspaces' && (
-            <WorkspacesSection
+        {visited.has('files') && (
+          <div className="page-host" hidden={route.page !== 'files'}>
+            <FilesPage
               workspaces={workspaces}
-              refreshWorkspaces={refreshWorkspaces}
+              onPublished={() => navigate({ page: 'artifacts' })}
             />
-          )}
+          </div>
+        )}
 
-          {section === 'jobs' && (
-            <JobsSection
-              workspaces={workspaces}
-              refreshWorkspaces={refreshWorkspaces}
-            />
-          )}
+        {visited.has('artifacts') && (
+          <div className="page-host" hidden={route.page !== 'artifacts'}>
+            <ArtifactsPage active={route.page === 'artifacts'} />
+          </div>
+        )}
 
-          {section === 'files' && (
-            <FilesSection
-              workspaces={workspaces}
-              refreshWorkspaces={refreshWorkspaces}
-              onPublished={() => setSection('artifacts')}
-            />
-          )}
+        {visited.has('settings') && (
+          <div className="page-host" hidden={route.page !== 'settings'}>
+            <SettingsPage theme={theme} active={route.page === 'settings'} />
+          </div>
+        )}
+      </AppLayout>
 
-          {section === 'artifacts' && (
-            <ArtifactsSection onChanged={refreshWorkspaces} />
-          )}
-
-          {section === 'settings' && <SettingsSection />}
-
-        </section>
-      </main>
-    </div>
+      <CommandPalette
+        open={commandsOpen}
+        onClose={() => setCommandsOpen(false)}
+        navigate={goToPage}
+        theme={theme}
+        onRefresh={refreshAll}
+      />
+    </>
   )
 }
 
-export default App
+export default function App() {
+  const memoized = useMemo(
+    () => (
+      <I18nProvider>
+        <ToastProvider>
+          <WorkspaceApp />
+        </ToastProvider>
+      </I18nProvider>
+    ),
+    [],
+  )
+
+  return memoized
+}

@@ -5,7 +5,8 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-strip-types --test src/i18n/i18n.test.ts src/theme/theme.test.ts src/router/router.test.ts"
   },
   "keywords": [],
   "author": "ALXPRGS",

@@ -292,6 +292,7 @@ export interface RuntimeStatus {
   platform: string
   infrastructure_ready: boolean
   execution_ready: boolean
+  readiness?: 'ready' | 'degraded' | 'unavailable' | 'unconfigured'
   blocking: string[]
   checks: StatusCheck[]
 }
