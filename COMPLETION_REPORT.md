@@ -112,6 +112,12 @@ Rollback available: 0.2.1 -> 0.2.0
 | Изменение БД после обновления | `database_restore_requires_ack=true`; UI требует checkbox; safety copy содержит sentinel, восстановленная БД — нет |
 | Legacy 0.1.0 → 0.2.0 (Lab B) | bootstrap с schema 9→11 и сохранением строк; откат на 0.1.0 |
 | Повторная установка финального чистого пакета | `0.2.0 -> 0.2.0`, health `ea2416b…` |
+| Отсутствие обновления | `update --check`: `Status: UP_TO_DATE`, exit 0 |
+| Подменённый пакет | `--check` → `release package is not signed by the trusted key`, exit 2, установка не изменилась |
+| Нет секретов | `Update was not started: authentication secrets are not available…`, exit 2, health 200, версия не изменилась |
+| WSL-дистрибутив недоступен | `WSL distribution … is not installed`, exit 2, установка не изменилась |
+| Конкурентный запуск | второй запрос → `409 Conflict`, lock/journal не повреждены |
+| API-права | admin 200; без CSRF 403; чужой Origin 403; обычный пользователь 403 |
 
 Production не обновлялся; его health и публичный HTTPS проверены отдельно
 (см. §8).
