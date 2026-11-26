@@ -1374,6 +1374,32 @@ mod tests {
     }
 
     #[test]
+    fn jobs_are_scoped_to_their_owner() {
+        let (_dir, store) = test_store();
+
+        let job = match store
+            .insert("owner", "ws", &request(Some("scope")), 30)
+            .unwrap()
+        {
+            InsertOutcome::Created(job) => job,
+            InsertOutcome::Existing(_) => panic!("expected a created job"),
+        };
+
+        assert!(matches!(
+            store.owned("intruder", &job.id),
+            Err(JobError::Forbidden)
+        ));
+        assert!(matches!(
+            store.logs("intruder", &job.id, "stdout", 0, 1024),
+            Err(JobError::Forbidden)
+        ));
+        assert!(store.list("intruder", Some("ws")).unwrap().is_empty());
+        assert!(store.list("intruder", None).unwrap().is_empty());
+
+        assert_eq!(store.owned("owner", &job.id).unwrap().id, job.id);
+    }
+
+    #[test]
     fn a_repeated_key_returns_the_original_job_instead_of_a_new_one() {
         let (_dir, store) = test_store();
         let request = request(Some("key-1"));

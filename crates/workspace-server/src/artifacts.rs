@@ -607,6 +607,51 @@ mod tests {
         assert_eq!(media_type("a.unknown"), "application/octet-stream");
     }
 
+    fn seeded_store() -> (tempfile::TempDir, ArtifactStore) {
+        let directory = tempfile::tempdir().unwrap();
+
+        crate::storage::initialize(directory.path()).unwrap();
+
+        let connection = crate::storage::open(directory.path()).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO users (id, issuer, subject, created_at_unix, updated_at_unix)
+                 VALUES ('owner-1', 'https://auth.example.com', 'subject-1', 0, 0);
+                 INSERT INTO users (id, issuer, subject, created_at_unix, updated_at_unix)
+                 VALUES ('owner-2', 'https://auth.example.com', 'subject-2', 0, 0);
+                 INSERT INTO artifacts (
+                    id, owner_id, workspace_id, display_name, stored_name, media_type,
+                    size_bytes, sha256, created_at_unix, expires_at_unix
+                 ) VALUES (
+                    'artifact-1', 'owner-1', NULL, 'report.txt', 'file-report.txt',
+                    'text/plain', 5, 'abc', 1, 9999999999
+                 );",
+            )
+            .unwrap();
+        drop(connection);
+
+        let store = ArtifactStore::new(directory.path());
+
+        (directory, store)
+    }
+
+    #[test]
+    fn artifacts_are_isolated_between_owners() {
+        let (_directory, store) = seeded_store();
+
+        assert!(matches!(
+            store.owned("owner-2", "artifact-1"),
+            Err(ArtifactError::Forbidden)
+        ));
+        assert!(store.list("owner-2").unwrap().is_empty());
+        assert_eq!(store.list("owner-1").unwrap().len(), 1);
+        assert!(matches!(
+            store.revoke("owner-2", "artifact-1"),
+            Err(ArtifactError::Forbidden)
+        ));
+        assert!(store.owned("owner-1", "artifact-1").is_ok());
+    }
+
     #[test]
     fn a_link_never_outlives_its_artifact() {
         // Plenty of artifact lifetime left: the policy applies.

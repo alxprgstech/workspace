@@ -1380,6 +1380,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn owners_cannot_operate_on_each_others_workspaces() {
+        let fixture = fixture();
+        let workspace = fixture
+            .manager
+            .create(&fixture.owner, &request())
+            .await
+            .unwrap();
+        let intruder = "owner-2";
+
+        assert!(matches!(
+            fixture.manager.get_owned(intruder, &workspace.id).await,
+            Err(WorkspaceError::Forbidden)
+        ));
+        assert!(matches!(
+            fixture.manager.owned(intruder, &workspace.id),
+            Err(WorkspaceError::Forbidden)
+        ));
+        assert!(matches!(
+            fixture
+                .manager
+                .update(intruder, &workspace.id, &UpdateRequest::default())
+                .await,
+            Err(WorkspaceError::Forbidden)
+        ));
+        assert!(matches!(
+            fixture.manager.stop(intruder, &workspace.id).await,
+            Err(WorkspaceError::Forbidden)
+        ));
+        assert!(matches!(
+            fixture.manager.start(intruder, &workspace.id).await,
+            Err(WorkspaceError::Forbidden)
+        ));
+        assert!(matches!(
+            fixture.manager.delete(intruder, &workspace.id).await,
+            Err(WorkspaceError::Forbidden)
+        ));
+        assert!(fixture.manager.list(intruder).unwrap().is_empty());
+
+        // The owner still sees the workspace untouched.
+        assert_eq!(
+            fixture
+                .manager
+                .owned(&fixture.owner, &workspace.id)
+                .unwrap()
+                .state,
+            WorkspaceState::Created
+        );
+    }
+
+    #[tokio::test]
     async fn owners_cannot_see_each_others_workspaces() {
         let fixture = fixture();
         let workspace = fixture

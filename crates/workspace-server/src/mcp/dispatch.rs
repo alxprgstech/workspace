@@ -783,6 +783,72 @@ mod tests {
         }));
     }
 
+    fn services() -> GatewayServices {
+        GatewayServices {
+            schema_version: 10,
+            runtime: Arc::new(workspace_runtime::status::RuntimeMonitor::new(
+                None,
+                "f32ac08f-5f8c-41df-8a72-820d9ff123d8",
+            )),
+            workspaces: None,
+            files: None,
+            downloader: None,
+            artifacts: None,
+            jobs: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn every_tool_requires_its_declared_scope() {
+        let services = services();
+        let caller = Caller {
+            user_id: "user-1",
+            scopes: &[],
+        };
+
+        for definition in catalog::definitions() {
+            let name = definition.tool.name.as_ref();
+
+            let error = call(&services, &caller, &name, &Map::new())
+                .await
+                .expect_err(&format!("{name} must refuse an empty scope set"));
+
+            assert_eq!(error.code, "insufficient_scope", "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_scoped_caller_without_services_gets_a_structured_error() {
+        let services = services();
+        let scopes: Vec<String> = catalog::definitions()
+            .iter()
+            .map(|definition| definition.scope.to_string())
+            .collect();
+        let caller = Caller {
+            user_id: "user-1",
+            scopes: &scopes,
+        };
+
+        for definition in catalog::definitions() {
+            let name = definition.tool.name.as_ref();
+            let result = call(&services, &caller, &name, &Map::new()).await;
+
+            if matches!(name, "server_info" | "capabilities_list") {
+                assert!(result.is_ok(), "{name} must answer without services");
+                continue;
+            }
+
+            let error = result.expect_err(&format!("{name} must fail without services"));
+
+            assert_ne!(error.code, "insufficient_scope", "{name}");
+            assert!(
+                !error.message.contains("/srv/") && !error.message.contains("C:\\"),
+                "{name} leaks an internal path: {}",
+                error.message
+            );
+        }
+    }
+
     #[test]
     fn arbitrary_json_arguments_are_errors_not_panics() {
         let mut arguments = Map::new();
