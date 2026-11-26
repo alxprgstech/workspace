@@ -15,6 +15,10 @@ and ALXPRGS SSO.
 - [Interface and design system](docs/UI.md) — ALXPRGS Design Language v1 tokens,
   RU/EN localization, themes, motion, accessibility and browser acceptance.
 - [Status report](docs/STATUS_REPORT.md) — the latest verified runtime state.
+- [Updating](docs/UPDATE.md) — `workspace update`, rollback, the update journal and
+  the bootstrap command for old installations.
+- [Releases](docs/RELEASES.md) — reproducible builds, signing keys, package
+  verification and the GitHub release workflow.
 - [Completion report](COMPLETION_REPORT.md) — deployment and acceptance record.
 
 ## Quick start
@@ -23,6 +27,15 @@ and ALXPRGS SSO.
 cargo build --release -p workspace-cli
 target\release\workspace.exe --config config.toml runtime accept
 target\release\workspace.exe --config config.toml serve
+```
+
+Updates on an installed instance:
+
+```powershell
+workspace update --check
+workspace update
+workspace update --status
+workspace update --rollback --yes
 ```
 
 Runtime provisioning, deployment and rollback are described in

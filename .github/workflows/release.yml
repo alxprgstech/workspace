@@ -1,0 +1,287 @@
+# Build and optionally publish an ALXPRGS Workspace release.
+#
+# Heavy builds run only for a version tag (v*) or an explicit manual dispatch.
+# A normal push never starts this workflow.
+#
+# Signing:
+#   * set the repository secret RELEASE_SIGNING_KEY_PKCS8_BASE64 to the base64
+#     form of the PKCS#8 Ed25519 private key, and dispatch with sign=true;
+#   * without the secret a manual run builds a TEST package signed by an
+#     ephemeral key. That package is explicitly named -TEST and is rejected by
+#     installations that trust the embedded production key. It exists to verify
+#     the build and packaging pipeline, not for deployment.
+#
+# The workflow has read-only permissions except for the publish job, which needs
+# contents:write to create the GitHub release.
+
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (x.y.z); defaults to the Cargo workspace version"
+        required: false
+        type: string
+      sign:
+        description: "Sign with RELEASE_SIGNING_KEY_PKCS8_BASE64 (fails when the secret is absent)"
+        required: false
+        default: false
+        type: boolean
+      publish:
+        description: "Create a GitHub release (requires sign=true)"
+        required: false
+        default: false
+        type: boolean
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  windows:
+    name: Windows x64 (embedded UI)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build web interface
+        working-directory: web
+        run: |
+          npm ci --no-audit --no-fund
+          npm run typecheck
+          npm run build
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Build workspace.exe
+        run: cargo build --release --locked -p workspace-cli --features web-ui
+
+      - name: Verify the embedded UI is present
+        shell: pwsh
+        run: |
+          $exe = "target\release\workspace.exe"
+          if (-not (Test-Path $exe)) { throw "workspace.exe was not produced" }
+          $bytes = [System.IO.File]::ReadAllBytes($exe)
+          $text = [System.Text.Encoding]::UTF8.GetString($bytes)
+          if (-not $text.Contains("ALXPRGS Workspace")) { throw "the binary does not look like workspace.exe" }
+          Write-Host "workspace.exe: $((Get-Item $exe).Length) bytes, SHA-256 $((Get-FileHash $exe -Algorithm SHA256).Hash)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-binary
+          path: target/release/workspace.exe
+          if-no-files-found: error
+          retention-days: 7
+
+  linux:
+    name: Linux x86_64 musl components
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Build helper and egress proxy
+        run: sh scripts/build-linux-musl.sh
+
+      - name: Verify the binaries are static ELF x86-64
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends file binutils
+          for binary in workspace-helper workspace-egress; do
+            path="target/x86_64-unknown-linux-musl/release/$binary"
+            file "$path"
+            file "$path" | grep -q "ELF 64-bit"
+            file "$path" | grep -q "x86-64"
+            if file "$path" | grep -q "interpreter"; then
+              echo "$binary is dynamically linked; the runtime has no musl loader" >&2
+              exit 1
+            fi
+            if readelf -l "$path" | grep -q INTERP; then
+              echo "$binary has an INTERP segment" >&2
+              exit 1
+            fi
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-binaries
+          path: |
+            target/x86_64-unknown-linux-musl/release/workspace-helper
+            target/x86_64-unknown-linux-musl/release/workspace-egress
+          if-no-files-found: error
+          retention-days: 7
+
+  package:
+    name: Signed release package
+    needs: [windows, linux]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-binary
+          path: dist/staging
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-binaries
+          path: dist/staging/linux
+
+      - name: Assemble deployment files
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist/staging/deploy | Out-Null
+          Copy-Item deploy/windows/install.ps1 dist/staging/deploy/
+          Copy-Item deploy/windows/provision-runtime.ps1 dist/staging/deploy/
+          Copy-Item deploy/windows/tunnel.ps1 dist/staging/deploy/
+          Copy-Item deploy/windows/bootstrap-update.ps1 dist/staging/deploy/
+          Copy-Item deploy/windows/alxprgs-quota dist/staging/deploy/
+          Copy-Item docs/UPDATE.md dist/staging/UPDATE.md
+          Copy-Item docs/RELEASES.md dist/staging/RELEASES.md
+
+      - name: Resolve version
+        id: version
+        shell: pwsh
+        run: |
+          if ("${{ github.event_name }}" -eq "workflow_dispatch" -and -not [string]::IsNullOrWhiteSpace("${{ inputs.version }}")) {
+            $version = "${{ inputs.version }}"
+          }
+          elseif ("${{ github.ref_type }}" -eq "tag") {
+            $version = "${{ github.ref_name }}".TrimStart("v")
+          }
+          else {
+            $cargo = Get-Content -Raw Cargo.toml
+            $version = [regex]::Match($cargo, '(?ms)^\[workspace\.package\].*?^version\s*=\s*"([^"]+)"').Groups[1].Value
+          }
+
+          if ($version -notmatch '^\d+\.\d+\.\d+$') { throw "invalid version '$version'" }
+          "value=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Prepare signing key
+        id: signing
+        shell: pwsh
+        env:
+          SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY_PKCS8_BASE64 }}
+        run: |
+          $wantSign = "${{ inputs.sign }}" -eq "true" -or "${{ github.ref_type }}" -eq "tag"
+
+          if (-not [string]::IsNullOrWhiteSpace($env:SIGNING_KEY)) {
+            $bytes = [Convert]::FromBase64String($env:SIGNING_KEY)
+            [System.IO.File]::WriteAllBytes("$PWD\release-key.pk8", $bytes)
+            "signed=true" >> $env:GITHUB_OUTPUT
+            "key=$PWD\release-key.pk8" >> $env:GITHUB_OUTPUT
+          }
+          elseif ($wantSign) {
+            throw "signing was requested but RELEASE_SIGNING_KEY_PKCS8_BASE64 is not configured"
+          }
+          else {
+            & dist/staging/workspace.exe release keygen --out "$PWD\test-key" --force | Out-Null
+            "signed=false" >> $env:GITHUB_OUTPUT
+            "key=$PWD\test-key\release-signing-key.pk8" >> $env:GITHUB_OUTPUT
+          }
+
+      - name: Build and sign the package
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.value }}"
+          $sha = (git rev-parse HEAD).Trim()
+          if (-not "${{ steps.signing.outputs.signed }}" -eq "true") {
+            $sha = "$sha-test"
+            $name = "workspace-$version-windows-x64-TEST.zip"
+          }
+          else {
+            $name = "workspace-$version-windows-x64.zip"
+          }
+
+          & dist/staging/workspace.exe release package `
+            --files dist/staging `
+            --output "dist/$name" `
+            --release-version $version `
+            --git-sha $sha `
+            --schema-version 11 --min-schema 9 --max-schema 11 `
+            --channel stable `
+            --key "${{ steps.signing.outputs.key }}" `
+            --changelog docs/RELEASE_NOTES.md
+
+          if ($LASTEXITCODE -ne 0) { throw "packaging failed" }
+
+          if ("${{ steps.signing.outputs.signed }}" -eq "true") {
+            & dist/staging/workspace.exe release verify --package "dist/$name"
+          }
+          else {
+            & dist/staging/workspace.exe release verify --package "dist/$name" --public-key test-key/release-public-key.txt
+            Write-Warning "TEST package signed with an ephemeral key; installations reject it."
+          }
+
+          if ($LASTEXITCODE -ne 0) { throw "the package failed verification" }
+
+          $hash = (Get-FileHash "dist/$name" -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $name" | Set-Content "dist/$name.sha256" -Encoding ASCII
+          "package=dist/$name" >> $env:GITHUB_OUTPUT
+          "checksum=dist/$name.sha256" >> $env:GITHUB_OUTPUT
+        id: package
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-package
+          path: |
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Remove the private key from the runner
+        if: always()
+        shell: pwsh
+        run: Remove-Item -Force -ErrorAction SilentlyContinue release-key.pk8
+
+  publish:
+    name: Publish GitHub release
+    needs: [package]
+    if: |
+      (github.event_name == 'workflow_dispatch' && inputs.publish && inputs.sign) ||
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-package
+          path: dist
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', inputs.version) }}"
+          shopt -s nullglob
+          files=(dist/*.zip dist/*.sha256)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "no package artifacts" >&2
+            exit 1
+          fi
+          gh release create "$tag" "${files[@]}" \
+            --title "ALXPRGS Workspace ${tag#v}" \
+            --notes-file docs/RELEASE_NOTES.md

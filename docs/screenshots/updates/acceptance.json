@@ -1,0 +1,56 @@
+{
+  "base": "https://localhost:8443",
+  "scenario": [
+    "rollback"
+  ],
+  "results": [
+    {
+      "name": "rollback requires a data acknowledgement when the database changed",
+      "ok": true,
+      "detail": "required=true, control=checked"
+    },
+    {
+      "name": "rollback progresses",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "previous version is reported after rollback",
+      "ok": true,
+      "detail": "0.2.0"
+    },
+    {
+      "name": "no unexpected JavaScript console errors",
+      "ok": true,
+      "detail": ""
+    }
+  ],
+  "consoleErrors": [
+    "Failed to load resource: the server responded with a status of 502 (Bad Gateway)",
+    "Failed to load resource: the server responded with a status of 502 (Bad Gateway)",
+    "Failed to load resource: the server responded with a status of 502 (Bad Gateway)",
+    "Failed to load resource: the server responded with a status of 502 (Bad Gateway)",
+    "Failed to load resource: the server responded with a status of 502 (Bad Gateway)",
+    "Failed to load resource: the server responded with a status of 502 (Bad Gateway)",
+    "Failed to load resource: the server responded with a status of 502 (Bad Gateway)",
+    "Failed to load resource: the server responded with a status of 502 (Bad Gateway)",
+    "Failed to load resource: the server responded with a status of 502 (Bad Gateway)",
+    "Failed to load resource: the server responded with a status of 502 (Bad Gateway)",
+    "Failed to load resource: the server responded with a status of 502 (Bad Gateway)",
+    "Failed to load resource: the server responded with a status of 502 (Bad Gateway)",
+    "Failed to load resource: the server responded with a status of 502 (Bad Gateway)",
+    "Failed to load resource: the server responded with a status of 502 (Bad Gateway)",
+    "Failed to load resource: the server responded with a status of 502 (Bad Gateway)",
+    "Failed to load resource: the server responded with a status of 502 (Bad Gateway)",
+    "Failed to load resource: the server responded with a status of 502 (Bad Gateway)",
+    "Failed to load resource: the server responded with a status of 502 (Bad Gateway)",
+    "Failed to load resource: the server responded with a status of 502 (Bad Gateway)",
+    "Failed to load resource: the server responded with a status of 502 (Bad Gateway)",
+    "Failed to load resource: the server responded with a status of 502 (Bad Gateway)",
+    "Failed to load resource: the server responded with a status of 502 (Bad Gateway)",
+    "Failed to load resource: the server responded with a status of 502 (Bad Gateway)",
+    "Failed to load resource: the server responded with a status of 502 (Bad Gateway)"
+  ],
+  "unexpectedConsoleErrors": [],
+  "at": "2026-11-26T16:25:27.435Z"
+}
