@@ -12,7 +12,7 @@
 # What it does:
 #   1. stops the running server (if any);
 #   2. backs up the binary, configuration and a consistent SQLite snapshot;
-#   3. installs the new binary next to the old one;
+#   3. installs the new binary and configuration next to the old ones;
 #   4. starts the server and waits for /health;
 #   5. prints the rollback command.
 #
@@ -46,9 +46,9 @@ foreach ($required in @($BinarySource, $ConfigSource)) {
     }
 }
 
-if ([string]::IsNullOrWhiteSpace($env:WORKSPACE_SSO_CLIENT_SECRET) -or
-    [string]::IsNullOrWhiteSpace($env:WORKSPACE_AUTH_KEY)) {
-    throw "WORKSPACE_SSO_CLIENT_SECRET and WORKSPACE_AUTH_KEY must be set before deployment"
+if ($Start -and ([string]::IsNullOrWhiteSpace($env:WORKSPACE_SSO_CLIENT_SECRET) -or
+    [string]::IsNullOrWhiteSpace($env:WORKSPACE_AUTH_KEY))) {
+    throw "WORKSPACE_SSO_CLIENT_SECRET and WORKSPACE_AUTH_KEY must be set before starting the server"
 }
 
 $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
@@ -77,36 +77,83 @@ if (Test-Path -LiteralPath (Join-Path $stateDir "workspace.db")) {
     Copy-Item -LiteralPath (Join-Path $stateDir "workspace.db-shm") -Destination $dbCopy -ErrorAction SilentlyContinue
 }
 
-Write-Host "[3/5] Installing the new binary"
+Write-Host "[3/5] Installing the new binary and configuration"
 if ($PSCmdlet.ShouldProcess($InstallDir, "Install workspace.exe")) {
     Copy-Item -LiteralPath $BinarySource -Destination (Join-Path $InstallDir "workspace.exe") -Force
 }
 
+# The server cannot start without its configuration. Always install the
+# validated configuration next to the binary instead of assuming it is there.
+$installedConfig = Join-Path $InstallDir "config.toml"
+if ((Resolve-Path -LiteralPath $ConfigSource).Path -ne $installedConfig) {
+    if ($PSCmdlet.ShouldProcess($installedConfig, "Install config.toml")) {
+        Copy-Item -LiteralPath $ConfigSource -Destination $installedConfig -Force
+    }
+}
+
 Write-Host "[4/5] Starting the server"
 if ($Start) {
+    $logDir = Join-Path $InstallDir "logs"
+    New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+    $outLog = Join-Path $logDir "server.out.log"
+    $errLog = Join-Path $logDir "server.err.log"
+
     $process = Start-Process -FilePath (Join-Path $InstallDir "workspace.exe") `
-        -ArgumentList @("--config", (Join-Path $InstallDir "config.toml"), "serve") `
+        -ArgumentList @("--config", $installedConfig, "serve") `
         -WorkingDirectory $InstallDir `
         -WindowStyle Hidden `
+        -RedirectStandardOutput $outLog `
+        -RedirectStandardError $errLog `
         -PassThru
+
+    $port = 8765
+    $listen = Select-String -LiteralPath $installedConfig -Pattern '^\s*listen\s*=\s*"127\.0\.0\.1:(\d+)"' |
+        Select-Object -First 1
+    if ($listen -and $listen.Matches.Count -gt 0) {
+        $port = [int]$listen.Matches[0].Groups[1].Value
+    }
 
     $deadline = (Get-Date).AddSeconds(90)
     $healthy = $false
+    $exited = $false
 
     while ((Get-Date) -lt $deadline) {
         Start-Sleep -Seconds 2
+
+        if ($process.HasExited) {
+            $exited = $true
+            break
+        }
+
         try {
-            $response = Invoke-WebRequest -Uri "http://127.0.0.1:8765/health" -UseBasicParsing -TimeoutSec 3
+            $response = Invoke-WebRequest -Uri "http://127.0.0.1:$port/health" -UseBasicParsing -TimeoutSec 3
             if ($response.StatusCode -eq 200) { $healthy = $true; break }
         }
         catch { }
     }
 
     if (-not $healthy) {
-        Write-Warning "The server did not report healthy; see the process output and roll back if needed."
+        if ($exited) {
+            Write-Warning "The server exited during startup (exit code $($process.ExitCode))."
+        }
+        else {
+            Write-Warning "The server did not report healthy on port $port."
+        }
+
+        foreach ($log in @($errLog, $outLog)) {
+            if ((Test-Path -LiteralPath $log) -and (Get-Item -LiteralPath $log).Length -gt 0) {
+                Write-Host ""
+                Write-Host "--- $log (tail) ---"
+                Get-Content -LiteralPath $log -Tail 40 | ForEach-Object { Write-Host $_ }
+            }
+        }
+
+        Write-Host ""
+        Write-Warning "Roll back with the commands printed below if the previous build was working."
     }
     else {
-        Write-Host "Server is healthy (pid $($process.Id))."
+        Set-Content -LiteralPath (Join-Path $InstallDir "state\server.pid") -Value $process.Id
+        Write-Host "Server is healthy (pid $($process.Id), port $port)."
     }
 }
 
