@@ -137,8 +137,28 @@ pub struct ExtractOutcome {
     pub bytes: u64,
 }
 
-/// Whether the workspace passed preparation, so its storage exists.
+/// Encode a file chunk without losing bytes.
 ///
+/// Valid UTF-8 travels as text; anything else is base64 so binary content is
+/// preserved exactly and the client always knows which form it received.
+fn encode_content(body: &[u8]) -> (&'static str, String) {
+    match std::str::from_utf8(body) {
+        Ok(text) => ("utf-8", text.to_owned()),
+        Err(_) => (
+            "base64",
+            base64::engine::general_purpose::STANDARD.encode(body),
+        ),
+    }
+}
+
+/// Offset and end-of-file flag for one chunk, without overflowing.
+fn chunk_bounds(offset: u64, read: u64, size: u64) -> (u64, bool) {
+    let end = offset.saturating_add(read);
+
+    (end, end >= size)
+}
+
+/// Whether the workspace passed preparation, so its storage exists.///
 /// `Stopped` keeps the storage on disk, so files remain readable and writable
 /// without a container; every transitional or failed state does not.
 fn operations_ready(state: WorkspaceState) -> bool {
@@ -336,21 +356,17 @@ impl Files {
         let read = value["read"].as_u64().unwrap_or(0);
         let sha256 = value["sha256"].as_str().unwrap_or_default().to_owned();
 
-        let (encoding, content) = match String::from_utf8(body.clone()) {
-            Ok(text) => ("utf-8", text),
-            Err(_) => (
-                "base64",
-                base64::engine::general_purpose::STANDARD.encode(&body),
-            ),
-        };
+        let (encoding, content) = encode_content(&body);
+
+        let (next_offset, eof) = chunk_bounds(offset, read, size);
 
         Ok(FileChunk {
             path: path.to_owned(),
             size,
             offset,
             read,
-            next_offset: offset + read,
-            eof: offset + read >= size,
+            next_offset,
+            eof,
             sha256,
             encoding,
             content,
@@ -829,5 +845,38 @@ mod tests {
             assert_eq!(mapped.code(), "storage_error", "{code}");
             assert_eq!(mapped.status(), 500, "{code}");
         }
+    }
+
+    #[test]
+    fn utf8_and_binary_content_survive_the_wire_format() {
+        let text = "привет, мир\n";
+        let (encoding, content) = encode_content(text.as_bytes());
+
+        assert_eq!(encoding, "utf-8");
+        assert_eq!(content, text);
+
+        let binary = [0xFFu8, 0x00, 0xFE, 0x80];
+        let (encoding, content) = encode_content(&binary);
+
+        assert_eq!(encoding, "base64");
+
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&content)
+            .unwrap();
+        assert_eq!(decoded, binary);
+    }
+
+    #[test]
+    fn chunk_pagination_is_exact_and_never_overflows() {
+        // A full chunk in the middle of a file continues.
+        assert_eq!(chunk_bounds(0, 10, 100), (10, false));
+        // The last byte ends the file.
+        assert_eq!(chunk_bounds(90, 10, 100), (100, true));
+        // A short read before the end still continues.
+        assert_eq!(chunk_bounds(10, 5, 100), (15, false));
+        // An empty file is complete at offset zero.
+        assert_eq!(chunk_bounds(0, 0, 0), (0, true));
+        // A hostile offset cannot wrap around.
+        assert_eq!(chunk_bounds(u64::MAX, 10, 100), (u64::MAX, true));
     }
 }
