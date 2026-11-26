@@ -551,3 +551,143 @@ export async function loadRuntime(signal?: AbortSignal): Promise<RuntimeStatus> 
 export async function loadCapabilities(signal?: AbortSignal): Promise<CapabilityCatalog> {
   return await jsonRequest<CapabilityCatalog>('/api/v1/capabilities', { signal })
 }
+
+// ---------------------------------------------------------------------------
+// Administrative updates
+// ---------------------------------------------------------------------------
+
+export interface ReleaseCompatibility {
+  platforms: string[]
+  runtime: string[]
+  min_database_schema: number
+  max_database_schema: number
+  min_updater_format: number
+}
+
+export interface ReleaseSummary {
+  version: string
+  git_sha: string
+  build_time_unix: number
+  channel: string
+  schema_version: number
+  compatibility: ReleaseCompatibility
+  changelog: string[]
+  manifest_sha256: string
+  package_sha256: string | null
+  source: string
+}
+
+export interface InstalledInfo {
+  product: string
+  version: string
+  git_sha: string
+  build_time: string
+  installed_at_unix: number | null
+  schema_version: number
+  package_sha256: string | null
+  previous_version: string | null
+  backup: string | null
+  database_sha256: string | null
+  managed: boolean
+  install_dir: string
+}
+
+export interface UpdateStep {
+  id: string
+  status: 'running' | 'completed' | 'failed' | 'skipped'
+  at_unix: number
+  detail: string | null
+}
+
+export interface UpdateJournal {
+  format: number
+  id: string
+  action: 'update' | 'rollback'
+  status: 'prepared' | 'running' | 'succeeded' | 'failed' | 'rolled_back' | 'rollback_failed' | 'interrupted'
+  stage: string
+  progress: number
+  message: string | null
+  error: string | null
+  from_version: string
+  from_git_sha: string
+  to_version: string
+  from_schema: number
+  to_schema: number
+  started_at_unix: number
+  updated_at_unix: number
+  pid: number
+  install_dir: string
+  package_dir: string | null
+  backup_dir: string | null
+  log_path: string
+  server_was_running: boolean
+  steps: UpdateStep[]
+  warnings: string[]
+}
+
+export interface UpdateCheckReport {
+  checked_at_unix: number
+  installed: InstalledInfo
+  available: ReleaseSummary | null
+  update_available: boolean
+  status: 'update_available' | 'up_to_date' | 'incompatible' | 'error'
+  message: string | null
+}
+
+export interface RollbackCandidate {
+  backup_dir: string
+  from_version: string
+  to_version: string
+  created_at_unix: number
+  database_restore_requires_ack: boolean
+}
+
+export interface UpdateStatus {
+  installed: InstalledInfo
+  journal: UpdateJournal | null
+  last_check: UpdateCheckReport | null
+  active_jobs: number
+  server_pid: number | null
+  rollback: RollbackCandidate | null
+  busy: boolean
+  admin: boolean
+  update_supported: boolean
+}
+
+export async function loadUpdateStatus(signal?: AbortSignal): Promise<UpdateStatus> {
+  return await jsonRequest<UpdateStatus>('/api/v1/admin/update', { signal })
+}
+
+export async function checkForUpdates(): Promise<UpdateCheckReport> {
+  return await jsonRequest<UpdateCheckReport>('/api/v1/admin/update/check', {
+    method: 'POST',
+    body: {},
+    acceptedStatuses: [200],
+  })
+}
+
+export async function applyUpdate(options: {
+  activeJobsConfirmed: boolean
+}): Promise<{ started: boolean; journal: UpdateJournal; journal_path: string }> {
+  return await jsonRequest('/api/v1/admin/update/apply', {
+    method: 'POST',
+    body: {
+      confirm: true,
+      active_jobs_confirmed: options.activeJobsConfirmed,
+    },
+    acceptedStatuses: [202],
+  })
+}
+
+export async function rollbackUpdate(options: {
+  allowDatabaseRestore: boolean
+}): Promise<{ started: boolean; journal: UpdateJournal; journal_path: string }> {
+  return await jsonRequest('/api/v1/admin/update/rollback', {
+    method: 'POST',
+    body: {
+      confirm: true,
+      allow_database_restore: options.allowDatabaseRestore,
+    },
+    acceptedStatuses: [202],
+  })
+}

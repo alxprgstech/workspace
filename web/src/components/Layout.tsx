@@ -12,6 +12,7 @@ import {
   Menu,
   Monitor,
   Moon,
+  RefreshCw,
   Settings,
   Sun,
   Terminal,
@@ -40,14 +41,18 @@ const NAV: NavEntry[] = [
   { page: 'files', icon: FileIcon, key: 'nav.files' },
   { page: 'artifacts', icon: Database, key: 'nav.artifacts' },
   { page: 'settings', icon: Settings, key: 'nav.settings' },
+  // Administrator-only: the server rejects the API for every other role.
+  { page: 'updates', icon: RefreshCw, key: 'nav.updates' },
 ]
 
 function Navigation({
   route,
   onNavigate,
+  admin,
 }: {
   route: Route
   onNavigate: (page: PageId) => void
+  admin: boolean
 }) {
   const { t } = useI18n()
   const list = useRef<HTMLElement>(null)
@@ -87,7 +92,7 @@ function Navigation({
           style={{ transform: `translateY(${indicator.top}px)`, height: indicator.height }}
         />
       )}
-      {NAV.map(entry => {
+      {NAV.filter(entry => admin || entry.page !== 'updates').map(entry => {
         const Icon = entry.icon
         const active = route.page === entry.page
 
@@ -183,6 +188,7 @@ export function AppLayout({
   const [sectionsOpen, setSectionsOpen] = useState(false)
   const displayName = session.user.username ?? session.user.subject
   const role = session.user.role === 'admin' ? t('auth.roleAdmin') : t('auth.roleUser')
+  const admin = session.user.role === 'admin'
 
   const go = (page: PageId) => {
     setSectionsOpen(false)
@@ -248,7 +254,7 @@ export function AppLayout({
       <div className="app-body">
         <aside className="app-sidebar">
           <p className="nav-heading">{t('nav.management')}</p>
-          <Navigation route={route} onNavigate={go} />
+          <Navigation route={route} onNavigate={go} admin={admin} />
           <div className="sidebar-foot">
             <Boxes size={15} aria-hidden="true" />
             <span>
@@ -269,7 +275,7 @@ export function AppLayout({
         onClose={() => setSectionsOpen(false)}
         size="small"
       >
-        <Navigation route={route} onNavigate={go} />
+        <Navigation route={route} onNavigate={go} admin={admin} />
         <div className="mobile-appearance">
           <AppearanceControls theme={theme} />
         </div>

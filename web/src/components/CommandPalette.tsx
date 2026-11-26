@@ -39,6 +39,7 @@ const PAGE_ICONS: Record<PageId, LucideIcon> = {
   files: FileIcon,
   artifacts: Database,
   settings: Settings,
+  updates: RefreshCw,
 }
 
 const PAGE_KEYS: Array<{ page: PageId; key: MessageKey }> = [
@@ -48,6 +49,7 @@ const PAGE_KEYS: Array<{ page: PageId; key: MessageKey }> = [
   { page: 'files', key: 'nav.files' },
   { page: 'artifacts', key: 'nav.artifacts' },
   { page: 'settings', key: 'nav.settings' },
+  { page: 'updates', key: 'nav.updates' },
 ]
 
 export function CommandPalette({
@@ -56,12 +58,14 @@ export function CommandPalette({
   navigate,
   theme,
   onRefresh,
+  isAdmin,
 }: {
   open: boolean
   onClose: () => void
   navigate: (page: PageId) => void
   theme: ThemeController
   onRefresh: () => void
+  isAdmin: boolean
 }) {
   const { t, setLocale } = useI18n()
   const [query, setQuery] = useState('')
@@ -76,7 +80,7 @@ export function CommandPalette({
   }, [open])
 
   const commands = useMemo<Command[]>(() => {
-    const navigation = PAGE_KEYS.map(entry => ({
+    const navigation = PAGE_KEYS.filter(entry => isAdmin || entry.page !== 'updates').map(entry => ({
       id: `nav:${entry.page}`,
       group: 'palette.navigation' as Group,
       label: t(entry.key),
@@ -126,7 +130,7 @@ export function CommandPalette({
     ]
 
     return [...navigation, ...appearance, ...languageCommands, ...actions]
-  }, [navigate, onRefresh, setLocale, t, theme])
+  }, [isAdmin, navigate, onRefresh, setLocale, t, theme])
 
   const filtered = useMemo(() => {
     const needle = query.trim().toLowerCase()

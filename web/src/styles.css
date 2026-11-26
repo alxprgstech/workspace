@@ -2010,3 +2010,56 @@ kbd {
     border: 1px solid ButtonText;
   }
 }
+
+/* ------------------------------------------------------------ updates page */
+
+.ui-progress {
+  height: 8px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 999px;
+  background: var(--surface-3);
+  overflow: hidden;
+}
+
+.ui-progress > span {
+  display: block;
+  height: 100%;
+  min-width: 2%;
+  background: linear-gradient(90deg, var(--brand), var(--accent-cyan));
+  transition: width var(--motion-layout) var(--ease-standard);
+}
+
+.ui-checkbox {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.ui-checkbox input {
+  margin-top: 2px;
+  accent-color: var(--brand);
+}
+
+.subsection-title {
+  margin-bottom: 6px;
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+.update-changelog {
+  margin: 0;
+  padding-left: 18px;
+  display: grid;
+  gap: 4px;
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ui-progress > span {
+    transition: none;
+  }
+}

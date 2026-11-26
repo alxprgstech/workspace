@@ -13,6 +13,7 @@ export const PAGES = [
   'files',
   'artifacts',
   'settings',
+  'updates',
 ] as const
 
 export type PageId = (typeof PAGES)[number]

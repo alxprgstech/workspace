@@ -27,6 +27,7 @@ import { JobsPage } from './pages/Jobs.tsx'
 import { FilesPage } from './pages/Files.tsx'
 import { ArtifactsPage } from './pages/Artifacts.tsx'
 import { SettingsPage } from './pages/Settings.tsx'
+import { UpdatesPage } from './pages/Updates.tsx'
 import { dispatchRefresh } from './pages/shared.tsx'
 
 const PAGE_TITLES: Record<PageId, MessageKey> = {
@@ -36,6 +37,7 @@ const PAGE_TITLES: Record<PageId, MessageKey> = {
   files: 'nav.files',
   artifacts: 'nav.artifacts',
   settings: 'nav.settings',
+  updates: 'nav.updates',
 }
 
 function WorkspaceApp() {
@@ -413,6 +415,15 @@ function WorkspaceApp() {
             <SettingsPage theme={theme} active={route.page === 'settings'} />
           </div>
         )}
+
+        {visited.has('updates') && (
+          <div className="page-host" hidden={route.page !== 'updates'}>
+            <UpdatesPage
+              active={route.page === 'updates'}
+              isAdmin={session.user.role === 'admin'}
+            />
+          </div>
+        )}
       </AppLayout>
 
       <CommandPalette
@@ -421,6 +432,7 @@ function WorkspaceApp() {
         navigate={goToPage}
         theme={theme}
         onRefresh={refreshAll}
+        isAdmin={session.user.role === 'admin'}
       />
     </>
   )

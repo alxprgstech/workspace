@@ -199,6 +199,40 @@ export const SERVICE_STATES: Record<string, Record<Locale, string>> = {
   degraded: { ru: 'Ограниченно', en: 'Degraded' },
 }
 
+/** Journal status of an update or rollback. */
+export const UPDATE_STATES: Record<string, Record<Locale, string>> = {
+  prepared: { ru: 'Подготовлено', en: 'Prepared' },
+  running: { ru: 'Выполняется', en: 'Running' },
+  succeeded: { ru: 'Успешно', en: 'Succeeded' },
+  failed: { ru: 'Ошибка', en: 'Failed' },
+  rolled_back: { ru: 'Откат выполнен', en: 'Rolled back' },
+  rollback_failed: { ru: 'Откат не удался', en: 'Rollback failed' },
+  interrupted: { ru: 'Прервано', en: 'Interrupted' },
+}
+
+/** Steps of an update or rollback. */
+export const UPDATE_STAGES: Record<string, Record<Locale, string>> = {
+  prepared: { ru: 'Подготовка', en: 'Preparing' },
+  drain: { ru: 'Ожидание заданий', en: 'Waiting for active jobs' },
+  stop: { ru: 'Остановка сервера', en: 'Stopping the server' },
+  backup: { ru: 'Резервное копирование', en: 'Backing up' },
+  install_runtime: { ru: 'Обновление компонентов WSL', en: 'Installing WSL components' },
+  migrate: { ru: 'Миграция базы данных', en: 'Migrating the database' },
+  install_windows: { ru: 'Установка Windows-бинарника', en: 'Installing the Windows binary' },
+  start: { ru: 'Запуск сервера', en: 'Starting the server' },
+  verify: { ru: 'Проверка работоспособности', en: 'Verifying the installation' },
+  rollback: { ru: 'Откат', en: 'Rolling back' },
+  safety_copy: { ru: 'Сохранение текущей базы', en: 'Saving the current database' },
+  restore_database: { ru: 'Восстановление базы', en: 'Restoring the database' },
+  restore_windows: { ru: 'Восстановление бинарника', en: 'Restoring the Windows binary' },
+  restore_runtime: { ru: 'Восстановление WSL', en: 'Restoring WSL components' },
+  succeeded: { ru: 'Завершено', en: 'Finished' },
+  failed: { ru: 'Ошибка', en: 'Failed' },
+  rolled_back: { ru: 'Откат выполнен', en: 'Rolled back' },
+  rollback_failed: { ru: 'Откат не удался', en: 'Rollback failed' },
+  interrupted: { ru: 'Прервано', en: 'Interrupted' },
+}
+
 export function stateLabel(
   table: Record<string, Record<Locale, string>>,
   code: string,
