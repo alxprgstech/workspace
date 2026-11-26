@@ -873,24 +873,52 @@ impl Manager {
     }
 
     /// Delete a workspace and every resource owned by its row.
+    ///
+    /// The row is deliberately kept (in `Deleting`) until the container is
+    /// confirmed gone and the storage and project quota are released. A failed
+    /// attempt returns an error and stays retryable: the reaper and a later
+    /// request finish it, and nothing is freed while a container may still run.
     pub async fn delete(&self, owner: &str, id: &str) -> Result<(), WorkspaceError> {
         let workspace = self.owned(owner, id)?;
 
-        if self.store.has_active_jobs(id)? {
+        if workspace.state != WorkspaceState::Deleting && self.store.has_active_jobs(id)? {
             return Err(WorkspaceError::Busy);
         }
 
-        self.store.set_state(id, WorkspaceState::Deleting, None)?;
+        if workspace.state != WorkspaceState::Deleting {
+            self.store.set_state(id, WorkspaceState::Deleting, None)?;
 
-        if let Err(error) = self.runtime.stop_container(&workspace).await {
-            tracing::warn!(%error, workspace = id, "container cleanup failed during delete");
+            let refreshed = self.store.get(id)?.ok_or(WorkspaceError::NotFound)?;
+
+            self.finalize_delete(&refreshed).await?;
+        } else {
+            self.finalize_delete(&workspace).await?;
         }
 
-        self.runtime.release_storage(&workspace).await?;
-
-        self.store.delete(id)?;
         self.store
             .audit(owner, "workspace.delete", Some(id), "ok", None)?;
+
+        Ok(())
+    }
+
+    /// Stop the container, release storage and only then drop the row.
+    ///
+    /// Each step is idempotent, so a retry after a partial failure is safe. A
+    /// container stop that cannot be confirmed aborts the sequence with the row
+    /// still present: the project id and storage stay accounted for.
+    async fn finalize_delete(&self, workspace: &Workspace) -> Result<(), WorkspaceError> {
+        self.runtime
+            .stop_container(workspace)
+            .await
+            .map_err(|error| {
+                WorkspaceError::Storage(format!(
+                    "the workspace container could not be stopped; deletion will be retried: {error}"
+                ))
+            })?;
+
+        self.store.set_container(&workspace.id, None)?;
+        self.runtime.release_storage(workspace).await?;
+        self.store.delete(&workspace.id)?;
 
         Ok(())
     }
@@ -979,6 +1007,16 @@ impl Manager {
 
         for workspace in self.store.list_all()? {
             if workspace.state == WorkspaceState::Deleting {
+                // Finish a deletion interrupted by a runtime failure. The row
+                // and its project id were kept on purpose, so retrying here is
+                // both safe and required.
+                match self.finalize_delete(&workspace).await {
+                    Ok(()) => deleted += 1,
+                    Err(error) => {
+                        tracing::warn!(%error, workspace = %workspace.id, "pending deletion could not be finished");
+                    }
+                }
+
                 continue;
             }
 
@@ -1028,10 +1066,9 @@ impl Manager {
     }
 
     async fn delete_expired(&self, workspace: &Workspace) -> Result<(), WorkspaceError> {
-        let _ = self.runtime.stop_container(workspace).await;
-
-        self.runtime.release_storage(workspace).await?;
-        self.store.delete(&workspace.id)?;
+        // Same ordering as an explicit delete: the container must be gone
+        // before its storage and quota are released.
+        self.finalize_delete(workspace).await?;
 
         let _ = self.store.audit(
             "system",
@@ -1090,6 +1127,8 @@ mod tests {
         stopped: Mutex<Vec<String>>,
         fail_prepare: Mutex<Option<String>>,
         fail_start: Mutex<Option<String>>,
+        fail_stop: Mutex<Option<String>>,
+        fail_release: Mutex<Option<String>>,
         usage: Mutex<Option<QuotaSnapshot>>,
     }
 
@@ -1106,6 +1145,10 @@ mod tests {
         }
 
         async fn release_storage(&self, workspace: &Workspace) -> Result<(), WorkspaceError> {
+            if let Some(message) = self.fail_release.lock().unwrap().as_ref() {
+                return Err(WorkspaceError::Storage(message.clone()));
+            }
+
             self.released.lock().unwrap().push(workspace.id.clone());
 
             Ok(())
@@ -1122,6 +1165,10 @@ mod tests {
         }
 
         async fn stop_container(&self, workspace: &Workspace) -> Result<(), WorkspaceError> {
+            if let Some(message) = self.fail_stop.lock().unwrap().as_ref() {
+                return Err(WorkspaceError::RuntimeUnavailable(message.clone()));
+            }
+
             self.stopped.lock().unwrap().push(workspace.id.clone());
 
             Ok(())
@@ -1290,6 +1337,137 @@ mod tests {
             fixture.manager.create(&fixture.owner, &extra).await,
             Err(WorkspaceError::LimitReached)
         ));
+    }
+
+    #[tokio::test]
+    async fn a_failed_container_stop_keeps_the_workspace_and_its_storage() {
+        let fixture = fixture();
+        let workspace = fixture
+            .manager
+            .create(&fixture.owner, &request())
+            .await
+            .unwrap();
+
+        *fixture.runtime.fail_stop.lock().unwrap() = Some("engine is down".into());
+
+        assert!(
+            fixture
+                .manager
+                .delete(&fixture.owner, &workspace.id)
+                .await
+                .is_err()
+        );
+
+        let kept = fixture
+            .manager
+            .owned(&fixture.owner, &workspace.id)
+            .unwrap();
+
+        assert_eq!(kept.state, WorkspaceState::Deleting);
+        assert!(
+            fixture.runtime.released.lock().unwrap().is_empty(),
+            "storage must not be released while the container is unconfirmed"
+        );
+
+        // The same request retries successfully once the runtime is back.
+        *fixture.runtime.fail_stop.lock().unwrap() = None;
+
+        fixture
+            .manager
+            .delete(&fixture.owner, &workspace.id)
+            .await
+            .unwrap();
+
+        assert!(
+            fixture
+                .manager
+                .owned(&fixture.owner, &workspace.id)
+                .is_err()
+        );
+        assert!(
+            fixture
+                .runtime
+                .released
+                .lock()
+                .unwrap()
+                .contains(&workspace.id)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_storage_release_is_retryable() {
+        let fixture = fixture();
+        let workspace = fixture
+            .manager
+            .create(&fixture.owner, &request())
+            .await
+            .unwrap();
+
+        *fixture.runtime.fail_release.lock().unwrap() = Some("helper failed".into());
+
+        assert!(
+            fixture
+                .manager
+                .delete(&fixture.owner, &workspace.id)
+                .await
+                .is_err()
+        );
+
+        assert_eq!(
+            fixture
+                .manager
+                .owned(&fixture.owner, &workspace.id)
+                .unwrap()
+                .state,
+            WorkspaceState::Deleting
+        );
+
+        *fixture.runtime.fail_release.lock().unwrap() = None;
+
+        fixture
+            .manager
+            .delete(&fixture.owner, &workspace.id)
+            .await
+            .unwrap();
+
+        assert!(
+            fixture
+                .manager
+                .owned(&fixture.owner, &workspace.id)
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_reaper_finishes_an_interrupted_deletion() {
+        let fixture = fixture();
+        let workspace = fixture
+            .manager
+            .create(&fixture.owner, &request())
+            .await
+            .unwrap();
+
+        *fixture.runtime.fail_stop.lock().unwrap() = Some("engine is down".into());
+
+        assert!(
+            fixture
+                .manager
+                .delete(&fixture.owner, &workspace.id)
+                .await
+                .is_err()
+        );
+
+        *fixture.runtime.fail_stop.lock().unwrap() = None;
+
+        let (deleted, _) = fixture.manager.reap(0).await.unwrap();
+
+        assert_eq!(deleted, 1);
+        assert!(
+            fixture
+                .manager
+                .owned(&fixture.owner, &workspace.id)
+                .is_err()
+        );
     }
 
     #[tokio::test]

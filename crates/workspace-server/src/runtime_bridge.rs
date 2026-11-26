@@ -344,7 +344,9 @@ impl WorkspaceRuntime for DockerWorkspaceRuntime {
 
         self.remove_egress(workspace).await?;
 
-        helper
+        // Idempotent by contract: a retry after a partial cleanup must not fail
+        // because the directory is already gone.
+        match helper
             .call(
                 Operation::Remove {
                     root: self.settings.data_root.clone(),
@@ -354,7 +356,12 @@ impl WorkspaceRuntime for DockerWorkspaceRuntime {
                 &[],
             )
             .await
-            .map_err(map_runtime)?;
+        {
+            Ok(_) => {}
+            Err(RuntimeError::Helper { code, .. })
+                if code == workspace_core::helper::code::NOT_FOUND => {}
+            Err(error) => return Err(map_runtime(error)),
+        }
 
         quota::clear(host, workspace.project_id)
             .await
