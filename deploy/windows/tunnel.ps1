@@ -39,7 +39,7 @@ catch {
 }
 
 $existing = Get-CimInstance Win32_Process -Filter "Name='ssh.exe'" -ErrorAction SilentlyContinue |
-    Where-Object { $_.CommandLine -match "-R\s+127\.0\.0\.1:$RemotePort:127\.0\.0\.1:$LocalPort" }
+    Where-Object { $_.CommandLine -match "-R\s+127\.0\.0\.1:${RemotePort}:127\.0\.0\.1:${LocalPort}" }
 
 if ($existing) {
     Write-Host "Tunnel is already running (pid $($existing.ProcessId))."
