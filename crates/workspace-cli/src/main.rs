@@ -270,8 +270,12 @@ fn run(cli: Cli) -> AppResult<ExitCode> {
 
                     for client in clients {
                         println!(
-                            "{}  enabled={}  name={:?}  redirect={:?}",
-                            client.client_id, client.is_enabled, client.name, client.redirect_uri,
+                            "{}  enabled={}  name={:?}  redirect={:?}  scopes={:?}",
+                            client.client_id,
+                            client.is_enabled,
+                            client.name,
+                            client.redirect_uri,
+                            client.allowed_scope,
                         );
                     }
                 }

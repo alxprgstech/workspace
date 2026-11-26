@@ -102,7 +102,7 @@ TTL/stop/start/pin/delete), Jobs (список, cancel, stdout/stderr), Files
 - `cargo fmt --all --check`, `git diff --check`: чисто.
 - Release binary: `target/release/workspace.exe` — **15 975 424 байт**, web UI
   встроен.
-- Схема SQLite: 8, миграции с автоматическим `VACUUM INTO`-бэкапом.
+- Схема SQLite: 9, миграции с автоматическим `VACUUM INTO`-бэкапом.
 - Диск: C: ≈17.8 ГиБ свободно; ext4 хранилище — 21 МБ занято (после очистки
   тестовых пространств); Docker images 2.46 ГБ, build cache 2.37 ГБ.
 

@@ -8,7 +8,7 @@ use std::{
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const SCHEMA_VERSION: u32 = 8;
+pub const SCHEMA_VERSION: u32 = 9;
 
 const APPLICATION_ID: i64 = 0x414C5857;
 const MIN_SQLITE_VERSION: i32 = 3_051_003;
@@ -21,6 +21,7 @@ const MIGRATION_005: &str = include_str!("../migrations/0005_workspaces.sql");
 const MIGRATION_006: &str = include_str!("../migrations/0006_scopes.sql");
 const MIGRATION_007: &str = include_str!("../migrations/0007_artifacts.sql");
 const MIGRATION_008: &str = include_str!("../migrations/0008_images.sql");
+const MIGRATION_009: &str = include_str!("../migrations/0009_scopes_expand.sql");
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct StorageInfo {
@@ -154,6 +155,10 @@ fn migrate(connection: &mut Connection) -> Result<(), StorageError> {
 
     if version < 8 {
         tx.execute_batch(MIGRATION_008)?;
+    }
+
+    if version < 9 {
+        tx.execute_batch(MIGRATION_009)?;
     }
 
     tx.commit()?;
@@ -645,7 +650,7 @@ mod mcp_oauth_migration_tests {
 
         let info = initialize(dir.path()).unwrap();
 
-        assert_eq!(info.schema_version, 8);
+        assert_eq!(info.schema_version, 9);
         assert_eq!(info.instance_id, "550e8400-e29b-41d4-a716-446655440000");
 
         let connection = open(dir.path()).unwrap();
@@ -674,6 +679,55 @@ mod mcp_oauth_migration_tests {
             .unwrap();
 
         assert_eq!(tables, 6);
+    }
+
+    #[test]
+    fn expands_legacy_client_scopes_without_touching_grants() {
+        let connection = Connection::open_in_memory().unwrap();
+
+        for migration in [
+            MIGRATION_001,
+            MIGRATION_002,
+            MIGRATION_003,
+            MIGRATION_004,
+            MIGRATION_005,
+            MIGRATION_006,
+            MIGRATION_007,
+            MIGRATION_008,
+        ] {
+            connection.execute_batch(migration).unwrap();
+        }
+
+        connection
+            .execute_batch(
+                "INSERT INTO mcp_oauth_clients
+                 (client_id, name, secret_hash, redirect_uri, allowed_scope, is_enabled, created_at_unix)
+                 VALUES (
+                    'client-legacy', 'ChatGPT', randomblob(32),
+                    'https://chatgpt.com/connector_platform_oauth_redirect',
+                    'workspace:read workspace:write execution:run files:read files:write artifacts:read artifacts:publish',
+                    1, 1
+                 );",
+            )
+            .unwrap();
+
+        connection.execute_batch(MIGRATION_009).unwrap();
+
+        let (scope, version): (String, i64) = connection
+            .query_row(
+                "SELECT allowed_scope, (SELECT user_version FROM pragma_user_version)
+                 FROM mcp_oauth_clients WHERE client_id = 'client-legacy'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+
+        assert_eq!(
+            scope,
+            "workspace:read workspace:write workspace:delete execution:run \
+             files:read files:write files:import artifacts:read artifacts:publish"
+        );
+        assert_eq!(version, 9);
     }
 
     #[test]

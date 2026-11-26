@@ -415,7 +415,7 @@ async fn mcp_protocol_end_to_end() {
     println!("server_info: {info}");
 
     assert_eq!(info["product"], "ALXPRGS Workspace");
-    assert_eq!(info["schema_version"], 8);
+    assert_eq!(info["schema_version"], 9);
     assert!(info["runtime"].is_object());
     assert_eq!(called["result"]["isError"], false);
 

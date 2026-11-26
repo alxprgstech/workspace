@@ -95,6 +95,7 @@ pub struct ClientRecord {
     pub client_id: String,
     pub name: String,
     pub redirect_uri: String,
+    pub allowed_scope: String,
     pub is_enabled: bool,
 }
 
@@ -323,7 +324,7 @@ impl OAuthStore {
         let connection = storage::open(&self.data_dir)?;
 
         let mut statement = connection.prepare(
-            "SELECT client_id, name, redirect_uri, is_enabled
+            "SELECT client_id, name, redirect_uri, allowed_scope, is_enabled
              FROM mcp_oauth_clients
              ORDER BY created_at_unix, client_id",
         )?;
@@ -333,7 +334,8 @@ impl OAuthStore {
                 client_id: row.get(0)?,
                 name: row.get(1)?,
                 redirect_uri: row.get(2)?,
-                is_enabled: row.get(3)?,
+                allowed_scope: row.get(3)?,
+                is_enabled: row.get(4)?,
             })
         })?;
 
