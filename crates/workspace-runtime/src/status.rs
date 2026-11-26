@@ -25,6 +25,9 @@ use crate::{RuntimeError, RuntimeSettings, container_name, quota};
 /// How long a cheap probe result is reused by `/ready`.
 const STATUS_CACHE: Duration = Duration::from_secs(10);
 
+/// Bound for an engine recovery attempted on a request path.
+const RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// How long a full acceptance result stays authoritative.
 pub const ACCEPTANCE_TTL: Duration = Duration::from_secs(600);
 
@@ -280,9 +283,18 @@ impl RuntimeMonitor {
     /// rootless engine needs a few seconds after boot. This call is bounded by
     /// the configured startup timeout and never starts a workload.
     pub async fn warm_up(&self) {
-        if let Some(docker) = self.docker.as_ref() {
-            let _ = docker.wait_until_ready().await;
+        let Some(docker) = self.docker.as_ref() else {
+            return;
+        };
+
+        if docker.info().await.is_ok() {
+            return;
         }
+
+        // A WSL2 cold boot leaves the user systemd manager (and therefore the
+        // enabled rootless engine) stopped. Start it, then wait for the socket.
+        let _ = docker.start_user_engine().await;
+        let _ = docker.wait_until_ready().await;
     }
 
     /// Drop cached diagnostics, for example after an operator action.
@@ -311,7 +323,16 @@ impl RuntimeMonitor {
         // re-probe below.
         *self.status_cache.lock().await = None;
 
-        if docker.wait_until_ready().await.is_err() {
+        if docker.info().await.is_err() {
+            // Idempotent and fixed: starts the enabled rootless user unit.
+            let _ = docker.start_user_engine().await;
+        }
+
+        if docker
+            .wait_until_ready_within(RECOVERY_TIMEOUT)
+            .await
+            .is_err()
+        {
             return false;
         }
 

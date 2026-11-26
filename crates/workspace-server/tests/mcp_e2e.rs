@@ -419,6 +419,18 @@ async fn mcp_protocol_end_to_end() {
     assert!(info["runtime"].is_object());
     assert_eq!(called["result"]["isError"], false);
 
+    // The same payload must also be present as machine-readable structured
+    // content: a client that only reads `structuredContent` must not see an
+    // empty object for an object-returning tool.
+    assert_eq!(
+        called["result"]["structuredContent"]["product"],
+        "ALXPRGS Workspace"
+    );
+    assert_eq!(
+        called["result"]["structuredContent"]["schema_version"], 9,
+        "structured content must carry the full payload"
+    );
+
     // A tool-level error must be structured, not a transport failure.
     let error_call = post_mcp(
         &client,
@@ -446,6 +458,10 @@ async fn mcp_protocol_end_to_end() {
 
     assert_eq!(errored["result"]["isError"], true);
     assert_eq!(payload["error"], "workspace_not_found");
+    assert!(
+        errored["result"]["structuredContent"].is_null(),
+        "a failed call must not carry structured success content"
+    );
 
     server.abort();
 }

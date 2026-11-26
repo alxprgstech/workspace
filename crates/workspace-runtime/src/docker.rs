@@ -320,7 +320,17 @@ impl Docker {
     /// before the socket accepts connections. Every attempt is a bounded,
     /// read-only query and the total wait is capped by the startup timeout.
     pub async fn wait_until_ready(&self) -> Result<EngineInfo, RuntimeError> {
-        let deadline = tokio::time::Instant::now() + self.host.startup_timeout();
+        self.wait_until_ready_within(self.host.startup_timeout())
+            .await
+    }
+
+    /// Bounded variant for request paths, where a full startup timeout would
+    /// hold the caller for too long.
+    pub async fn wait_until_ready_within(
+        &self,
+        timeout: Duration,
+    ) -> Result<EngineInfo, RuntimeError> {
+        let deadline = tokio::time::Instant::now() + timeout;
 
         loop {
             let error = match self.info().await {
@@ -335,6 +345,30 @@ impl Docker {
 
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
+    }
+
+    /// Start the enabled rootless user engine.
+    ///
+    /// A WSL2 distribution stops when idle. When it boots again the user systemd
+    /// manager is not running yet, so the enabled `docker.service` is not
+    /// started and the socket never appears. Starting that unit is the
+    /// documented recovery and is idempotent: `systemctl start` on a running
+    /// engine is a no-op, never a restart.
+    ///
+    /// The unit and the action are fixed literals; no caller value reaches the
+    /// command.
+    pub async fn start_user_engine(&self) -> Result<(), RuntimeError> {
+        self.host
+            .run(
+                "/usr/bin/systemctl",
+                &[
+                    "--user".to_owned(),
+                    "start".to_owned(),
+                    "docker.service".to_owned(),
+                ],
+            )
+            .await
+            .map(|_| ())
     }
 
     /// Create a Docker network. Internal networks have no default route.

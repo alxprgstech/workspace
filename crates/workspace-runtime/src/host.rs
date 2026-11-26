@@ -27,6 +27,9 @@ pub const ALLOWED_PROGRAMS: &[&str] = &[
     "/usr/bin/sudo",
     "/usr/bin/timeout",
     "/usr/bin/tee",
+    // Starts the enabled rootless user engine after a WSL2 cold boot. Only
+    // fixed literals are passed; no caller selects a unit or an action.
+    "/usr/bin/systemctl",
 ];
 
 /// Runner for fixed commands inside the dedicated runtime.
@@ -270,6 +273,10 @@ mod tests {
             Err(RuntimeError::Protocol(_))
         ));
         assert!(host.command("/usr/bin/docker", &[]).is_ok());
+        assert!(
+            host.command("/usr/bin/systemctl", &["--user".into()])
+                .is_ok()
+        );
     }
 
     #[test]
