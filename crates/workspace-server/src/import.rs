@@ -182,6 +182,11 @@ impl Downloader {
 fn build_client(host: &str, address: Option<IpAddr>) -> Result<reqwest::Client, FilesError> {
     let mut builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
+        // An environment proxy would silently bypass the validated, pinned
+        // address: the request would be resolved again by the proxy. The
+        // download policy is a direct connection, so the proxy is disabled
+        // explicitly instead of depending on the host environment.
+        .no_proxy()
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(REQUEST_TIMEOUT)
         .user_agent("ALXPRGS-Workspace/0.1");
@@ -365,5 +370,31 @@ mod tests {
 
         assert_eq!(url.file_name.as_deref(), Some("source.zip"));
         assert_eq!(url.host, "example.com");
+    }
+
+    #[test]
+    fn redirects_cannot_downgrade_the_policy() {
+        let base = ParsedUrl::parse("https://example.com/a.zip").unwrap();
+
+        // A redirect to plain HTTP or to credentials is refused exactly like a
+        // top-level URL: the policy applies to every hop.
+        assert!(ParsedUrl::resolve(&base, "http://example.com/b.zip").is_err());
+        assert!(ParsedUrl::resolve(&base, "https://user:pass@example.com/b.zip").is_err());
+
+        let resolved = ParsedUrl::resolve(&base, "https://cdn.example.com/b.zip").unwrap();
+
+        assert_eq!(resolved.host, "cdn.example.com");
+    }
+
+    #[test]
+    fn ipv4_mapped_ipv6_uses_the_ipv4_policy() {
+        // ::ffff:127.0.0.1 must be refused exactly like 127.0.0.1.
+        for mapped in [
+            "::ffff:127.0.0.1",
+            "::ffff:10.0.0.1",
+            "::ffff:169.254.169.254",
+        ] {
+            assert!(is_forbidden(mapped.parse().unwrap()), "{mapped}");
+        }
     }
 }
