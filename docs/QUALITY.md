@@ -138,8 +138,20 @@ A skipped or ignored test is not a passing test. The release decision uses
 
 | Date (UTC) | Commit | Rust tests | Clippy | Web | Audits | Runtime acceptance |
 |---|---|---|---|---|---|---|
-| 2026-11-26 | `a6f2890` + dependency upgrade | 279 passed, 0 failed, 7 ignored | clean | typecheck + build, `npm audit`: 0 vulnerabilities | `cargo audit`: 1 accepted advisory (`rsa`, justified above) + 1 unmaintained warning; npm: 0 | PASSED (8990 ms, real WSL2/rootless runtime) |
+| 2026-11-26 | `6e009a0` | 296 passed, 0 failed, 7 ignored | clean | typecheck + build + 15 unit tests, `npm audit`: 0 vulnerabilities | `cargo audit`: 1 accepted advisory (`rsa`, justified above) + 1 unmaintained warning; npm: 0 | PASSED (3044 ms, real WSL2/rootless runtime) |
+
+Ignored acceptance tests run on the same commit and passed: `mcp_e2e` (real
+HTTP listener and OAuth token), `runtime_e2e` (real workspace, job, files,
+artifact publish/download, idempotency conflict), `recovery_e2e` (server
+restart, job interrupted, workspace survives, deletion works) and `egress_e2e`
+(allowlist proxy: allowed 200, denied 403, no direct route).
+
+Browser acceptance is recorded in [docs/UI.md](UI.md): 28 checks, 0 failures,
+0 console errors, 14 synthetic screenshots in `docs/screenshots/`.
 
 Update this table in the same commit that changes the result; a stale row is a
-bug in the process.
+bug in the process. A documentation-only commit after the verified code commit
+does not invalidate the code evidence, but any code change does.
+
+
 
