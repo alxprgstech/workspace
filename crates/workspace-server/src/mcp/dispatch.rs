@@ -782,4 +782,40 @@ mod tests {
             definition.tool.name == "workspace_delete" && definition.scope == "workspace:delete"
         }));
     }
+
+    #[test]
+    fn arbitrary_json_arguments_are_errors_not_panics() {
+        let mut arguments = Map::new();
+
+        arguments.insert("text".into(), json!("value"));
+        arguments.insert("number".into(), json!(-1));
+        arguments.insert("float".into(), json!(1.5));
+        arguments.insert("object".into(), json!({"nested": [1, 2, 3]}));
+        arguments.insert("array".into(), json!([{"deep": true}]));
+        arguments.insert("null".into(), Value::Null);
+        arguments.insert("huge".into(), json!("x".repeat(4096)));
+
+        assert_eq!(
+            string_argument(&arguments, "text").unwrap(),
+            "value".to_owned()
+        );
+        assert!(string_argument(&arguments, "number").is_err());
+        assert!(string_argument(&arguments, "object").is_err());
+        assert!(string_argument(&arguments, "array").is_err());
+        assert!(string_argument(&arguments, "missing").is_err());
+
+        // Typed parsers must reject mismatches predictably.
+        assert!(optional_u64(&arguments, "float").is_err());
+        assert!(optional_u64(&arguments, "object").is_err());
+        assert!(optional_u64(&arguments, "number").is_err());
+        assert!(optional_bool(&arguments, "array").is_err());
+        assert!(optional_bool(&arguments, "text").is_err());
+        assert!(string_array(&arguments, "object").is_err());
+        assert!(environment(&arguments).is_ok(), "env is absent, not wrong");
+
+        // A null is treated as absent, never as a value.
+        assert_eq!(optional_u64(&arguments, "null").unwrap(), None);
+        assert_eq!(optional_string(&arguments, "null").unwrap(), None);
+        assert_eq!(optional_bool(&arguments, "null").unwrap(), None);
+    }
 }

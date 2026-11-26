@@ -372,6 +372,37 @@ mod tests {
     }
 
     #[test]
+    fn malformed_archives_are_rejected_without_panicking() {
+        let (_directory, root) = root();
+
+        // Deterministic pseudo-random inputs: a crash or a panic here would be
+        // a remotely reachable denial of service, so "returns an error" is the
+        // only acceptable outcome.
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+
+        for length in [0usize, 1, 2, 4, 8, 16, 64, 512, 4096] {
+            let mut data = vec![0u8; length];
+
+            for byte in &mut data {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                *byte = state as u8;
+            }
+
+            for name in ["evidence.zip", "payload.tar", "unknown.bin"] {
+                let mut archive = std::io::Cursor::new(data.clone());
+                let result = extract(&root, "", &mut archive, 16, 4096);
+
+                assert!(
+                    result.is_err(),
+                    "{name} with {length} bytes must be refused"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn extracts_a_plain_tar_archive() {
         let (_directory, root) = root();
 
