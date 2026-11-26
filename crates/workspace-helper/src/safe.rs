@@ -4,11 +4,26 @@
 //! a `cap-std` directory handle. `cap-std` resolves paths with openat-style
 //! semantics and refuses escapes: `..`, absolute components and symlinks that
 //! leave the capability all fail instead of touching the host filesystem.
+//!
+//! Write guarantees: a create-only write commits through `link(2)`, which is
+//! atomic and cannot replace an existing name; a digest-checked write holds a
+//! process-wide lock across the check and the rename. Commands running inside a
+//! workspace container write with their own credentials and are outside these
+//! guarantees by design, not by accident.
 
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, File, Metadata, OpenOptions};
 use std::io::{self, Read, Write};
+use std::sync::Mutex;
 use workspace_core::helper::{self, HelperError};
+
+/// Serialises the check-and-commit sequence of writes inside the helper.
+///
+/// The helper is the control plane's only writer, so this closes races between
+/// two API calls. Commands running *inside* a workspace container write with
+/// their own credentials and are outside this guarantee; that boundary is
+/// documented rather than implied.
+static WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 /// An opened capability root.
 pub struct SafeRoot {
@@ -328,6 +343,12 @@ impl SafeRoot {
             ));
         }
 
+        // Held across the digest/existence check and the commit: two writes to
+        // the same path can no longer both pass the check.
+        let _guard = WRITE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
         if let Some(parent) = parent_of(path)
             && create_parents
             && !parent.is_empty()
@@ -367,9 +388,23 @@ impl SafeRoot {
             return Err(map_io(error));
         }
 
-        if let Err(error) = self.dir.rename(&temporary, &self.dir, path) {
+        if replace {
+            if let Err(error) = self.dir.rename(&temporary, &self.dir, path) {
+                let _ = self.dir.remove_file(&temporary);
+                return Err(map_io(error));
+            }
+        } else {
+            // `link(2)` is atomic and fails with EEXIST instead of replacing:
+            // a concurrent creation can never be silently overwritten, and the
+            // guarantee does not depend on the earlier existence check.
+            if let Err(error) = self.dir.hard_link(&temporary, &self.dir, path) {
+                let _ = self.dir.remove_file(&temporary);
+                return Err(map_io(error));
+            }
+
+            // The committed name is now a second link to the same inode; the
+            // temporary name must not linger.
             let _ = self.dir.remove_file(&temporary);
-            return Err(map_io(error));
         }
 
         Ok(serde_json::json!({
@@ -775,6 +810,66 @@ mod tests {
                 .unwrap_err()
                 .code,
             helper::code::EXISTS
+        );
+    }
+
+    #[test]
+    fn concurrent_create_only_writes_commit_exactly_one_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let allowed = directory.path().join("data");
+        std::fs::create_dir_all(&allowed).unwrap();
+        let prefix = allowed.to_string_lossy().to_string();
+
+        let handles: Vec<_> = (0..8)
+            .map(|writer| {
+                let prefix = prefix.clone();
+                let allowed = allowed.clone();
+
+                std::thread::spawn(move || {
+                    let root = SafeRoot::open(&[prefix], &allowed.to_string_lossy()).unwrap();
+                    let content = format!("writer-{writer}");
+
+                    root.write("race.txt", content.as_bytes(), false, false, None)
+                        .map(|_| ())
+                        .map_err(|error| error.code)
+                })
+            })
+            .collect();
+
+        let mut created = 0;
+        let mut refused = 0;
+
+        for handle in handles {
+            match handle.join().expect("thread") {
+                Ok(()) => created += 1,
+                Err(code) if code == helper::code::EXISTS => refused += 1,
+                Err(code) => panic!("unexpected helper error: {code}"),
+            }
+        }
+
+        assert_eq!(created, 1, "exactly one create-only write may win");
+        assert_eq!(refused, 7);
+
+        // One complete payload survived, not a mixture, and no temporary file
+        // was left behind.
+        let mut content = String::new();
+        std::io::Read::read_to_string(
+            &mut std::fs::File::open(allowed.join("race.txt")).unwrap(),
+            &mut content,
+        )
+        .unwrap();
+
+        assert!(content.starts_with("writer-"), "{content}");
+
+        let entries: Vec<_> = std::fs::read_dir(&allowed)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+
+        assert_eq!(
+            entries.len(),
+            1,
+            "temporary files must not linger: {entries:?}"
         );
     }
 
