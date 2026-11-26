@@ -210,6 +210,14 @@ async fn resolve_public(host: &str, port: u16) -> Result<Vec<IpAddr>, FilesError
         .map(|socket| socket.ip())
         .collect::<Vec<_>>();
 
+    validate_resolved(addresses)
+}
+
+/// Apply the address policy to a resolved answer.
+///
+/// Split from the lookup so the policy can be exercised against synthetic DNS
+/// answers, including the mixed public/private answer of a rebinding attempt.
+fn validate_resolved(addresses: Vec<IpAddr>) -> Result<Vec<IpAddr>, FilesError> {
     if addresses.is_empty() {
         return Err(FilesError::Invalid("the URL host has no addresses"));
     }
@@ -384,6 +392,62 @@ mod tests {
         let resolved = ParsedUrl::resolve(&base, "https://cdn.example.com/b.zip").unwrap();
 
         assert_eq!(resolved.host, "cdn.example.com");
+    }
+
+    fn addresses(values: &[&str]) -> Vec<IpAddr> {
+        values
+            .iter()
+            .map(|value| value.parse().expect("valid address"))
+            .collect()
+    }
+
+    #[test]
+    fn synthetic_dns_answers_are_policed() {
+        // An empty answer is a resolution failure, not a free pass.
+        assert!(validate_resolved(Vec::new()).is_err());
+
+        // A public answer is accepted.
+        assert_eq!(validate_resolved(addresses(&["1.1.1.1"])).unwrap().len(), 1);
+
+        // DNS rebinding typically returns a public and a private address; one
+        // forbidden address rejects the whole answer.
+        assert!(validate_resolved(addresses(&["1.1.1.1", "127.0.0.1"])).is_err());
+        assert!(validate_resolved(addresses(&["2606:4700:4700::1111", "::1"])).is_err());
+
+        // The metadata service is refused even when it is the only answer.
+        assert!(validate_resolved(addresses(&["169.254.169.254"])).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_local_mock_server_is_unreachable_through_the_policy() {
+        use tokio::io::AsyncReadExt;
+
+        // A real listening socket on loopback. The downloader must refuse the
+        // host before connecting, so the listener sees no connection at all.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        assert!(
+            resolve_public("127.0.0.1", port).await.is_err(),
+            "loopback must be refused"
+        );
+        assert!(
+            resolve_public("localhost", port).await.is_err(),
+            "the localhost name must be refused"
+        );
+
+        let refused = tokio::time::timeout(std::time::Duration::from_millis(200), async {
+            let (mut stream, _) = listener.accept().await?;
+            let mut byte = [0u8; 1];
+            let _ = stream.read(&mut byte).await?;
+            Ok::<(), std::io::Error>(())
+        })
+        .await;
+
+        assert!(
+            refused.is_err(),
+            "the downloader must not connect to a local mock server"
+        );
     }
 
     #[test]
