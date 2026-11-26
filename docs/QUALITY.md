@@ -88,7 +88,7 @@ npm audit
 
 - `storage::initialize` migrates forward in one `IMMEDIATE` transaction and
   creates a `backups/pre-schema<N>-*` snapshot before any upgrade.
-- Migrations are append-only; the current schema version is `10`.
+- Migrations are append-only; the current schema version is `11`.
 - Regression tests apply the historical migrations one by one and assert the
   resulting version, preserved data and rollback on failure.
 - A rollback of the binary requires restoring the matching database snapshot;
@@ -142,3 +142,4 @@ A skipped or ignored test is not a passing test. The release decision uses
 
 Update this table in the same commit that changes the result; a stale row is a
 bug in the process.
+

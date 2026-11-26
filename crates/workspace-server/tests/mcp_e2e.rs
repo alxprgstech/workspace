@@ -415,7 +415,7 @@ async fn mcp_protocol_end_to_end() {
     println!("server_info: {info}");
 
     assert_eq!(info["product"], "ALXPRGS Workspace");
-    assert_eq!(info["schema_version"], 10);
+    assert_eq!(info["schema_version"], 11);
     assert!(info["runtime"].is_object());
     assert_eq!(called["result"]["isError"], false);
 
@@ -427,7 +427,7 @@ async fn mcp_protocol_end_to_end() {
         "ALXPRGS Workspace"
     );
     assert_eq!(
-        called["result"]["structuredContent"]["schema_version"], 10,
+        called["result"]["structuredContent"]["schema_version"], 11,
         "structured content must carry the full payload"
     );
 

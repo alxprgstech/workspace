@@ -188,6 +188,7 @@ impl AppState {
                     ttl_seconds: config.workspace.artifact_ttl_seconds,
                     link_ttl_seconds: 900.min(config.workspace.artifact_ttl_seconds),
                     public_base: public_base(config),
+                    ..artifacts::ArtifactSettings::default()
                 },
             ))
         });
@@ -476,7 +477,11 @@ fn valid_local_mcp(config: &Config) -> bool {
 /// A stopped WSL2 distribution is woken by the same probe: the first pass
 /// tolerates the cold start through the bounded engine retry, and later passes
 /// only re-verify. Nothing here starts user workloads.
-fn spawn_runtime_supervisor(runtime: Arc<RuntimeMonitor>, workspaces: Arc<workspaces::Manager>) {
+fn spawn_runtime_supervisor(
+    runtime: Arc<RuntimeMonitor>,
+    workspaces: Arc<workspaces::Manager>,
+    artifacts: Option<Arc<artifacts::Artifacts>>,
+) {
     let manager = Arc::clone(&workspaces);
 
     tokio::spawn(async move {
@@ -560,6 +565,18 @@ fn spawn_runtime_supervisor(runtime: Arc<RuntimeMonitor>, workspaces: Arc<worksp
                 }
                 Ok(_) => {}
                 Err(error) => tracing::warn!(%error, "Workspace reaper failed"),
+            }
+
+            // Expired artifacts and abandoned budget reservations must also be
+            // reclaimed: they hold disk bytes outside any workspace.
+            if let Some(artifacts) = artifacts.as_ref() {
+                match artifacts.cleanup().await {
+                    Ok(removed) if removed > 0 => {
+                        tracing::info!(removed, "Artifact cleanup removed expired entries");
+                    }
+                    Ok(_) => {}
+                    Err(error) => tracing::warn!(%error, "Artifact cleanup failed"),
+                }
             }
         }
     });
@@ -730,7 +747,11 @@ pub async fn serve(config: Config) -> io::Result<()> {
         });
     }
 
-    spawn_runtime_supervisor(Arc::clone(&runtime), Arc::clone(&state.workspaces));
+    spawn_runtime_supervisor(
+        Arc::clone(&runtime),
+        Arc::clone(&state.workspaces),
+        state.artifacts.as_ref().map(Arc::clone),
+    );
 
     tracing::info!(
         backend = runtime

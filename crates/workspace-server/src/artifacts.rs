@@ -5,7 +5,7 @@
 //! that reveal no storage structure.
 
 use base64::Engine;
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -16,6 +16,24 @@ use crate::storage;
 
 /// Maximum artifact size accepted by one publish.
 pub const MAX_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Default number of artifacts one owner may keep.
+pub const DEFAULT_MAX_ARTIFACTS_PER_OWNER: u64 = 100;
+
+/// Default total artifact bytes one owner may keep.
+pub const DEFAULT_MAX_BYTES_PER_OWNER: u64 = 1024 * 1024 * 1024;
+
+/// Default total artifact bytes across all owners.
+pub const DEFAULT_MAX_BYTES_TOTAL: u64 = 8 * 1024 * 1024 * 1024;
+
+/// Default publication limit per owner per minute.
+pub const DEFAULT_MAX_PUBLISHES_PER_MINUTE: u64 = 30;
+
+/// Default download-link issuance limit per owner per minute.
+pub const DEFAULT_MAX_LINKS_PER_MINUTE: u64 = 120;
+
+/// How long a reservation may survive a crash before the cleanup removes it.
+pub const RESERVATION_TTL_SECONDS: u64 = 900;
 
 #[derive(Debug, Error)]
 pub enum ArtifactError {
@@ -30,6 +48,12 @@ pub enum ArtifactError {
 
     #[error("artifact is too large")]
     TooLarge,
+
+    #[error("the artifact storage budget is exhausted")]
+    QuotaExceeded,
+
+    #[error("too many artifact operations; retry later")]
+    RateLimited,
 
     #[error("artifact link is invalid or expired")]
     LinkInvalid,
@@ -48,6 +72,8 @@ impl ArtifactError {
             Self::NotFound => "artifact_not_found",
             Self::Forbidden => "forbidden",
             Self::TooLarge => "artifact_too_large",
+            Self::QuotaExceeded => "artifact_quota_exceeded",
+            Self::RateLimited => "artifact_rate_limited",
             Self::LinkInvalid => "link_invalid",
             Self::Files(error) => error.code(),
             Self::Database(_) => "database_error",
@@ -59,7 +85,8 @@ impl ArtifactError {
             Self::Invalid(_) => 400,
             Self::NotFound | Self::LinkInvalid => 404,
             Self::Forbidden => 403,
-            Self::TooLarge => 413,
+            Self::TooLarge | Self::QuotaExceeded => 413,
+            Self::RateLimited => 429,
             Self::Files(error) => error.status(),
             Self::Database(_) => 500,
         }
@@ -96,6 +123,130 @@ pub struct ArtifactSettings {
     pub ttl_seconds: u64,
     pub link_ttl_seconds: u64,
     pub public_base: String,
+    /// Total number of artifacts one owner may keep.
+    pub max_artifacts_per_owner: u64,
+    /// Total artifact bytes one owner may keep.
+    pub max_bytes_per_owner: u64,
+    /// Total artifact bytes across all owners.
+    pub max_bytes_total: u64,
+    /// Publications per owner per minute.
+    pub max_publishes_per_minute: u64,
+    /// Download-link issuances per owner per minute.
+    pub max_links_per_minute: u64,
+}
+
+impl Default for ArtifactSettings {
+    fn default() -> Self {
+        Self {
+            ttl_seconds: 86_400,
+            link_ttl_seconds: 900,
+            public_base: String::new(),
+            max_artifacts_per_owner: DEFAULT_MAX_ARTIFACTS_PER_OWNER,
+            max_bytes_per_owner: DEFAULT_MAX_BYTES_PER_OWNER,
+            max_bytes_total: DEFAULT_MAX_BYTES_TOTAL,
+            max_publishes_per_minute: DEFAULT_MAX_PUBLISHES_PER_MINUTE,
+            max_links_per_minute: DEFAULT_MAX_LINKS_PER_MINUTE,
+        }
+    }
+}
+
+/// A budget reservation for one publication.
+#[derive(Debug, Clone)]
+pub struct Reservation {
+    pub id: String,
+    pub owner: String,
+    pub bytes: u64,
+}
+
+fn insert_artifact(
+    connection: &Connection,
+    artifact: &Artifact,
+    owner: &str,
+    stored_name: &str,
+) -> Result<(), ArtifactError> {
+    connection
+        .execute(
+            "INSERT INTO artifacts (
+                id, owner_id, workspace_id, display_name, stored_name,
+                media_type, size_bytes, sha256, created_at_unix, expires_at_unix
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                artifact.id,
+                owner,
+                artifact.workspace_id,
+                artifact.name,
+                stored_name,
+                artifact.media_type,
+                artifact.size_bytes as i64,
+                artifact.sha256,
+                artifact.created_at_unix,
+                artifact.expires_at_unix,
+            ],
+        )
+        .map_err(|error| ArtifactError::Database(error.to_string()))?;
+
+    Ok(())
+}
+
+/// Enforce the owner and global budgets, counting committed bytes and live
+/// reservations together.
+fn check_budget(
+    connection: &Connection,
+    owner: &str,
+    add_bytes: u64,
+    settings: &ArtifactSettings,
+) -> Result<(), ArtifactError> {
+    let (owner_bytes, owner_count): (i64, i64) = connection
+        .query_row(
+            "SELECT COALESCE(SUM(size_bytes), 0), count(*)
+             FROM artifacts WHERE owner_id = ?1",
+            params![owner],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|error| ArtifactError::Database(error.to_string()))?;
+
+    let (owner_reserved_bytes, owner_reserved_count): (i64, i64) = connection
+        .query_row(
+            "SELECT COALESCE(SUM(bytes), 0), count(*)
+             FROM artifact_reservations WHERE owner_id = ?1",
+            params![owner],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|error| ArtifactError::Database(error.to_string()))?;
+
+    let total_bytes: i64 = connection
+        .query_row(
+            "SELECT COALESCE(SUM(size_bytes), 0) FROM artifacts",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| ArtifactError::Database(error.to_string()))?;
+
+    let total_reserved: i64 = connection
+        .query_row(
+            "SELECT COALESCE(SUM(bytes), 0) FROM artifact_reservations",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| ArtifactError::Database(error.to_string()))?;
+
+    let owner_bytes = (owner_bytes.max(0) as u64)
+        .saturating_add(owner_reserved_bytes.max(0) as u64)
+        .saturating_add(add_bytes);
+    let owner_entries =
+        (owner_count.max(0) as u64).saturating_add(owner_reserved_count.max(0) as u64);
+    let total_bytes = (total_bytes.max(0) as u64)
+        .saturating_add(total_reserved.max(0) as u64)
+        .saturating_add(add_bytes);
+
+    if owner_entries >= settings.max_artifacts_per_owner
+        || owner_bytes > settings.max_bytes_per_owner
+        || total_bytes > settings.max_bytes_total
+    {
+        return Err(ArtifactError::QuotaExceeded);
+    }
+
+    Ok(())
 }
 
 /// Durable artifact metadata and links.
@@ -115,34 +266,163 @@ impl ArtifactStore {
         storage::open(&self.data_dir).map_err(|error| ArtifactError::Database(error.to_string()))
     }
 
-    fn insert(
+    /// Reserve budget for one publication, atomically with the limit checks.
+    ///
+    /// The reservation is a row, so concurrent publications (and a crash
+    /// between the check and the copy) are accounted for instead of racing on
+    /// a read-only sum.
+    pub fn reserve(
         &self,
-        artifact: &Artifact,
         owner: &str,
+        bytes: u64,
+        settings: &ArtifactSettings,
+    ) -> Result<Reservation, ArtifactError> {
+        let mut connection = self.connection()?;
+
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| ArtifactError::Database(error.to_string()))?;
+
+        let recent: i64 = transaction
+            .query_row(
+                "SELECT
+                    (SELECT count(*) FROM artifacts
+                     WHERE owner_id = ?1 AND created_at_unix > unixepoch() - 60)
+                  + (SELECT count(*) FROM artifact_reservations
+                     WHERE owner_id = ?1 AND created_at_unix > unixepoch() - 60)",
+                params![owner],
+                |row| row.get(0),
+            )
+            .map_err(|error| ArtifactError::Database(error.to_string()))?;
+
+        if recent as u64 >= settings.max_publishes_per_minute {
+            return Err(ArtifactError::RateLimited);
+        }
+
+        check_budget(&transaction, owner, bytes, settings)?;
+
+        let id = uuid::Uuid::new_v4().to_string();
+
+        transaction
+            .execute(
+                "INSERT INTO artifact_reservations (id, owner_id, bytes, created_at_unix)
+                 VALUES (?1, ?2, ?3, unixepoch())",
+                params![id, owner, bytes as i64],
+            )
+            .map_err(|error| ArtifactError::Database(error.to_string()))?;
+
+        transaction
+            .commit()
+            .map_err(|error| ArtifactError::Database(error.to_string()))?;
+
+        Ok(Reservation {
+            id,
+            owner: owner.to_owned(),
+            bytes,
+        })
+    }
+
+    /// Turn a reservation into a published artifact, re-checking the budget
+    /// against the real size measured while copying.
+    pub fn commit(
+        &self,
+        reservation: &Reservation,
+        artifact: &Artifact,
         stored_name: &str,
+        settings: &ArtifactSettings,
     ) -> Result<(), ArtifactError> {
+        let mut connection = self.connection()?;
+
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| ArtifactError::Database(error.to_string()))?;
+
+        let owner: Option<String> = transaction
+            .query_row(
+                "SELECT owner_id FROM artifact_reservations WHERE id = ?1",
+                params![reservation.id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| ArtifactError::Database(error.to_string()))?;
+
+        if owner.as_deref() != Some(reservation.owner.as_str()) {
+            return Err(ArtifactError::Database(
+                "the artifact reservation is missing".into(),
+            ));
+        }
+
+        transaction
+            .execute(
+                "DELETE FROM artifact_reservations WHERE id = ?1",
+                params![reservation.id],
+            )
+            .map_err(|error| ArtifactError::Database(error.to_string()))?;
+
+        check_budget(
+            &transaction,
+            &reservation.owner,
+            artifact.size_bytes,
+            settings,
+        )?;
+
+        insert_artifact(&transaction, artifact, &reservation.owner, stored_name)?;
+
+        transaction
+            .commit()
+            .map_err(|error| ArtifactError::Database(error.to_string()))?;
+
+        Ok(())
+    }
+
+    /// Drop a reservation after a failed publication.
+    pub fn release(&self, reservation_id: &str) -> Result<(), ArtifactError> {
         let connection = self.connection()?;
 
         connection
             .execute(
-                "INSERT INTO artifacts (
-                    id, owner_id, workspace_id, display_name, stored_name,
-                    media_type, size_bytes, sha256, created_at_unix, expires_at_unix
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                params![
-                    artifact.id,
-                    owner,
-                    artifact.workspace_id,
-                    artifact.name,
-                    stored_name,
-                    artifact.media_type,
-                    artifact.size_bytes as i64,
-                    artifact.sha256,
-                    artifact.created_at_unix,
-                    artifact.expires_at_unix,
-                ],
+                "DELETE FROM artifact_reservations WHERE id = ?1",
+                params![reservation_id],
             )
             .map_err(|error| ArtifactError::Database(error.to_string()))?;
+
+        Ok(())
+    }
+
+    /// Remove reservations abandoned by a crash.
+    pub fn sweep_reservations(&self) -> Result<usize, ArtifactError> {
+        let connection = self.connection()?;
+
+        connection
+            .execute(
+                "DELETE FROM artifact_reservations
+                 WHERE created_at_unix <= unixepoch() - ?1",
+                params![RESERVATION_TTL_SECONDS as i64],
+            )
+            .map_err(|error| ArtifactError::Database(error.to_string()))
+    }
+
+    /// Enforce the per-owner download-link issuance rate.
+    pub fn check_link_rate(
+        &self,
+        owner: &str,
+        settings: &ArtifactSettings,
+    ) -> Result<(), ArtifactError> {
+        let connection = self.connection()?;
+
+        let recent: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM artifact_links l
+                 JOIN artifacts a ON a.id = l.artifact_id
+                 WHERE a.owner_id = ?1 AND l.created_at_unix > unixepoch() - 60",
+                params![owner],
+                |row| row.get(0),
+            )
+            .map_err(|error| ArtifactError::Database(error.to_string()))?;
+
+        if recent as u64 >= settings.max_links_per_minute {
+            return Err(ArtifactError::RateLimited);
+        }
 
         Ok(())
     }
@@ -354,13 +634,18 @@ impl ArtifactStore {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| ArtifactError::Database(error.to_string()))?;
 
-        for id in &ids {
-            connection
-                .execute("DELETE FROM artifacts WHERE id = ?1", params![id])
-                .map_err(|error| ArtifactError::Database(error.to_string()))?;
-        }
-
         Ok(ids)
+    }
+
+    /// Drop the metadata of one cleaned artifact.
+    pub fn remove_metadata(&self, id: &str) -> Result<(), ArtifactError> {
+        let connection = self.connection()?;
+
+        connection
+            .execute("DELETE FROM artifacts WHERE id = ?1", params![id])
+            .map_err(|error| ArtifactError::Database(error.to_string()))?;
+
+        Ok(())
     }
 }
 
@@ -404,16 +689,36 @@ impl Artifacts {
             }
         };
 
+        // Probe the source before copying: this proves the file exists and
+        // gives the size the budget must reserve.
+        let probe = self.files.read(owner, workspace_id, path, 0, 1).await?;
+
+        if probe.size > MAX_ARTIFACT_BYTES {
+            return Err(ArtifactError::TooLarge);
+        }
+
+        let reservation = self.store.reserve(owner, probe.size, &self.settings)?;
+
         let id = uuid::Uuid::new_v4().to_string();
         let stored_name = format!("file-{display_name}");
 
-        let copied = self
+        let copied = match self
             .files
             .copy_to_artifacts(owner, workspace_id, path, &id, &stored_name, false)
-            .await?;
+            .await
+        {
+            Ok(copied) => copied,
+            Err(error) => {
+                let _ = self.store.release(&reservation.id);
+
+                return Err(ArtifactError::Files(error));
+            }
+        };
 
         if copied.size > MAX_ARTIFACT_BYTES {
             let _ = self.files.remove_artifact(&id).await;
+            let _ = self.store.release(&reservation.id);
+
             return Err(ArtifactError::TooLarge);
         }
 
@@ -431,8 +736,15 @@ impl Artifacts {
             revoked: false,
         };
 
-        if let Err(error) = self.store.insert(&artifact, owner, &stored_name) {
+        if let Err(error) = self
+            .store
+            .commit(&reservation, &artifact, &stored_name, &self.settings)
+        {
+            // The budget check ran against the real size; the copied bytes
+            // must not outlive a rejected publication.
             let _ = self.files.remove_artifact(&id).await;
+            let _ = self.store.release(&reservation.id);
+
             return Err(error);
         }
 
@@ -455,6 +767,8 @@ impl Artifacts {
         if artifact.revoked || artifact.expires_at_unix <= unix_now() {
             return Err(ArtifactError::LinkInvalid);
         }
+
+        self.store.check_link_rate(owner, &self.settings)?;
 
         let remaining = (artifact.expires_at_unix - unix_now()).max(1) as u64;
         let ttl = link_ttl(
@@ -503,14 +817,33 @@ impl Artifacts {
     }
 
     /// Delete expired artifacts and their files.
+    ///
+    /// The metadata row stays until the file is confirmed gone: losing the row
+    /// first would leave bytes on disk with no record and no way to find them.
+    /// A failed removal is retried on the next pass.
     pub async fn cleanup(&self) -> Result<usize, ArtifactError> {
+        let _ = self.store.sweep_reservations()?;
+
         let expired = self.store.take_expired()?;
+        let mut removed = 0;
 
         for id in &expired {
-            let _ = self.files.remove_artifact(id).await;
+            match self.files.remove_artifact(id).await {
+                Ok(()) => {
+                    self.store.remove_metadata(id)?;
+                    removed += 1;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        artifact = %id,
+                        "Artifact file cleanup failed; metadata kept for the next pass"
+                    );
+                }
+            }
         }
 
-        Ok(expired.len())
+        Ok(removed)
     }
 }
 
@@ -605,6 +938,195 @@ mod tests {
         assert_eq!(media_type("a.zip"), "application/zip");
         assert_eq!(media_type("a.rs"), "text/plain; charset=utf-8");
         assert_eq!(media_type("a.unknown"), "application/octet-stream");
+    }
+
+    fn store_with_users() -> (tempfile::TempDir, ArtifactStore) {
+        let directory = tempfile::tempdir().unwrap();
+
+        crate::storage::initialize(directory.path()).unwrap();
+
+        let connection = crate::storage::open(directory.path()).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO users (id, issuer, subject, created_at_unix, updated_at_unix)
+                 VALUES ('owner-1', 'https://auth.example.com', 'subject-1', 0, 0);
+                 INSERT INTO users (id, issuer, subject, created_at_unix, updated_at_unix)
+                 VALUES ('owner-2', 'https://auth.example.com', 'subject-2', 0, 0);",
+            )
+            .unwrap();
+        drop(connection);
+
+        let store = ArtifactStore::new(directory.path());
+
+        (directory, store)
+    }
+
+    fn stored_artifact(id: &str, size: u64) -> Artifact {
+        Artifact {
+            id: id.to_owned(),
+            workspace_id: None,
+            name: "payload.bin".to_owned(),
+            size_bytes: size,
+            media_type: "application/octet-stream".to_owned(),
+            sha256: "00".to_owned(),
+            created_at_unix: 1,
+            expires_at_unix: 9_999_999_999,
+            revoked: false,
+        }
+    }
+
+    fn small_budget() -> ArtifactSettings {
+        ArtifactSettings {
+            max_artifacts_per_owner: 1,
+            max_bytes_per_owner: 10,
+            max_bytes_total: 12,
+            max_publishes_per_minute: 100,
+            max_links_per_minute: 100,
+            ..ArtifactSettings::default()
+        }
+    }
+
+    #[test]
+    fn a_small_budget_is_reserved_before_any_copy() {
+        let (_directory, store) = store_with_users();
+        let settings = small_budget();
+
+        let first = store.reserve("owner-1", 8, &settings).unwrap();
+
+        // The live reservation already counts against the entry and byte
+        // limits, before a single byte was copied.
+        assert!(matches!(
+            store.reserve("owner-1", 1, &settings),
+            Err(ArtifactError::QuotaExceeded)
+        ));
+
+        store
+            .commit(
+                &first,
+                &stored_artifact("artifact-a", 8),
+                "file-a",
+                &settings,
+            )
+            .unwrap();
+
+        // Only 4 bytes remain in the global budget.
+        assert!(matches!(
+            store.reserve("owner-2", 8, &settings),
+            Err(ArtifactError::QuotaExceeded)
+        ));
+
+        let second = store.reserve("owner-2", 4, &settings).unwrap();
+
+        // Releasing a reservation returns the budget.
+        store.release(&second.id).unwrap();
+        store.release(&first.id).unwrap();
+    }
+
+    #[test]
+    fn concurrent_reservations_cannot_overspend() {
+        let (_directory, store) = store_with_users();
+        let settings = small_budget();
+
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let store = store.clone();
+                let settings = settings.clone();
+
+                std::thread::spawn(move || store.reserve("owner-1", 6, &settings))
+            })
+            .collect();
+
+        let mut granted = 0;
+        let mut refused = 0;
+
+        for handle in handles {
+            match handle.join().expect("thread") {
+                Ok(reservation) => {
+                    granted += 1;
+                    assert_eq!(reservation.bytes, 6);
+                }
+                Err(ArtifactError::QuotaExceeded) => refused += 1,
+                Err(error) => panic!("unexpected error: {error}"),
+            }
+        }
+
+        assert_eq!(granted, 1, "only one 6-byte reservation fits into 10 bytes");
+        assert_eq!(refused, 3);
+    }
+
+    #[test]
+    fn publication_and_link_rates_are_limited() {
+        let (_directory, store) = store_with_users();
+
+        let settings = ArtifactSettings {
+            max_publishes_per_minute: 1,
+            max_links_per_minute: 1,
+            ..small_budget()
+        };
+
+        let reservation = store.reserve("owner-1", 1, &settings).unwrap();
+
+        assert!(matches!(
+            store.reserve("owner-1", 1, &settings),
+            Err(ArtifactError::RateLimited)
+        ));
+
+        store
+            .commit(
+                &reservation,
+                &stored_artifact("artifact-r", 1),
+                "file-r",
+                &settings,
+            )
+            .unwrap();
+
+        store.check_link_rate("owner-1", &settings).unwrap();
+        store.create_link("artifact-r", 60).unwrap();
+
+        assert!(matches!(
+            store.check_link_rate("owner-1", &settings),
+            Err(ArtifactError::RateLimited)
+        ));
+    }
+
+    #[test]
+    fn stale_reservations_are_swept_and_metadata_waits_for_its_file() {
+        let (directory, store) = store_with_users();
+
+        let connection = crate::storage::open(directory.path()).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO artifact_reservations (id, owner_id, bytes, created_at_unix)
+                 VALUES ('stale', 'owner-1', 5, unixepoch() - 3600);
+                 INSERT INTO artifact_reservations (id, owner_id, bytes, created_at_unix)
+                 VALUES ('fresh', 'owner-1', 5, unixepoch());
+                 INSERT INTO artifacts (
+                    id, owner_id, workspace_id, display_name, stored_name, media_type,
+                    size_bytes, sha256, created_at_unix, expires_at_unix
+                 ) VALUES (
+                    'expired', 'owner-1', NULL, 'old.txt', 'file-old.txt', 'text/plain',
+                    1, '00', 1, 1
+                 );",
+            )
+            .unwrap();
+        drop(connection);
+
+        assert_eq!(store.sweep_reservations().unwrap(), 1);
+
+        assert!(
+            store
+                .take_expired()
+                .unwrap()
+                .contains(&"expired".to_owned())
+        );
+
+        // The metadata row survives until the caller confirms the file is gone:
+        // losing it first would leave unaccounted bytes on disk.
+        assert!(store.get("expired").unwrap().is_some());
+
+        store.remove_metadata("expired").unwrap();
+
+        assert!(store.get("expired").unwrap().is_none());
     }
 
     fn seeded_store() -> (tempfile::TempDir, ArtifactStore) {

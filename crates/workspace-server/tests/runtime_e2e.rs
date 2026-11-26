@@ -285,6 +285,7 @@ async fn workspace_lifecycle_and_job_execution() {
             ttl_seconds: 3600,
             link_ttl_seconds: 600,
             public_base: "https://workspace.example.test".to_owned(),
+            ..Default::default()
         },
     );
 

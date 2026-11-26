@@ -163,6 +163,7 @@ async fn fixture() -> Fixture {
             ttl_seconds: 3600,
             link_ttl_seconds: 600,
             public_base: "https://workspace.alxprgs.tech".to_owned(),
+            ..Default::default()
         },
     ));
 

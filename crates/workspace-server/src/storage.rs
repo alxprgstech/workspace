@@ -8,7 +8,7 @@ use std::{
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const SCHEMA_VERSION: u32 = 10;
+pub const SCHEMA_VERSION: u32 = 11;
 
 const APPLICATION_ID: i64 = 0x414C5857;
 const MIN_SQLITE_VERSION: i32 = 3_051_003;
@@ -23,6 +23,7 @@ const MIGRATION_007: &str = include_str!("../migrations/0007_artifacts.sql");
 const MIGRATION_008: &str = include_str!("../migrations/0008_images.sql");
 const MIGRATION_009: &str = include_str!("../migrations/0009_scopes_expand.sql");
 const MIGRATION_010: &str = include_str!("../migrations/0010_active_jobs.sql");
+const MIGRATION_011: &str = include_str!("../migrations/0011_artifact_budget.sql");
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct StorageInfo {
@@ -164,6 +165,10 @@ fn migrate(connection: &mut Connection) -> Result<(), StorageError> {
 
     if version < 10 {
         tx.execute_batch(MIGRATION_010)?;
+    }
+
+    if version < 11 {
+        tx.execute_batch(MIGRATION_011)?;
     }
 
     tx.commit()?;
@@ -655,7 +660,7 @@ mod mcp_oauth_migration_tests {
 
         let info = initialize(dir.path()).unwrap();
 
-        assert_eq!(info.schema_version, 10);
+        assert_eq!(info.schema_version, 11);
         assert_eq!(info.instance_id, "550e8400-e29b-41d4-a716-446655440000");
 
         let connection = open(dir.path()).unwrap();
