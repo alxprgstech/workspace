@@ -18,7 +18,9 @@ use workspace_core::config::Config;
 use workspace_core::job::JobState;
 use workspace_core::workspace::ExecutionMode;
 use workspace_runtime::status::RuntimeMonitor;
-use workspace_server::jobs::{DockerJobRuntime, ExecRequest, ExecSettings, Executor, JobStore};
+use workspace_server::jobs::{
+    DockerJobRuntime, ExecRequest, ExecSettings, Executor, JobError, JobStore,
+};
 use workspace_server::runtime_bridge::DockerWorkspaceRuntime;
 use workspace_server::storage;
 use workspace_server::workspaces::{
@@ -204,8 +206,32 @@ async fn workspace_lifecycle_and_job_execution() {
     assert!(stdout.data.contains("out"), "{}", stdout.data);
     assert!(stderr.data.contains("err"), "{}", stderr.data);
 
-    // Idempotency: the same key must return the same job, not a duplicate.
+    // Idempotency: an identical request with the same key returns the same job
+    // and never starts a second execution.
     let duplicate = executor
+        .submit(
+            &owner,
+            &workspace.id,
+            ExecRequest {
+                argv: vec![
+                    "/bin/sh".to_owned(),
+                    "-c".to_owned(),
+                    "echo out; echo err >&2; exit 3".to_owned(),
+                ],
+                cwd: String::new(),
+                env: vec![],
+                timeout_seconds: Some(60),
+                idempotency_key: Some("e2e-1".to_owned()),
+            },
+        )
+        .await
+        .expect("idempotent submission");
+
+    assert_eq!(duplicate.id, job.id);
+
+    // Reusing the key with different parameters is a predictable conflict, not
+    // a silent replay of the original command.
+    let conflicting = executor
         .submit(
             &owner,
             &workspace.id,
@@ -217,10 +243,12 @@ async fn workspace_lifecycle_and_job_execution() {
                 idempotency_key: Some("e2e-1".to_owned()),
             },
         )
-        .await
-        .expect("idempotent submission");
+        .await;
 
-    assert_eq!(duplicate.id, job.id);
+    assert!(
+        matches!(conflicting, Err(JobError::IdempotencyConflict)),
+        "unexpected result: {conflicting:?}"
+    );
 
     // ---- Files: write, read, patch, list ---------------------------------
     let files =
