@@ -81,6 +81,13 @@ Available: 0.2.0 (ea2416b…) channel stable runtime wsl2/none
 Compatibility: schema 9..=11
 Status: UP_TO_DATE
 
+workspace update --install-dir <lab>
+# package_dir берётся из config.toml, без --package
+0.2.0 -> 0.2.1; все этапы completed; health 0.2.1
+
+workspace update --rollback --yes --allow-data-restore --install-dir <lab>
+# rolled_back 0.2.1 -> 0.2.0; exe/БД/WSL восстановлены
+
 workspace update --status
 Installed: 0.2.0 (ea2416b…), schema 11
 Active jobs: 0
