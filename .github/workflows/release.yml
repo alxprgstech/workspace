@@ -203,7 +203,7 @@ jobs:
         run: |
           $version = "${{ steps.version.outputs.value }}"
           $sha = (git rev-parse HEAD).Trim()
-          if (-not "${{ steps.signing.outputs.signed }}" -eq "true") {
+          if ("${{ steps.signing.outputs.signed }}" -ne "true") {
             $sha = "$sha-test"
             $name = "workspace-$version-windows-x64-TEST.zip"
           }
