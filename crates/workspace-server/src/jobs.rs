@@ -277,12 +277,22 @@ impl JobStore {
 
         let id = Uuid::new_v4().to_string();
 
-        transaction
+        let inserted = transaction
             .execute(
                 "INSERT INTO jobs (
                     id, workspace_id, owner_id, state, argv, cwd, env,
                     created_at_unix, timeout_seconds, idempotency_key
-                 ) VALUES (?1, ?2, ?3, 'queued', ?4, ?5, ?6, unixepoch(), ?7, ?8)",
+                 )
+                 SELECT ?1, ?2, ?3, 'queued', ?4, ?5, ?6, unixepoch(), ?7, ?8
+                 WHERE EXISTS (
+                     SELECT 1 FROM workspaces
+                     WHERE id = ?2
+                       AND state IN ('created', 'running', 'idle', 'stopped')
+                 )
+                 AND NOT EXISTS (
+                     SELECT 1 FROM jobs
+                     WHERE workspace_id = ?2 AND state IN ('queued', 'running')
+                 )",
                 params![
                     id,
                     workspace_id,
@@ -297,6 +307,35 @@ impl JobStore {
                 ],
             )
             .map_err(|error| JobError::Database(error.to_string()))?;
+
+        if inserted == 0 {
+            // The guarded insert is the atomic decision point: classify why it
+            // refused without ever starting anything.
+            let state: Option<String> = transaction
+                .query_row(
+                    "SELECT state FROM workspaces WHERE id = ?1",
+                    params![workspace_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| JobError::Database(error.to_string()))?;
+
+            let active: i64 = transaction
+                .query_row(
+                    "SELECT count(*) FROM jobs
+                     WHERE workspace_id = ?1 AND state IN ('queued', 'running')",
+                    params![workspace_id],
+                    |row| row.get(0),
+                )
+                .map_err(|error| JobError::Database(error.to_string()))?;
+
+            return match state.as_deref() {
+                None => Err(JobError::Workspace(WorkspaceError::NotFound)),
+                Some("deleting") => Err(JobError::WorkspaceBusy),
+                Some(_) if active > 0 => Err(JobError::WorkspaceBusy),
+                Some(_) => Err(JobError::Invalid("workspace is not ready yet")),
+            };
+        }
 
         transaction
             .commit()
@@ -474,21 +513,6 @@ impl JobStore {
             )
             .map(|value| value != 0)
             .map_err(|error| JobError::Database(error.to_string()))
-    }
-
-    fn active_for_workspace(&self, workspace_id: &str) -> Result<bool, JobError> {
-        let connection = self.connection()?;
-
-        let count: i64 = connection
-            .query_row(
-                "SELECT count(*) FROM jobs
-                 WHERE workspace_id = ?1 AND state IN ('queued', 'running')",
-                params![workspace_id],
-                |row| row.get(0),
-            )
-            .map_err(|error| JobError::Database(error.to_string()))?;
-
-        Ok(count > 0)
     }
 
     /// Mark every unfinished job as interrupted. Used once at startup.
@@ -733,10 +757,6 @@ impl Executor {
             .existing_submission(owner, workspace_id, &request, timeout)?
         {
             return Ok(job);
-        }
-
-        if self.store.active_for_workspace(workspace_id)? {
-            return Err(JobError::WorkspaceBusy);
         }
 
         let job = match self.store.insert(owner, workspace_id, &request, timeout)? {

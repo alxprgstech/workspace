@@ -20,6 +20,15 @@ use workspace_core::workspace::{ExecutionMode, Limits, Workspace, WorkspaceState
 /// Maximum number of workspaces one owner may keep at once.
 pub const MAX_WORKSPACES_PER_OWNER: u32 = 3;
 
+/// Outcome of a guarded state transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransitionOutcome {
+    /// The state was changed by this call.
+    Started,
+    /// The row is already being deleted; a deletion retry may continue.
+    AlreadyDeleting,
+}
+
 /// Workspace-level failures with stable codes for HTTP and MCP.
 #[derive(Debug, Error)]
 pub enum WorkspaceError {
@@ -394,6 +403,87 @@ impl Store {
             .map_err(map_sqlite)?;
 
         Ok(count > 0)
+    }
+
+    /// Atomically begin a deletion.
+    ///
+    /// The write lock is taken before the checks, so a concurrent submission
+    /// either commits first (and this update refuses with `Busy`) or sees the
+    /// `deleting` state and refuses. Nothing can start between the check and
+    /// the state change.
+    pub fn begin_delete(&self, id: &str) -> Result<TransitionOutcome, WorkspaceError> {
+        self.begin_transition(id, WorkspaceState::Deleting)
+    }
+
+    /// Atomically begin a stop: same invariant as deletion.
+    pub fn begin_stop(&self, id: &str) -> Result<(), WorkspaceError> {
+        match self.begin_transition(id, WorkspaceState::Stopping)? {
+            TransitionOutcome::Started => Ok(()),
+            TransitionOutcome::AlreadyDeleting => {
+                Err(WorkspaceError::Invalid("workspace is being deleted"))
+            }
+        }
+    }
+
+    fn begin_transition(
+        &self,
+        id: &str,
+        target: WorkspaceState,
+    ) -> Result<TransitionOutcome, WorkspaceError> {
+        let mut connection = self.connection()?;
+
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite)?;
+
+        let changed = transaction
+            .execute(
+                "UPDATE workspaces
+                 SET state = ?2, updated_at_unix = unixepoch()
+                 WHERE id = ?1
+                   AND state NOT IN ('preparing', 'starting', 'stopping', 'deleting')
+                   AND NOT EXISTS (
+                       SELECT 1 FROM jobs
+                       WHERE workspace_id = ?1 AND state IN ('queued', 'running')
+                   )",
+                params![id, target.as_str()],
+            )
+            .map_err(map_sqlite)?;
+
+        if changed > 0 {
+            transaction.commit().map_err(map_sqlite)?;
+
+            return Ok(TransitionOutcome::Started);
+        }
+
+        let state: Option<String> = transaction
+            .query_row(
+                "SELECT state FROM workspaces WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(map_sqlite)?;
+
+        let active: i64 = transaction
+            .query_row(
+                "SELECT count(*) FROM jobs
+                 WHERE workspace_id = ?1 AND state IN ('queued', 'running')",
+                params![id],
+                |row| row.get(0),
+            )
+            .map_err(map_sqlite)?;
+
+        transaction.commit().map_err(map_sqlite)?;
+
+        match state.as_deref() {
+            None => Err(WorkspaceError::NotFound),
+            Some("deleting") => Ok(TransitionOutcome::AlreadyDeleting),
+            Some(_) if active > 0 => Err(WorkspaceError::Busy),
+            Some(_) => Err(WorkspaceError::Invalid(
+                "workspace operation already in progress",
+            )),
+        }
     }
 
     pub fn audit(
@@ -837,17 +927,9 @@ impl Manager {
     pub async fn stop(&self, owner: &str, id: &str) -> Result<Workspace, WorkspaceError> {
         let workspace = self.owned(owner, id)?;
 
-        if workspace.state.is_transitional() {
-            return Err(WorkspaceError::Invalid(
-                "workspace operation already in progress",
-            ));
-        }
-
-        if self.store.has_active_jobs(id)? {
-            return Err(WorkspaceError::Busy);
-        }
-
-        self.store.set_state(id, WorkspaceState::Stopping, None)?;
+        // The stop transition and the "no active job" invariant are one
+        // database decision, so a job cannot slip in between them.
+        self.store.begin_stop(id)?;
 
         if let Err(error) = self.runtime.stop_container(&workspace).await {
             let _ = self
@@ -881,18 +963,15 @@ impl Manager {
     pub async fn delete(&self, owner: &str, id: &str) -> Result<(), WorkspaceError> {
         let workspace = self.owned(owner, id)?;
 
-        if workspace.state != WorkspaceState::Deleting && self.store.has_active_jobs(id)? {
-            return Err(WorkspaceError::Busy);
-        }
+        match self.store.begin_delete(id)? {
+            TransitionOutcome::Started => {
+                let refreshed = self.store.get(id)?.ok_or(WorkspaceError::NotFound)?;
 
-        if workspace.state != WorkspaceState::Deleting {
-            self.store.set_state(id, WorkspaceState::Deleting, None)?;
-
-            let refreshed = self.store.get(id)?.ok_or(WorkspaceError::NotFound)?;
-
-            self.finalize_delete(&refreshed).await?;
-        } else {
-            self.finalize_delete(&workspace).await?;
+                self.finalize_delete(&refreshed).await?;
+            }
+            TransitionOutcome::AlreadyDeleting => {
+                self.finalize_delete(&workspace).await?;
+            }
         }
 
         self.store
@@ -1337,6 +1416,144 @@ mod tests {
             fixture.manager.create(&fixture.owner, &extra).await,
             Err(WorkspaceError::LimitReached)
         ));
+    }
+
+    fn exec_request(key: &str) -> crate::jobs::ExecRequest {
+        crate::jobs::ExecRequest {
+            argv: vec!["true".to_owned()],
+            cwd: String::new(),
+            env: Vec::new(),
+            timeout_seconds: Some(30),
+            idempotency_key: Some(key.to_owned()),
+        }
+    }
+
+    #[test]
+    fn a_deletion_and_a_job_submission_cannot_both_win() {
+        let (directory, store) = store_fixture();
+        let mut workspace = reservation("owner-1");
+
+        store
+            .reserve(&mut workspace, MAX_WORKSPACES_PER_OWNER)
+            .unwrap();
+
+        // Reservation leaves the row in `preparing`; a real deletion targets a
+        // workspace that finished preparation.
+        store
+            .set_state(&workspace.id, WorkspaceState::Created, None)
+            .unwrap();
+
+        let jobs = crate::jobs::JobStore::new(directory.path());
+
+        // Deletion wins first: the guarded insert refuses and starts nothing.
+        assert_eq!(
+            store.begin_delete(&workspace.id).unwrap(),
+            TransitionOutcome::Started
+        );
+
+        assert!(matches!(
+            jobs.insert("owner-1", &workspace.id, &exec_request("deleting"), 30),
+            Err(crate::jobs::JobError::WorkspaceBusy)
+        ));
+    }
+
+    #[test]
+    fn an_active_job_blocks_a_deletion() {
+        let (directory, store) = store_fixture();
+        let mut workspace = reservation("owner-1");
+
+        store
+            .reserve(&mut workspace, MAX_WORKSPACES_PER_OWNER)
+            .unwrap();
+
+        // Reservation leaves the row in `preparing`; a real deletion targets a
+        // workspace that finished preparation.
+        store
+            .set_state(&workspace.id, WorkspaceState::Created, None)
+            .unwrap();
+
+        let jobs = crate::jobs::JobStore::new(directory.path());
+
+        assert!(matches!(
+            jobs.insert("owner-1", &workspace.id, &exec_request("active"), 30)
+                .unwrap(),
+            crate::jobs::InsertOutcome::Created(_)
+        ));
+
+        assert!(matches!(
+            store.begin_delete(&workspace.id),
+            Err(WorkspaceError::Busy)
+        ));
+
+        // Once the job is terminal the deletion may begin.
+        let connection = crate::storage::open(directory.path()).unwrap();
+        connection
+            .execute(
+                "UPDATE jobs SET state = 'succeeded', finished_at_unix = unixepoch()
+                 WHERE workspace_id = ?1",
+                params![workspace.id],
+            )
+            .unwrap();
+        drop(connection);
+
+        assert_eq!(
+            store.begin_delete(&workspace.id).unwrap(),
+            TransitionOutcome::Started
+        );
+    }
+
+    #[test]
+    fn the_database_enforces_one_active_job_per_workspace() {
+        let (directory, store) = store_fixture();
+        let mut workspace = reservation("owner-1");
+
+        store
+            .reserve(&mut workspace, MAX_WORKSPACES_PER_OWNER)
+            .unwrap();
+
+        // Reservation leaves the row in `preparing`; a real deletion targets a
+        // workspace that finished preparation.
+        store
+            .set_state(&workspace.id, WorkspaceState::Created, None)
+            .unwrap();
+
+        let jobs = crate::jobs::JobStore::new(directory.path());
+
+        jobs.insert("owner-1", &workspace.id, &exec_request("first"), 30)
+            .unwrap();
+
+        assert!(matches!(
+            jobs.insert("owner-1", &workspace.id, &exec_request("second"), 30),
+            Err(crate::jobs::JobError::WorkspaceBusy)
+        ));
+
+        // The partial unique index is the last authority: even a direct write
+        // that bypasses the guarded insert cannot create a second active job.
+        let connection = crate::storage::open(directory.path()).unwrap();
+
+        let index: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema
+                 WHERE type = 'index' AND name = 'jobs_one_active'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(index, 1);
+
+        assert!(
+            connection
+                .execute(
+                    "INSERT INTO jobs (
+                        id, workspace_id, owner_id, state, argv, cwd, env,
+                        created_at_unix, timeout_seconds
+                     ) VALUES ('duplicate', ?1, 'owner-1', 'queued', '[]', '', '[]', 0, 30)",
+                    params![workspace.id],
+                )
+                .is_err(),
+            "the database must refuse a second active job"
+        );
     }
 
     #[tokio::test]
