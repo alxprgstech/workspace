@@ -2,16 +2,16 @@
 
 use axum::{
     Extension, Json,
-    body::Body,
+    body::{Body, Bytes},
     extract::{Path, Query, State},
     http::{StatusCode, header},
     response::{IntoResponse, Response},
 };
+use futures_util::stream;
 use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
-use tokio_util::io::ReaderStream;
 
 use crate::AppState;
 use crate::artifacts::ArtifactError;
@@ -453,36 +453,43 @@ pub async fn download(State(state): State<AppState>, Path(token): Path<String>) 
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
     };
 
-    // Stream the file through a duplex pipe so memory stays bounded.
-    let (mut writer, reader) = tokio::io::duplex(128 * 1024);
+    let total = artifact.size_bytes;
     let artifacts = Arc::clone(artifacts);
     let id = artifact.id.clone();
-    let name = stored_name.clone();
 
-    tokio::spawn(async move {
-        let mut offset = 0u64;
-
-        loop {
-            let chunk = match artifacts.read(&id, &name, offset, 1024 * 1024).await {
-                Ok(chunk) => chunk,
-                Err(_) => break,
-            };
-
-            if chunk.is_empty() {
-                break;
+    // Every chunk is bounded by the declared size, so the body never exceeds
+    // `Content-Length`. A failed read yields an `Err` to the client, which makes
+    // the server abort the response body instead of ending it cleanly: a
+    // truncated file can never be mistaken for a successful download.
+    let stream = stream::unfold(
+        (artifacts, id, stored_name, 0u64, false),
+        move |(artifacts, id, name, offset, failed)| async move {
+            if failed || offset >= total {
+                return None;
             }
 
-            offset += chunk.len() as u64;
+            let length = (total - offset).min(1024 * 1024);
 
-            if writer.write_all(&chunk).await.is_err() {
-                break;
+            match artifacts.read(&id, &name, offset, length).await {
+                Ok(chunk) if chunk.is_empty() => None,
+                Ok(chunk) => {
+                    let next = offset + chunk.len() as u64;
+
+                    Some((
+                        Ok::<Bytes, std::io::Error>(Bytes::from(chunk)),
+                        (artifacts, id, name, next, false),
+                    ))
+                }
+                Err(error) => {
+                    let error = std::io::Error::other(format!("artifact read failed: {error}"));
+
+                    Some((Err(error), (artifacts, id, name, offset, true)))
+                }
             }
-        }
+        },
+    );
 
-        let _ = writer.shutdown().await;
-    });
-
-    let body = Body::from_stream(ReaderStream::new(reader));
+    let body = Body::from_stream(stream);
 
     (
         [
@@ -494,6 +501,7 @@ pub async fn download(State(state): State<AppState>, Path(token): Path<String>) 
                     artifact.name.replace('"', "")
                 ),
             ),
+            (header::CONTENT_LENGTH, total.to_string()),
             (header::CACHE_CONTROL, "no-store".to_owned()),
         ],
         body,

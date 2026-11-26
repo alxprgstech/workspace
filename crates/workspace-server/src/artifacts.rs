@@ -266,8 +266,13 @@ impl ArtifactStore {
 
         let expires_at: i64 = connection
             .query_row(
-                "SELECT unixepoch() + ?1",
-                params![ttl_seconds as i64],
+                // The link can never outlive the artifact, even if a caller
+                // supplies a longer TTL.
+                "SELECT min(unixepoch() + ?1, COALESCE(
+                     (SELECT expires_at_unix FROM artifacts WHERE id = ?2),
+                     unixepoch()
+                 ))",
+                params![ttl_seconds as i64, artifact_id],
                 |row| row.get(0),
             )
             .map_err(|error| ArtifactError::Database(error.to_string()))?;
@@ -451,9 +456,13 @@ impl Artifacts {
             return Err(ArtifactError::LinkInvalid);
         }
 
-        let ttl = ttl_seconds
-            .unwrap_or(self.settings.link_ttl_seconds)
-            .clamp(60, self.settings.ttl_seconds.max(60));
+        let remaining = (artifact.expires_at_unix - unix_now()).max(1) as u64;
+        let ttl = link_ttl(
+            ttl_seconds,
+            self.settings.link_ttl_seconds,
+            self.settings.ttl_seconds,
+            remaining,
+        );
 
         let (token, expires_at) = self.store.create_link(artifact_id, ttl)?;
 
@@ -562,6 +571,22 @@ fn unix_now() -> i64 {
         .unwrap_or_default()
 }
 
+/// Effective link lifetime: the requested value, bounded by the link policy and
+/// by what is left of the artifact's own lifetime.
+fn link_ttl(
+    requested: Option<u64>,
+    link_ttl_seconds: u64,
+    artifact_ttl: u64,
+    remaining: u64,
+) -> u64 {
+    let requested = requested.unwrap_or(link_ttl_seconds);
+
+    requested
+        .clamp(1, link_ttl_seconds.max(1))
+        .min(artifact_ttl.max(1))
+        .min(remaining.max(1))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -580,5 +605,17 @@ mod tests {
         assert_eq!(media_type("a.zip"), "application/zip");
         assert_eq!(media_type("a.rs"), "text/plain; charset=utf-8");
         assert_eq!(media_type("a.unknown"), "application/octet-stream");
+    }
+
+    #[test]
+    fn a_link_never_outlives_its_artifact() {
+        // Plenty of artifact lifetime left: the policy applies.
+        assert_eq!(link_ttl(Some(3600), 600, 86_400, 86_400), 600);
+        // The artifact expires in 30 seconds: the link must not outlive it.
+        assert_eq!(link_ttl(Some(3600), 600, 86_400, 30), 30);
+        // An artifact with one second left still gets a usable, short link.
+        assert_eq!(link_ttl(None, 600, 86_400, 1), 1);
+        // A requested zero is still a positive lifetime.
+        assert_eq!(link_ttl(Some(0), 600, 86_400, 500), 1);
     }
 }
